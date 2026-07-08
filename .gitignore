@@ -1,0 +1,42 @@
+# Ignore everything by default.
+*
+
+# Keep project metadata and docs.
+!.gitignore
+!README.md
+!requirements.txt
+!pyproject.toml
+
+# Keep source code.
+!core/
+!core/**
+
+# Keep only necessary runnable scripts.
+!scripts/
+!scripts/run_backtest.py
+!scripts/generate_configs.py
+!scripts/run_config_sweep.py
+
+# Keep only the main config.
+!config/
+!config/config.yaml
+
+# Never upload data, generated configs, logs, reports, or research outputs.
+/data/
+/logs/
+/results/
+/output/
+/research/
+/tmp/
+/.vscode/
+/config/sweep.yaml
+/config/generated/
+
+# Python cache and local environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/

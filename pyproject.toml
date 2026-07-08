@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btc-coin-stat-arb"
+version = "0.1.0"
+description = "BTC-COIN relative value statistical arbitrage research framework"
+requires-python = ">=3.10"
+dependencies = [
+    "polars",
+    "pyyaml",
+    "loguru",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "tqdm>=4.66",
+]
+
+[tool.setuptools.packages.find]
+include = ["core*"]

@@ -1,0 +1,105 @@
+﻿data:
+  symbols:
+    BTCUSDT:
+      exchange: binance
+      timeframe: 1m
+      path: data/BTCUSDT_kline_1m_20260201_20260706_20260706_150041.csv
+      funding_path: data/binance_funding_rate_BTCUSDT_20260706_133637.csv
+    COINUSDT:
+      exchange: binance
+      timeframe: 1m
+      path: data/COINUSDT_kline_1m_20260209_20260706_20260706_150018.csv
+      funding_path: data/binance_funding_rate_COINUSDT_20260706_134744.csv
+  benchmarks: {}
+backtest:
+  initial_cash: 100000
+pair:
+  x_symbol: BTCUSDT
+  y_symbol: COINUSDT
+active_setup: cointegration_beta
+setups:
+  cointegration_fixed:
+    signal: cointegration_zscore
+    position_sizing: fixed_notional
+    position_management: default
+  cointegration_beta:
+    signal: cointegration_zscore
+    position_sizing: beta_neutral
+    position_management: default
+  cointegration_volatility:
+    signal: cointegration_zscore
+    position_sizing: volatility_neutral
+    position_management: default
+  ratio_fixed:
+    signal: ratio_zscore
+    position_sizing: fixed_notional
+    position_management: default
+  momentum_filter_fixed:
+    signal: momentum_filter_zscore
+    position_sizing: fixed_notional
+    position_management: default
+  funding_filter_fixed:
+    signal: funding_filter_zscore
+    position_sizing: fixed_notional
+    position_management: default
+signals:
+  cointegration_zscore:
+    type: cointegration_zscore
+    regression_method: log_price
+    warmup_bars: 4320
+    model_lookback_bars: 4320
+    model_update_interval_bars: 240
+    zscore_lookback_bars: 1440
+    entry_z: 2.0
+    exit_z: 0.3
+  ratio_zscore:
+    type: ratio_zscore
+    warmup_bars: 4320
+    zscore_lookback_bars: 1440
+    entry_z: 2.0
+    exit_z: 0.5
+  momentum_filter_zscore:
+    type: momentum_filter_zscore
+    warmup_bars: 4320
+    model_lookback_bars: 10080
+    model_update_interval_bars: 240
+    zscore_lookback_bars: 1440
+    momentum_lookback_bars: 30
+    max_abs_momentum: 0.5
+    entry_z: 2.0
+    exit_z: 0.5
+  funding_filter_zscore:
+    type: funding_filter_zscore
+    warmup_bars: 4320
+    model_lookback_bars: 10080
+    model_update_interval_bars: 240
+    zscore_lookback_bars: 1440
+    funding_spread_threshold: 0.0001
+    entry_z: 2.0
+    exit_z: 0.5
+position_sizing:
+  fixed_notional:
+    method: fixed_notional
+    notional: 10000
+  beta_neutral:
+    method: beta_neutral
+    equity: 100000
+    gross_exposure_ratio: 0.4
+    max_gross_exposure_ratio: 1.0
+  volatility_neutral:
+    method: volatility_neutral
+    equity: 100000
+    gross_exposure_ratio: 0.2
+    max_gross_exposure_ratio: 1.0
+position_management:
+  default:
+    max_add_times: 2
+    add_interval_bars: 60
+cost:
+  fee_rate: 0.0005
+  slippage_bps: 1
+  funding_enabled: true
+risk:
+  order_hedge_ratio_tolerance: 0.02
+  position_hedge_ratio_tolerance: 0.05
+
