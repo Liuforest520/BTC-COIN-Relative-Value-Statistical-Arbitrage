@@ -23,6 +23,7 @@ def build_strategy(setup_config, symbols):
         y_symbol=y_symbol,
         max_add_times=int(management.get("max_add_times", 0)),
         add_interval_bars=int(management.get("add_interval_bars", 1)),
+        pending_timeout_bars=int(management.get("pending_timeout_bars", 5)),
         name=setup_config.name,
     )
 

@@ -15,6 +15,7 @@ class PairTradingStrategy(BaseStrategy):
         y_symbol="COINUSDT",
         max_add_times=0,
         add_interval_bars=1,
+        pending_timeout_bars=5,
         name="pair_trading",
     ):
         super().__init__()
@@ -26,6 +27,7 @@ class PairTradingStrategy(BaseStrategy):
         self.y_symbol = y_symbol
         self.max_add_times = max_add_times
         self.add_interval_bars = add_interval_bars
+        self.pending_timeout_bars = pending_timeout_bars
         self.name = name
 
         self.position_side = None
@@ -34,16 +36,26 @@ class PairTradingStrategy(BaseStrategy):
         self.y_quantity = 0.0
         self.entry_count = 0
         self.last_entry_bar_index = None
+        self.last_open_reject_bar_index = None
         self.pending_state = None
+        self.pending_fills = []
 
     def on_bar(self, bars: dict):
+        bar_index = len(self.data)
         if self.pending_state is not None:
+            timeout_orders = self._pending_timeout_orders(bar_index)
+            if timeout_orders:
+                self._record_pending_timeout()
+                self.pending_state = None
+                self.pending_fills = []
+                return timeout_orders
             return []
 
-        bar_index = len(self.data)
         decision = self.signal(bars, self.position_side)
 
         if decision.action == "open":
+            if self._open_reject_cooldown_active(bar_index):
+                return []
             if self.position_side is not None and not self._can_add(decision.side, bar_index):
                 return []
             return self._open_orders(bars, decision, bar_index)
@@ -65,18 +77,30 @@ class PairTradingStrategy(BaseStrategy):
             return False
         return True
 
+    def _open_reject_cooldown_active(self, bar_index):
+        if self.last_open_reject_bar_index is None:
+            return False
+        return bar_index - self.last_open_reject_bar_index < self.add_interval_bars
+
     def _open_orders(self, bars, decision, bar_index):
         group_id = f"{self.name}-open-{bar_index}-{uuid4().hex[:8]}"
         position_id = self.position_id or f"{self.name}-position-{bar_index}"
 
-        sizing = self.sizing.notionals(
-            bars=bars,
-            x_leg=(self.x_exchange, self.x_symbol),
-            y_leg=(self.y_exchange, self.y_symbol),
-            hedge_ratio=decision.hedge_ratio,
-            x_vol=decision.long_vol,
-            y_vol=decision.short_vol,
-        )
+        try:
+            sizing = self.sizing.notionals(
+                bars=bars,
+                x_leg=(self.x_exchange, self.x_symbol),
+                y_leg=(self.y_exchange, self.y_symbol),
+                hedge_ratio=decision.hedge_ratio,
+                x_vol=decision.long_vol,
+                y_vol=decision.short_vol,
+            )
+        except ValueError as exc:
+            state = getattr(self.signal, "last_state", {}) or {}
+            state["action"] = "none"
+            state["reason"] = str(exc)
+            self.signal.last_state = state
+            return []
         x_quantity = sizing["x_quantity"]
         y_quantity = sizing["y_quantity"]
 
@@ -88,17 +112,7 @@ class PairTradingStrategy(BaseStrategy):
             y_side = OrderSide.BUY
         target_hedge_ratio = self._target_hedge_ratio(decision)
 
-        self.pending_state = {
-            "action": "open",
-            "group_id": group_id,
-            "position_id": position_id,
-            "position_side": decision.side,
-            "x_quantity_delta": x_quantity,
-            "y_quantity_delta": y_quantity,
-            "bar_index": bar_index,
-        }
-
-        return [
+        orders = [
             self._order(
                 order_id=f"{group_id}-{self.x_symbol}",
                 group_id=group_id,
@@ -125,6 +139,20 @@ class PairTradingStrategy(BaseStrategy):
             ),
         ]
 
+        self.pending_state = {
+            "action": "open",
+            "group_id": group_id,
+            "position_id": position_id,
+            "position_side": decision.side,
+            "x_quantity_delta": x_quantity,
+            "y_quantity_delta": y_quantity,
+            "bar_index": bar_index,
+            "orders": self._pending_order_refs(orders),
+        }
+        self.pending_fills = []
+
+        return orders
+
     def _close_orders(self, bars, bar_index):
         group_id = f"{self.name}-close-{bar_index}-{uuid4().hex[:8]}"
         position_id = self.position_id
@@ -135,12 +163,6 @@ class PairTradingStrategy(BaseStrategy):
         else:
             x_side = OrderSide.BUY
             y_side = OrderSide.SELL
-
-        self.pending_state = {
-            "action": "close",
-            "group_id": group_id,
-            "position_id": position_id,
-        }
 
         orders = [
             self._order(
@@ -166,18 +188,28 @@ class PairTradingStrategy(BaseStrategy):
                 position_id=position_id,
             ),
         ]
+        self.pending_state = {
+            "action": "close",
+            "group_id": group_id,
+            "position_id": position_id,
+            "bar_index": bar_index,
+            "orders": self._pending_order_refs(orders),
+        }
+        self.pending_fills = []
 
         return orders
 
     def on_orders_accepted(self, orders):
         if not self.pending_state or not orders:
             self.pending_state = None
+            self.pending_fills = []
             return
 
         group_id = self.pending_state["group_id"]
         accepted_group = [order for order in orders if order.group_id == group_id]
         if len(accepted_group) != 2:
             self.pending_state = None
+            self.pending_fills = []
         return
 
     def on_trades_filled(self, trades):
@@ -185,14 +217,24 @@ class PairTradingStrategy(BaseStrategy):
             return
 
         group_id = self.pending_state.get("group_id")
-        filled_group = [trade for trade in trades if trade.group_id == group_id]
-        if len(filled_group) != 2:
+        new_fills = [trade for trade in trades if trade.group_id == group_id]
+        if not new_fills:
             return
 
+        seen_order_ids = {trade.order_id for trade in self.pending_fills}
+        self.pending_fills.extend(trade for trade in new_fills if trade.order_id not in seen_order_ids)
+
+        filled_symbols = {trade.symbol for trade in self.pending_fills}
+        if self.x_symbol not in filled_symbols or self.y_symbol not in filled_symbols:
+            return
+
+        filled_group = self.pending_fills
         if self.pending_state["action"] == "open":
             x_quantity = self._filled_quantity(filled_group, self.x_symbol)
             y_quantity = self._filled_quantity(filled_group, self.y_symbol)
             if x_quantity <= 0 or y_quantity <= 0:
+                self.pending_state = None
+                self.pending_fills = []
                 return
 
             if self.position_id is None:
@@ -209,24 +251,71 @@ class PairTradingStrategy(BaseStrategy):
             self.y_quantity = 0.0
             self.entry_count = 0
             self.last_entry_bar_index = None
+            self.last_open_reject_bar_index = None
 
         self.pending_state = None
+        self.pending_fills = []
 
     def on_orders_rejected(self, orders):
         if not self.pending_state:
             return
         if not orders:
             self.pending_state = None
+            self.pending_fills = []
             return
 
         group_id = self.pending_state["group_id"]
         if any(order.group_id == group_id for order in orders):
+            if self.pending_state.get("action") == "open":
+                self.last_open_reject_bar_index = self.pending_state.get("bar_index")
             self.pending_state = None
+            self.pending_fills = []
 
     def _filled_quantity(self, trades, symbol):
         return sum(float(trade.quantity) for trade in trades if trade.symbol == symbol)
 
-    def _order(self, order_id, group_id, exchange, symbol, action, side, quantity, price=None, position_id=None, target_hedge_ratio=None):
+    def _pending_timeout_orders(self, bar_index):
+        if self.pending_timeout_bars is None or self.pending_timeout_bars <= 0:
+            return []
+        if not self.pending_state:
+            return []
+        started_at = self.pending_state.get("bar_index")
+        if started_at is None or bar_index - started_at < self.pending_timeout_bars:
+            return []
+        if self.pending_fills:
+            return []
+        return [
+            self._order(
+                order_id=f"{item['group_id']}-cancel-{item['symbol']}",
+                group_id=item["group_id"],
+                exchange=item["exchange"],
+                symbol=item["symbol"],
+                action=OrderAction.CANCEL,
+                side=None,
+                quantity=0.0,
+                cancel_order_id=item["order_id"],
+            )
+            for item in self.pending_state.get("orders", [])
+        ]
+
+    def _pending_order_refs(self, orders):
+        return [
+            {
+                "order_id": order.order_id,
+                "group_id": order.group_id,
+                "exchange": order.exchange,
+                "symbol": order.symbol,
+            }
+            for order in orders
+        ]
+
+    def _record_pending_timeout(self):
+        state = getattr(self.signal, "last_state", {}) or {}
+        state["action"] = "none"
+        state["reason"] = f"pending {self.pending_state.get('action')} timeout"
+        self.signal.last_state = state
+
+    def _order(self, order_id, group_id, exchange, symbol, action, side=None, quantity=None, price=None, position_id=None, target_hedge_ratio=None, cancel_order_id=None):
         return Order(
             order_id=order_id,
             group_id=group_id,
@@ -238,6 +327,7 @@ class PairTradingStrategy(BaseStrategy):
             order_type=OrderType.MARKET,
             quantity=quantity,
             price=price,
+            cancel_order_id=cancel_order_id,
             target_hedge_ratio=target_hedge_ratio,
         )
 

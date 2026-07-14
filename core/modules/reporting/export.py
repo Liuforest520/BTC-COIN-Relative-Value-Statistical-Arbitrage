@@ -1,5 +1,6 @@
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 import json
 import shutil
@@ -187,7 +188,7 @@ def _write_csv(path, rows):
 
 
 def _write_json(path, data):
-    path.write_text(json.dumps(_json_safe(data), ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(_json_safe(data), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
 
 def _dict_rows(data, key_name, value_name):
@@ -217,4 +218,12 @@ def _json_safe(value):
         return value.value
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, float):
+        if isfinite(value):
+            return value
+        if value > 0:
+            return "Infinity"
+        if value < 0:
+            return "-Infinity"
+        return None
     return value

@@ -66,7 +66,7 @@ class ExchangeManager:
         }
 
     @classmethod
-    def from_names(cls, exchange_names, initial_cash=100000.0, fee_rate=0.0005, slippage_bps=1.0):
+    def from_names(cls, exchange_names, initial_cash=100000.0, fee_rate=0.0005, slippage_bps=1.0, max_leverage=1.0):
         exchange_names = list(exchange_names)
         if not exchange_names:
             raise ValueError("exchange_names cannot be empty")
@@ -78,6 +78,7 @@ class ExchangeManager:
                 initial_cash=cash_per_exchange,
                 fee_rate=fee_rate,
                 slippage_bps=slippage_bps,
+                max_leverage=max_leverage,
             )
         return cls(exchanges)
 

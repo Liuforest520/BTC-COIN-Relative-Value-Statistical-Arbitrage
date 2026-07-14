@@ -15,6 +15,8 @@ class PositionHedgeRatioRisk(BaseRisk):
     def check(self, trades=None, positions=None, bars=None, **kwargs):
         if trades:
             self._update_lots(trades)
+            if self._has_close_trades(trades) and self._positions_flat(positions):
+                self._clear_lots()
 
         if not positions:
             return RiskResult(True, self.name, "no positions")
@@ -69,13 +71,50 @@ class PositionHedgeRatioRisk(BaseRisk):
 
     def _close_lots(self, group):
         position_id = self._position_id(group)
-        if position_id is not None:
-            lots = self.position_lots.pop(position_id, [])
-            for lot in lots:
-                self.target_long_value -= lot.target_ratio * lot.short_value
-                self.target_short_value -= lot.short_value
-            self.target_long_value = max(self.target_long_value, 0.0)
-            self.target_short_value = max(self.target_short_value, 0.0)
+        if position_id is None:
+            return
+
+        lots = self.position_lots.get(position_id, [])
+        if not lots:
+            return
+
+        close_short_value, close_long_value = split_long_short(group, trade_notional)
+        if close_long_value is None or close_short_value is None:
+            return
+
+        remaining_long_to_close = float(close_long_value)
+        remaining_short_to_close = float(close_short_value)
+        remaining_lots = []
+
+        for lot in lots:
+            long_fraction = remaining_long_to_close / lot.long_value if lot.long_value > 0 else 0.0
+            short_fraction = remaining_short_to_close / lot.short_value if lot.short_value > 0 else 0.0
+            close_fraction = min(1.0, max(long_fraction, short_fraction))
+
+            if close_fraction <= 0:
+                remaining_lots.append(lot)
+                continue
+
+            closed_long_value = lot.long_value * close_fraction
+            closed_short_value = lot.short_value * close_fraction
+            self.target_long_value -= lot.target_ratio * closed_short_value
+            self.target_short_value -= closed_short_value
+
+            remaining_long_to_close = max(remaining_long_to_close - closed_long_value, 0.0)
+            remaining_short_to_close = max(remaining_short_to_close - closed_short_value, 0.0)
+            lot.long_value -= closed_long_value
+            lot.short_value -= closed_short_value
+
+            if lot.long_value > 1e-12 and lot.short_value > 1e-12:
+                remaining_lots.append(lot)
+
+        if remaining_lots:
+            self.position_lots[position_id] = remaining_lots
+        else:
+            self.position_lots.pop(position_id, None)
+
+        self.target_long_value = max(self.target_long_value, 0.0)
+        self.target_short_value = max(self.target_short_value, 0.0)
 
     def _target_ratio(self, group, long_value, short_value):
         ratios = [
@@ -120,3 +159,18 @@ class PositionHedgeRatioRisk(BaseRisk):
             if position_id is not None:
                 return position_id
         return None
+
+    def _has_close_trades(self, trades):
+        return any(value_of(getattr(trade, "action", None)) == OrderAction.CLOSE.value for trade in trades or [])
+
+    def _positions_flat(self, positions):
+        for exchange_positions in (positions or {}).values():
+            for quantity in exchange_positions.values():
+                if abs(float(quantity)) > 1e-12:
+                    return False
+        return True
+
+    def _clear_lots(self):
+        self.position_lots.clear()
+        self.target_long_value = 0.0
+        self.target_short_value = 0.0

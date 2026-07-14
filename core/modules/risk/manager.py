@@ -77,7 +77,7 @@ def build_risk_manager(strategy_config, risk_config=None):
     order_tolerance = float(risk_config.get("order_hedge_ratio_tolerance", 0.02))
     position_tolerance = float(risk_config.get("position_hedge_ratio_tolerance", 0.05))
 
-    if hedge_method in ["fixed_notional", "equity_ratio", "dollar_neutral"]:
+    if hedge_method in ["fixed_notional", "dollar_neutral"]:
         hedge_risk = DollarNeutralRisk(max_deviation=order_tolerance)
     else:
         hedge_risk = HedgeRatioRisk(hedge_method=hedge_method, max_deviation=order_tolerance)

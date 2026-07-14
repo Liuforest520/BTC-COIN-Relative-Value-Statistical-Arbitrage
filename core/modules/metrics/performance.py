@@ -1,10 +1,12 @@
 from dataclasses import asdict, is_dataclass
-from math import sqrt
+from math import isfinite, sqrt
 
 import polars as pl
 
 
+MINUTES_PER_YEAR = 365 * 24 * 60
 MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000
+MILLISECONDS_PER_YEAR = 365 * MILLISECONDS_PER_DAY
 
 
 def calculate_metrics(
@@ -50,14 +52,15 @@ def performance_metrics(equity_curve) -> dict:
 
     mean_return = _series_mean(returns, "return")
     std_return = _series_std(returns, "return")
-    annualized_return = mean_return * MINUTES_PER_YEAR if mean_return is not None else None
-    annualized_volatility = std_return * sqrt(MINUTES_PER_YEAR) if std_return is not None else None
+    annualization_factor = _annualization_factor(equity)
+    annualized_return = mean_return * annualization_factor if mean_return is not None else None
+    annualized_volatility = std_return * sqrt(annualization_factor) if std_return is not None else None
     sharpe = annualized_return / annualized_volatility if annualized_volatility else None
 
     equity = equity.with_columns(pl.col("equity").cum_max().alias("peak"))
     equity = equity.with_columns((pl.col("equity") / pl.col("peak") - 1).alias("drawdown"))
     max_drawdown = _series_min(equity, "drawdown")
-    calmar = annualized_return / abs(max_drawdown) if max_drawdown and max_drawdown < 0 else None
+    calmar = _calmar_ratio(annualized_return, max_drawdown)
 
     return {
         "initial_equity": initial_equity,
@@ -118,7 +121,7 @@ def cost_metrics(trades, funding_payments=None) -> dict:
     if trades.is_empty():
         return {
             "total_fee": 0.0,
-            "total_slippage": None,
+            "total_slippage": 0.0,
             **funding_stats,
             "funding_payment_count": funding_payments.height,
         }
@@ -400,6 +403,46 @@ def _elapsed_days(frame):
         return None
 
     return elapsed_days if elapsed_days > 0 else None
+
+
+def _annualization_factor(equity):
+    if equity.is_empty() or "ts" not in equity.columns:
+        return MINUTES_PER_YEAR
+
+    timestamps = (
+        equity.select(pl.col("ts").cast(pl.Int64, strict=False).alias("ts"))
+        .drop_nulls("ts")
+        .sort("ts")
+    )
+    if timestamps.height < 2:
+        return MINUTES_PER_YEAR
+
+    diffs = (
+        timestamps.with_columns(pl.col("ts").diff().alias("interval_ms"))
+        .drop_nulls("interval_ms")
+        .filter(pl.col("interval_ms") > 0)
+    )
+    if diffs.is_empty():
+        return MINUTES_PER_YEAR
+
+    interval_ms = float(diffs["interval_ms"].median())
+    if interval_ms <= 0 or not isfinite(interval_ms):
+        return MINUTES_PER_YEAR
+    return MILLISECONDS_PER_YEAR / interval_ms
+
+
+def _calmar_ratio(annualized_return, max_drawdown):
+    if annualized_return is None or max_drawdown is None:
+        return None
+    if max_drawdown < 0:
+        return annualized_return / abs(max_drawdown)
+    if max_drawdown == 0:
+        if annualized_return > 0:
+            return float("inf")
+        if annualized_return < 0:
+            return float("-inf")
+        return 0.0
+    return None
 
 
 def _benchmark_metrics(benchmark_returns):

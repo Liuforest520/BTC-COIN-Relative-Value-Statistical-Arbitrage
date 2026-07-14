@@ -3,12 +3,22 @@ from core.modules.strategy import BAR_COLUMNS
 
 
 class Exchange:
-    def __init__(self, exchange_name, initial_cash=100000.0, fee_rate=0.0005, slippage_bps=1.0):
+    def __init__(
+        self,
+        exchange_name,
+        initial_cash=100000.0,
+        fee_rate=0.0005,
+        slippage_bps=1.0,
+        max_leverage=1.0,
+    ):
         self.exchange_name = exchange_name
         self.initial_cash = initial_cash
         self.cash = initial_cash
         self.fee_rate = fee_rate
         self.slippage = slippage_bps / 10000
+        self.max_leverage = 1.0 if max_leverage is None else float(max_leverage)
+        if self.max_leverage <= 0:
+            raise ValueError("max_leverage must be positive")
         self.positions = {}
         self.orders = []
         self.order_history = []
@@ -31,7 +41,9 @@ class Exchange:
 
             if order.action == OrderAction.CANCEL:
                 self.cancel_order(order.cancel_order_id)
+                order.status = OrderStatus.CANCELED
                 self.order_history.append(order)
+                accepted.append(order)
             else:
                 self.orders.append(order)
                 self.order_history.append(order)
@@ -61,8 +73,14 @@ class Exchange:
         remaining_orders = []
 
         funding_payments = self._apply_funding(bars, funding_rates)
+        margin_rejected_ids = self._margin_rejected_order_ids(bars)
 
         for order in self.orders:
+            if order.order_id in margin_rejected_ids:
+                order.status = OrderStatus.REJECTED
+                rejected_orders.append(order)
+                continue
+
             bar = bars.get(order.symbol)
             if bar is None:
                 remaining_orders.append(order)
@@ -158,6 +176,78 @@ class Exchange:
             new_position = 0.0
         self.positions[symbol] = new_position
 
+    def _margin_rejected_order_ids(self, bars):
+        rejected = set()
+        groups = {}
+        for order in self.orders:
+            if self._value(order.action) != OrderAction.OPEN.value:
+                continue
+            groups.setdefault(order.group_id, []).append(order)
+
+        for group_orders in groups.values():
+            if not self._can_open_group(group_orders, bars):
+                rejected.update(order.order_id for order in group_orders)
+        return rejected
+
+    def _can_open_group(self, orders, bars):
+        cash = float(self.cash)
+        positions = dict(self.positions)
+
+        for order in orders:
+            bar = bars.get(order.symbol)
+            if bar is None:
+                return False
+
+            price = self._projected_order_price(order, bar)
+            if price is None:
+                return False
+
+            quantity = float(order.quantity)
+            notional = price * quantity
+            fee = notional * self.fee_rate
+            side = self._value(order.side)
+
+            if side == OrderSide.BUY.value:
+                cash -= notional + fee
+                positions[order.symbol] = positions.get(order.symbol, 0.0) + quantity
+            elif side == OrderSide.SELL.value:
+                cash += notional - fee
+                positions[order.symbol] = positions.get(order.symbol, 0.0) - quantity
+            else:
+                return False
+
+        equity, gross_exposure = self._projected_exposure(cash, positions, bars)
+        if equity <= 0:
+            return False
+        return gross_exposure <= equity * self.max_leverage + 1e-9
+
+    def _projected_order_price(self, order, bar):
+        order_type = self._value(order.order_type)
+        if order.quantity is None or order.quantity <= 0:
+            order.status = OrderStatus.REJECTED
+            return None
+        if order_type == OrderType.LIMIT.value:
+            if order.price is None or order.price <= 0:
+                order.status = OrderStatus.REJECTED
+                return None
+            return float(order.price)
+        return self._get_trade_price(order, bar)
+
+    def _projected_exposure(self, cash, positions, bars):
+        position_value = 0.0
+        gross_exposure = 0.0
+        for symbol, quantity in positions.items():
+            if abs(float(quantity)) < 1e-12:
+                continue
+            bar = bars.get(symbol)
+            if bar is None:
+                continue
+            mark_price = float(bar["close"])
+            value = float(quantity) * mark_price
+            position_value += value
+            gross_exposure += abs(value)
+        return cash + position_value, gross_exposure
+
     def _get_trade_price(self, order, bar):
         order_type = self._value(order.order_type)
         side = self._value(order.side)
@@ -194,6 +284,12 @@ class Exchange:
 
     def _apply_funding(self, bars, funding_rates):
         payments = []
+        for event in self._funding_events(funding_rates):
+            payments.extend(self._apply_funding_rates(bars, event["rates"], event.get("ts")))
+        return payments
+
+    def _apply_funding_rates(self, bars, funding_rates, event_ts=None):
+        payments = []
         for symbol, funding_rate in funding_rates.items():
             quantity = self.positions.get(symbol, 0.0)
             if abs(quantity) < 1e-12:
@@ -211,7 +307,7 @@ class Exchange:
             funding_payment = FundingPayment(
                 exchange=self.exchange_name,
                 symbol=symbol,
-                ts=bar["ts"],
+                ts=event_ts if event_ts is not None else bar["ts"],
                 funding_rate=float(funding_rate),
                 quantity=float(quantity),
                 mark_price=mark_price,
@@ -222,6 +318,17 @@ class Exchange:
             payments.append(funding_payment)
 
         return payments
+
+    def _funding_events(self, funding_rates):
+        if not funding_rates:
+            return []
+        if isinstance(funding_rates, list):
+            return funding_rates
+        if isinstance(funding_rates, tuple):
+            return list(funding_rates)
+        if isinstance(funding_rates, dict) and "rates" in funding_rates:
+            return [funding_rates]
+        return [{"ts": None, "rates": funding_rates}]
 
     def _format_bars(self, bars):
         if isinstance(bars, list):

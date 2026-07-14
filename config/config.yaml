@@ -30,53 +30,38 @@ setups:
     signal: cointegration_zscore
     position_sizing: volatility_neutral
     position_management: default
-  ratio_fixed:
-    signal: ratio_zscore
-    position_sizing: fixed_notional
-    position_management: default
-  momentum_filter_fixed:
-    signal: momentum_filter_zscore
-    position_sizing: fixed_notional
-    position_management: default
-  funding_filter_fixed:
-    signal: funding_filter_zscore
-    position_sizing: fixed_notional
-    position_management: default
 signals:
   cointegration_zscore:
     type: cointegration_zscore
-    regression_method: log_price
     warmup_bars: 4320
-    model_lookback_bars: 4320
-    model_update_interval_bars: 240
+    spread_model:
+      regression_method: deming_returns
+      deming_delta: 1.0
+      lookback_bars: 4320
+      update_interval_bars: 240
+    hedge_model:
+      regression_method: deming_returns
+      deming_delta: 1.0
+      lookback_bars: 1440
+      update_interval_bars: 1
+    entry_rule:
+      method: rolling_quantile
+      lookback_bars: 10080
+      update_interval_bars: 60
+      upper_percentile: 97.5
+      lower_percentile: 2.5
+      min_samples: 1440
+      min_abs_entry_z: 2.0
+      max_abs_entry_z: 5.0
+    entry_filters:
+      beta_stability:
+        enabled: true
+        lookback_bars: 1440
+        max_cv: 0.1
+        min_samples: 240
     zscore_lookback_bars: 1440
     entry_z: 2.0
     exit_z: 0.3
-  ratio_zscore:
-    type: ratio_zscore
-    warmup_bars: 4320
-    zscore_lookback_bars: 1440
-    entry_z: 2.0
-    exit_z: 0.5
-  momentum_filter_zscore:
-    type: momentum_filter_zscore
-    warmup_bars: 4320
-    model_lookback_bars: 10080
-    model_update_interval_bars: 240
-    zscore_lookback_bars: 1440
-    momentum_lookback_bars: 30
-    max_abs_momentum: 0.5
-    entry_z: 2.0
-    exit_z: 0.5
-  funding_filter_zscore:
-    type: funding_filter_zscore
-    warmup_bars: 4320
-    model_lookback_bars: 10080
-    model_update_interval_bars: 240
-    zscore_lookback_bars: 1440
-    funding_spread_threshold: 0.0001
-    entry_z: 2.0
-    exit_z: 0.5
 position_sizing:
   fixed_notional:
     method: fixed_notional
@@ -95,6 +80,7 @@ position_management:
   default:
     max_add_times: 2
     add_interval_bars: 60
+    pending_timeout_bars: 5
 cost:
   fee_rate: 0.0005
   slippage_bps: 1
@@ -102,4 +88,5 @@ cost:
 risk:
   order_hedge_ratio_tolerance: 0.02
   position_hedge_ratio_tolerance: 0.05
+  max_leverage: 1.0
 

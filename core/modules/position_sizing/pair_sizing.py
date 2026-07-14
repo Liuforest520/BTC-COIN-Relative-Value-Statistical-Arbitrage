@@ -1,3 +1,6 @@
+from math import isfinite
+
+
 class PairSizing:
     def __init__(
         self,
@@ -19,10 +22,6 @@ class PairSizing:
         if self.method == "fixed_notional":
             x_notional = self.notional
             y_notional = self.notional
-        elif self.method == "equity_ratio":
-            gross_notional = self._gross_notional()
-            x_notional = gross_notional / 2
-            y_notional = gross_notional / 2
         elif self.method == "beta_neutral":
             gross_notional = self._gross_notional()
             beta = abs(float(hedge_ratio)) if hedge_ratio else 1.0
@@ -30,8 +29,10 @@ class PairSizing:
             y_notional = gross_notional / (1 + beta)
         elif self.method == "volatility_neutral":
             gross_notional = self._gross_notional()
-            x_risk = 1 / x_vol if x_vol and x_vol > 0 else 1.0
-            y_risk = 1 / y_vol if y_vol and y_vol > 0 else 1.0
+            if not self._valid_vol(x_vol) or not self._valid_vol(y_vol):
+                raise ValueError("volatility_neutral sizing requires finite positive volatility")
+            x_risk = 1 / x_vol
+            y_risk = 1 / y_vol
             base = x_risk + y_risk
             x_notional = gross_notional * x_risk / base
             y_notional = gross_notional * y_risk / base
@@ -40,11 +41,13 @@ class PairSizing:
 
         x_notional = max(float(x_notional), self.min_notional)
         y_notional = max(float(y_notional), self.min_notional)
+        x_price = self._open_price(bars, x_leg)
+        y_price = self._open_price(bars, y_leg)
         return {
             "x_notional": x_notional,
             "y_notional": y_notional,
-            "x_quantity": x_notional / self._open_price(bars, x_leg),
-            "y_quantity": y_notional / self._open_price(bars, y_leg),
+            "x_quantity": x_notional / x_price,
+            "y_quantity": y_notional / y_price,
         }
 
     def _gross_notional(self):
@@ -54,4 +57,10 @@ class PairSizing:
 
     def _open_price(self, bars, leg):
         exchange, symbol = leg
-        return float(bars[exchange][symbol][1])
+        price = float(bars[exchange][symbol][1])
+        if not isfinite(price) or price <= 0:
+            raise ValueError(f"invalid open price for {exchange}.{symbol}: {price}")
+        return price
+
+    def _valid_vol(self, value):
+        return value is not None and isfinite(float(value)) and float(value) > 0

@@ -43,6 +43,9 @@ class Backtest:
         funding_data = self._load_funding_data()
         joined_data = self._join_market_data(market_data)
         self._check_funding_alignment(funding_data, joined_data)
+        funding_timestamps = sorted(funding_data)
+        funding_index = 0
+        previous_ts = None
         last_bars = None
 
         for bars in tqdm(
@@ -56,12 +59,25 @@ class Backtest:
         ):
             last_bars = bars
             ts = self._bars_ts(bars)
-            funding_rates = funding_data.get(ts, {}) if self.config.funding_enabled else {}
-            exchange_result = self.exchange_manager.on_bar(bars, funding_rates=funding_rates)
+            if self.config.funding_enabled:
+                funding_events, funding_index = self._funding_events_for_bar(
+                    funding_data,
+                    funding_timestamps,
+                    funding_index,
+                    previous_ts,
+                    ts,
+                )
+                funding_rates = self._latest_funding_rates(funding_events)
+            else:
+                funding_events = []
+                funding_rates = {}
+
+            exchange_result = self.exchange_manager.on_bar(bars, funding_rates=funding_events)
             self.position_curve.append(self._position_snapshot(ts, bars, exchange_result))
             new_trades = exchange_result["new_trades"]
             rejected_orders = exchange_result["rejected_orders"]
             self.strategy.on_funding_rates(funding_rates)
+            previous_ts = ts
 
             if new_trades:
                 self.trades.extend(new_trades)
@@ -128,7 +144,17 @@ class Backtest:
             initial_cash=self.config.initial_cash,
             fee_rate=self.config.fee_rate,
             slippage_bps=self.config.slippage_bps,
+            max_leverage=self._max_leverage(),
         )
+
+    def _max_leverage(self):
+        raw_value = self.config.risk.get("max_leverage", 1.0)
+        if raw_value is None:
+            return 1.0
+        max_leverage = float(raw_value)
+        if max_leverage <= 0:
+            raise ValueError("risk.max_leverage must be positive")
+        return max_leverage
 
     def _load_market_data(self):
         data = {}
@@ -165,10 +191,40 @@ class Backtest:
         bar_timestamps = set(joined_data["ts"].to_list())
         funding_timestamps = set(funding_data.keys())
         matched = funding_timestamps & bar_timestamps
+        start_ts = joined_data["ts"].min()
+        end_ts = joined_data["ts"].max()
+        in_range = {ts for ts in funding_timestamps if start_ts <= ts <= end_ts}
         if not matched:
-            logger.warning("funding rate timestamps have zero overlap with bar timestamps — funding will never be applied")
+            logger.warning(
+                "funding rate timestamps have zero exact overlap with bar timestamps; "
+                "{} events are inside the backtest range and will be applied on the next bar",
+                len(in_range),
+            )
         elif len(matched) < len(funding_timestamps):
-            logger.info("funding rate timestamps: {} matched / {} total", len(matched), len(funding_timestamps))
+            logger.info(
+                "funding rate timestamps: {} exact matches / {} in range / {} total",
+                len(matched),
+                len(in_range),
+                len(funding_timestamps),
+            )
+
+    def _funding_events_for_bar(self, funding_data, funding_timestamps, funding_index, previous_ts, ts):
+        if ts is None:
+            return [], funding_index
+
+        events = []
+        while funding_index < len(funding_timestamps) and funding_timestamps[funding_index] <= ts:
+            funding_ts = funding_timestamps[funding_index]
+            if previous_ts is None or funding_ts > previous_ts:
+                events.append({"ts": funding_ts, "rates": funding_data[funding_ts]})
+            funding_index += 1
+        return events, funding_index
+
+    def _latest_funding_rates(self, funding_events):
+        rates = {}
+        for event in funding_events:
+            rates.update(event.get("rates", {}))
+        return rates
 
     def _iter_bars(self, market_data, joined):
         symbols = list(market_data.keys())
@@ -319,11 +375,23 @@ class Backtest:
                     "volume": f"{symbol}_volume",
                 }
             )
-            frames.append(frame)
+            frames.append((symbol, frame))
 
-        joined = frames[0]
-        for frame in frames[1:]:
+        _, joined = frames[0]
+        for symbol, frame in frames[1:]:
+            left_rows = joined.height
+            right_rows = frame.height
             joined = joined.join(frame, on="ts", how="inner")
+            dropped_rows = min(left_rows, right_rows) - joined.height
+            if dropped_rows > 0:
+                logger.warning(
+                    "market data inner join dropped {} rows while joining {}; left_rows={} right_rows={} joined_rows={}",
+                    dropped_rows,
+                    symbol,
+                    left_rows,
+                    right_rows,
+                    joined.height,
+                )
 
         return joined.sort("ts")
 
