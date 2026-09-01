@@ -1,4 +1,4 @@
-from .base import SignalDecision
-from .factory import build_signal
+from .zscore import ZScoreSignal
+from .zscore_reversion import ZScoreReversionSignal
 
-__all__ = ["SignalDecision", "build_signal"]
+__all__ = ["ZScoreSignal", "ZScoreReversionSignal"]

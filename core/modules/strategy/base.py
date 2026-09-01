@@ -6,12 +6,25 @@ from core.modules.models import Order
 BAR_COLUMNS = ["ts", "open", "high", "close", "low", "volume"]
 
 
+class BarCounter:
+    def __init__(self):
+        self.count = 0
+
+    def append(self, _item):
+        self.count += 1
+
+    def __len__(self):
+        return self.count
+
+
 class BaseStrategy(ABC):
     def __init__(self):
-        self.data = []
+        self.data = BarCounter()
+        self.validate_bars = True
 
     def __call__(self, bars: dict):
-        self._check_bars(bars)
+        if self.validate_bars:
+            self._check_bars(bars)
         self.data.append(bars)
         orders = self.on_bar(bars)
         return self._check_orders(orders)
@@ -21,9 +34,13 @@ class BaseStrategy(ABC):
             raise TypeError("bars must be a dict")
 
         for exchange, symbols in bars.items():
+            if str(exchange).startswith("_"):
+                continue
             if not isinstance(symbols, dict):
                 raise TypeError(f"bars[{exchange}] must be a dict")
             for symbol, bar in symbols.items():
+                if symbol.startswith("_"):  # skip system keys
+                    continue
                 self._check_bar(bar, exchange, symbol)
 
     def _check_bar(self, bar: list, exchange=None, symbol=None):
@@ -51,6 +68,10 @@ class BaseStrategy(ABC):
 
     def on_funding_rates(self, funding_rates: dict):
         pass
+
+    def set_portfolio_context(self, cash=None, equity=None):
+        self._current_cash = cash
+        self._current_equity = equity
 
     def on_orders_accepted(self, orders: list[Order]):
         pass

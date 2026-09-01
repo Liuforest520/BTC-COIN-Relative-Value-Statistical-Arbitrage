@@ -7,6 +7,7 @@ import polars as pl
 COLUMN_ALIASES = {
     "时间戳": "ts",
     "timestamp": "ts",
+    "open_time": "ts",  # 币安合约 kline 表的时间列（毫秒时间戳）
     "开盘价": "open",
     "最高价": "high",
     "最低价": "low",

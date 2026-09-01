@@ -1,42 +1,120 @@
-# Ignore everything by default.
+# Repository allowlist: ignore everything unless it is explicitly kept below.
 *
 
-# Keep project metadata and docs.
+# Project metadata and top-level documentation.
 !.gitignore
+!.gitattributes
+!.github/
+!.github/**
 !README.md
+!LICENSE
+!LICENSE.*
+!CHANGELOG.md
+!CONTRIBUTING.md
 !requirements.txt
 !pyproject.toml
+!pytest.ini
+!ruff.toml
+!mypy.ini
 
-# Keep source code.
+# Application source code.
 !core/
 !core/**
 
-# Keep only necessary runnable scripts.
+# Runnable scripts and automated tests.
 !scripts/
-!scripts/run_backtest.py
-!scripts/generate_configs.py
-!scripts/run_config_sweep.py
+!scripts/**
+!test/
+!test/**
 
-# Keep only the main config.
+# Maintenance and research source code only.
+!maintenance/
+!maintenance/**
+!research/
+/research/*
+!/research/scripts/
+!/research/scripts/**
+
+# Hand-maintained configuration files.
 !config/
-!config/config.yaml
+/config/*
+!/config/config.yaml
+!/config/archive/
+!/config/archive/*.yaml
+!/config/archive/*.md
+!/config/sweeps/
+/config/sweeps/*
+!/config/sweeps/archive/
+!/config/sweeps/archive/*.yaml
+!/config/sweeps/archive/*.md
+!/config/tls_huber_selected_24/
+!/config/tls_huber_selected_24/*.yaml
 
-# Never upload data, generated configs, logs, reports, or research outputs.
+# Credentials and machine-local configuration must never be committed.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secrets*
+/config/mysql.config
+/config/*.config
+
+# Market data, research documents, dependencies, logs and generated outputs.
 /data/
+/documents/
 /logs/
-/results/
+/node_modules/
 /output/
-/research/
+/outputs/
+/results/
 /tmp/
-/.vscode/
+/优化/
+
+# Generated configuration trees.
 /config/sweep.yaml
 /config/generated/
+/config/sweeps/**/generated/
 
-# Python cache and local environments.
+# Generated research data; research source scripts are allowed above.
+/research/data/
+/research/outputs/
+
+# Python environments, caches, coverage and build artifacts.
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
 .venv/
 venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Local databases and temporary files.
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Editors and operating-system files.
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini

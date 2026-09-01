@@ -24,9 +24,8 @@ def calculate_metrics(
 
     result = {}
     result.update(performance_metrics(equity))
-    result.update(trading_metrics(trade_df, equity))
+    result.update(trading_metrics(trade_df, equity, funding_df))
     result.update(cost_metrics(trade_df, funding_df))
-    result.update(neutrality_metrics(trade_df, order_df, benchmark_returns, hedge_ratio_tolerance))
     return result
 
 
@@ -35,9 +34,12 @@ def performance_metrics(equity_curve) -> dict:
     if equity.is_empty() or "equity" not in equity.columns:
         return _empty_performance_metrics()
 
-    equity = equity.select(["ts", "equity"]) if "ts" in equity.columns else equity.select(["equity"])
+    has_timestamps = "ts" in equity.columns
+    equity = equity.select(["ts", "equity"]) if has_timestamps else equity.select(["equity"])
     equity = equity.with_columns(pl.col("equity").cast(pl.Float64, strict=False))
     equity = equity.drop_nulls("equity")
+    if has_timestamps:
+        equity = equity.sort("ts")
     if equity.height < 2:
         return _empty_performance_metrics()
 
@@ -53,9 +55,10 @@ def performance_metrics(equity_curve) -> dict:
     mean_return = _series_mean(returns, "return")
     std_return = _series_std(returns, "return")
     annualization_factor = _annualization_factor(equity)
-    annualized_return = mean_return * annualization_factor if mean_return is not None else None
+    annualized_mean_return = mean_return * annualization_factor if mean_return is not None else None
+    annualized_return = _compound_annualized_return(equity, initial_equity, final_equity)
     annualized_volatility = std_return * sqrt(annualization_factor) if std_return is not None else None
-    sharpe = annualized_return / annualized_volatility if annualized_volatility else None
+    sharpe = annualized_mean_return / annualized_volatility if annualized_volatility else None
 
     equity = equity.with_columns(pl.col("equity").cum_max().alias("peak"))
     equity = equity.with_columns((pl.col("equity") / pl.col("peak") - 1).alias("drawdown"))
@@ -67,6 +70,7 @@ def performance_metrics(equity_curve) -> dict:
         "final_equity": final_equity,
         "total_return": total_return,
         "annualized_return": annualized_return,
+        "annualized_mean_return": annualized_mean_return,
         "annualized_volatility": annualized_volatility,
         "sharpe": sharpe,
         "calmar": calmar,
@@ -74,19 +78,32 @@ def performance_metrics(equity_curve) -> dict:
     }
 
 
-def trading_metrics(trades, equity_curve=None) -> dict:
+def trading_metrics(trades, equity_curve=None, funding_payments=None) -> dict:
     trades = _normalize_trades(_to_frame(trades))
     if trades.is_empty():
         return {
             "trade_count": 0,
+            "fill_count": 0,
             "win_rate": None,
             "profit_loss_ratio": None,
             "average_holding_minutes": None,
             "daily_turnover": None,
         }
 
-    trade_count = trades.height
+    fill_count = trades.height
     position_pnl = _position_cashflow(trades)
+    position_funding = _position_funding(trades, _to_frame(funding_payments))
+    if not position_pnl.is_empty() and position_funding:
+        position_pnl = position_pnl.with_columns(
+            pl.col("position_key")
+            .map_elements(lambda value: position_funding.get(str(value), 0.0), return_dtype=pl.Float64)
+            .alias("funding_fee")
+        ).with_columns((pl.col("pnl") - pl.col("funding_fee")).alias("pnl"))
+    group_column = "position_id" if "position_id" in trades.columns else "group_id"
+    trade_count = (
+        trades[group_column].drop_nulls().n_unique()
+        if group_column in trades.columns else position_pnl.height
+    )
     win_rate = None
     profit_loss_ratio = None
 
@@ -107,6 +124,7 @@ def trading_metrics(trades, equity_curve=None) -> dict:
 
     return {
         "trade_count": trade_count,
+        "fill_count": fill_count,
         "win_rate": win_rate,
         "profit_loss_ratio": profit_loss_ratio,
         "average_holding_minutes": _average_holding_minutes(trades),
@@ -195,7 +213,66 @@ def _position_cashflow(trades):
         .otherwise(-pl.col("notional") - pl.col("fee"))
         .alias("cashflow")
     )
-    return trades.drop_nulls(group_column).group_by(group_column).agg(pl.col("cashflow").sum().alias("pnl"))
+    return (
+        trades.drop_nulls(group_column)
+        .group_by(group_column)
+        .agg(
+            pl.col("cashflow").sum().alias("pnl"),
+            (pl.col("action").cast(pl.Utf8).str.to_lowercase() == "close").any().alias("is_closed"),
+        )
+        .filter(pl.col("is_closed"))
+        .rename({group_column: "position_key"})
+        .drop("is_closed")
+    )
+
+
+def _position_funding(trades: pl.DataFrame, funding: pl.DataFrame) -> dict[str, float]:
+    """Allocate portfolio funding records to open position ids."""
+    if trades.is_empty() or funding.is_empty():
+        return {}
+    group_column = "position_id" if "position_id" in trades.columns else "group_id"
+    required_trade = {group_column, "ts", "symbol", "side", "quantity"}
+    if not required_trade.issubset(trades.columns) or not {"ts", "symbol"}.issubset(funding.columns):
+        return {}
+
+    trade_rows = sorted(trades.to_dicts(), key=lambda row: int(row.get("ts") or 0))
+    funding_rows = sorted(funding.to_dicts(), key=lambda row: int(row.get("ts") or 0))
+    quantities: dict[tuple[str, str | None, str], float] = {}
+    result: dict[str, float] = {}
+    trade_index = 0
+    for event in funding_rows:
+        event_ts = int(event.get("ts") or 0)
+        while trade_index < len(trade_rows) and int(trade_rows[trade_index].get("ts") or 0) < event_ts:
+            row = trade_rows[trade_index]
+            position_key = str(row.get(group_column) or "")
+            if position_key:
+                quantity = abs(float(row.get("quantity") or 0.0))
+                signed = quantity if str(row.get("side") or "").lower() == "buy" else -quantity
+                key = (position_key, row.get("exchange"), str(row.get("symbol") or ""))
+                quantities[key] = quantities.get(key, 0.0) + signed
+            trade_index += 1
+
+        symbol = str(event.get("symbol") or "")
+        exchange = event.get("exchange")
+        active = {
+            key: quantity for key, quantity in quantities.items()
+            if key[2] == symbol
+            and (exchange is None or key[1] is None or key[1] == exchange)
+            and abs(quantity) > 1e-12
+        }
+        rate = _float_value(event.get("funding_rate"))
+        mark = _float_value(event.get("mark_price"))
+        payment = _float_value(event.get("payment"))
+        if rate is not None and mark is not None:
+            allocations = {key: quantity * mark * rate for key, quantity in active.items()}
+        else:
+            total_quantity = sum(active.values())
+            if payment is None or abs(total_quantity) <= 1e-12:
+                continue
+            allocations = {key: payment * quantity / total_quantity for key, quantity in active.items()}
+        for key, allocated in allocations.items():
+            result[key[0]] = result.get(key[0], 0.0) + allocated
+    return result
 
 
 def _open_symmetry_pass_rate(trades, orders=None):
@@ -431,6 +508,36 @@ def _annualization_factor(equity):
     return MILLISECONDS_PER_YEAR / interval_ms
 
 
+def _compound_annualized_return(equity, initial_equity, final_equity):
+    """Return CAGR from the equity endpoints and their actual elapsed time."""
+    if initial_equity is None or final_equity is None:
+        return None
+
+    try:
+        initial_equity = float(initial_equity)
+        final_equity = float(final_equity)
+    except (TypeError, ValueError):
+        return None
+
+    if not isfinite(initial_equity) or not isfinite(final_equity):
+        return None
+    if initial_equity <= 0 or final_equity < 0:
+        return None
+
+    elapsed_days = _elapsed_days(equity)
+    if elapsed_days is None:
+        return None
+    if final_equity == 0:
+        return -1.0
+
+    years = elapsed_days / 365.0
+    if years <= 0 or not isfinite(years):
+        return None
+
+    value = (final_equity / initial_equity) ** (1.0 / years) - 1.0
+    return value if isfinite(value) else None
+
+
 def _calmar_ratio(annualized_return, max_drawdown):
     if annualized_return is None or max_drawdown is None:
         return None
@@ -535,6 +642,7 @@ def _empty_performance_metrics():
         "final_equity": None,
         "total_return": None,
         "annualized_return": None,
+        "annualized_mean_return": None,
         "annualized_volatility": None,
         "sharpe": None,
         "calmar": None,

@@ -1,10 +1,14 @@
 from .base import BAR_COLUMNS, BaseStrategy
-from .factory import build_strategy
-from .pair_trading_strategy import PairTradingStrategy
+
+
+def build_strategy(*args, **kwargs):
+    """Lazy-import build_strategy to avoid circular imports with pipeline."""
+    from .factory import build_strategy as _build
+    return _build(*args, **kwargs)
+
 
 __all__ = [
     "BaseStrategy",
     "BAR_COLUMNS",
-    "PairTradingStrategy",
     "build_strategy",
 ]

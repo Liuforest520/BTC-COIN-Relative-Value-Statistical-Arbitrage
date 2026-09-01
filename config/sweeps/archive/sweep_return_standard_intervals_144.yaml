@@ -1,0 +1,147 @@
+base_config: config/config.yaml
+manifest_path: config/sweeps/archive/generated/sweep_return_standard_intervals_144/manifest.csv
+output_dir: config/sweeps/archive/generated/sweep_return_standard_intervals_144
+result_path: results/sweep_return_standard_intervals_144/sweep_results.csv
+sort_by: sharpe
+fast_summary: true
+progress_interval_bars: 100000
+workers: 4
+
+# Do not rerun any winning configuration in detailed mode or generate HTML reports.
+top_backtest_count: 0
+
+common_params: &common_params
+  cost.funding_enabled: [true]
+  setups.multi_pair_beta.pipeline.estimator.regression_method: [log_return]
+  setups.multi_pair_beta.pipeline.estimator.return_interval_bars: [30, 60, 300]
+  setups.multi_pair_beta.pipeline.estimator.position_update_policy: [freeze]
+  setups.multi_pair_beta.pipeline.signal.position_exit_zscore_method: [standard]
+  setups.multi_pair_beta.pipeline.signal.entry_z: [2.0, 2.5]
+  setups.multi_pair_beta.pipeline.signal.exit_z: [0.5]
+  setups.multi_pair_beta.pipeline.signal.entry_rule_method: [fixed_z]
+  setups.multi_pair_beta.pipeline.signal.two_stage_enabled: [false]
+
+experiments:
+  # TLS: 3 lookbacks x 2 update frequencies x 3 return intervals
+  # x 2 entry thresholds = 36 configs.
+  - name: tls_return_standard_1d_update
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [tls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
+
+  - name: tls_return_standard_3d_update
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [tls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
+
+  # Huber: robust parameters are fixed; 36 configs.
+  - name: huber_return_standard_1d_update
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [huber]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
+      setups.multi_pair_beta.pipeline.estimator.huber_delta: [1.96]
+      setups.multi_pair_beta.pipeline.estimator.huber_iterations: [5]
+
+  - name: huber_return_standard_3d_update
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [huber]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
+      setups.multi_pair_beta.pipeline.estimator.huber_delta: [1.96]
+      setups.multi_pair_beta.pipeline.estimator.huber_iterations: [5]
+
+  # Age-Weighted WLS: bucket endpoints must remain paired with each lookback.
+  # The medium profile is fixed; 36 configs.
+  - name: age_weighted_return_standard_20d_1d
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [age_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
+      setups.multi_pair_beta.pipeline.estimator.age_bucket_end_bars: [[720, 4320, 11520, 28800]]
+      setups.multi_pair_beta.pipeline.estimator.age_wls_profile: [medium]
+
+  - name: age_weighted_return_standard_30d_1d
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [age_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [43200]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
+      setups.multi_pair_beta.pipeline.estimator.age_bucket_end_bars: [[720, 5760, 17280, 43200]]
+      setups.multi_pair_beta.pipeline.estimator.age_wls_profile: [medium]
+
+  - name: age_weighted_return_standard_60d_1d
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [age_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
+      setups.multi_pair_beta.pipeline.estimator.age_bucket_end_bars: [[1440, 10080, 36000, 86400]]
+      setups.multi_pair_beta.pipeline.estimator.age_wls_profile: [medium]
+
+  - name: age_weighted_return_standard_20d_3d
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [age_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
+      setups.multi_pair_beta.pipeline.estimator.age_bucket_end_bars: [[720, 4320, 11520, 28800]]
+      setups.multi_pair_beta.pipeline.estimator.age_wls_profile: [medium]
+
+  - name: age_weighted_return_standard_30d_3d
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [age_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [43200]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
+      setups.multi_pair_beta.pipeline.estimator.age_bucket_end_bars: [[720, 5760, 17280, 43200]]
+      setups.multi_pair_beta.pipeline.estimator.age_wls_profile: [medium]
+
+  - name: age_weighted_return_standard_60d_3d
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [age_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
+      setups.multi_pair_beta.pipeline.estimator.age_bucket_end_bars: [[1440, 10080, 36000, 86400]]
+      setups.multi_pair_beta.pipeline.estimator.age_wls_profile: [medium]
+
+  # Residual-Weighted WLS: fixed 7D short model and medium profile; 36 configs.
+  - name: residual_weighted_return_standard_1d_update
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [residual_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
+      setups.multi_pair_beta.pipeline.estimator.short_model_lookback_bars: [10080]
+      setups.multi_pair_beta.pipeline.estimator.shock_score_boundaries: [[1.5, 2.0, 3.0]]
+      setups.multi_pair_beta.pipeline.estimator.residual_wls_profile: [medium]
+
+  - name: residual_weighted_return_standard_3d_update
+    active_setup: multi_pair_beta
+    params:
+      <<: *common_params
+      setups.multi_pair_beta.pipeline.estimator.method: [residual_weighted_wls]
+      setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
+      setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
+      setups.multi_pair_beta.pipeline.estimator.short_model_lookback_bars: [10080]
+      setups.multi_pair_beta.pipeline.estimator.shock_score_boundaries: [[1.5, 2.0, 3.0]]
+      setups.multi_pair_beta.pipeline.estimator.residual_wls_profile: [medium]

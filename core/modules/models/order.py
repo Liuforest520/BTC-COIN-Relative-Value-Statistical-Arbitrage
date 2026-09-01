@@ -42,3 +42,4 @@ class Order:
     cancel_order_id: str | None = None
     position_id: str | None = None
     target_hedge_ratio: float | None = None
+    pair_id: str | None = None

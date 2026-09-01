@@ -8,3 +8,4 @@ class PositionLot:
     long_value: float
     short_value: float
     target_ratio: float
+    pair_id: str | None = None

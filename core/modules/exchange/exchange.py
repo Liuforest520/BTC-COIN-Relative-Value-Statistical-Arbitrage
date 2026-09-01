@@ -20,11 +20,14 @@ class Exchange:
         if self.max_leverage <= 0:
             raise ValueError("max_leverage must be positive")
         self.positions = {}
+        self.position_lots = {}
         self.orders = []
         self.order_history = []
         self.trade_history = []
         self.funding_history = []
+        self.last_bars = {}
         self.equity = initial_cash
+        self.copy_positions_on_bar = True
 
     def place_order(self, orders):
         if orders is None:
@@ -64,9 +67,11 @@ class Exchange:
             order.status = OrderStatus.CANCELED
         self.orders = []
 
-    def __call__(self, bars, funding_rates=None):
+    def __call__(self, bars, funding_rates=None, blocked_group_ids=None):
         bars = self._format_bars(bars)
+        self.last_bars.update(bars)
         funding_rates = funding_rates or {}
+        blocked_group_ids = blocked_group_ids or set()
         filled_orders = []
         rejected_orders = []
         new_trades = []
@@ -75,30 +80,36 @@ class Exchange:
         funding_payments = self._apply_funding(bars, funding_rates)
         margin_rejected_ids = self._margin_rejected_order_ids(bars)
 
-        for order in self.orders:
-            if order.order_id in margin_rejected_ids:
-                order.status = OrderStatus.REJECTED
-                rejected_orders.append(order)
+        for group_orders in self._pending_order_groups().values():
+            group_id = group_orders[0].group_id
+            if group_id in blocked_group_ids:
+                remaining_orders.extend(group_orders)
                 continue
 
-            bar = bars.get(order.symbol)
-            if bar is None:
-                remaining_orders.append(order)
+            if not self._group_has_current_bars(group_orders, bars):
+                remaining_orders.extend(group_orders)
                 continue
 
-            trade = self._execute_order(order, bar)
-            if trade is None:
-                if order.status != OrderStatus.REJECTED:
-                    remaining_orders.append(order)
-                else:
-                    rejected_orders.append(order)
-            else:
+            if any(order.order_id in margin_rejected_ids for order in group_orders):
+                self._reject_group(group_orders, rejected_orders)
+                continue
+
+            status, prepared = self._prepare_group_execution(group_orders, bars)
+            if status == "waiting":
+                remaining_orders.extend(group_orders)
+                continue
+            if status == "rejected":
+                self._reject_group(group_orders, rejected_orders)
+                continue
+
+            for order, bar, price in prepared:
+                trade = self._execute_prepared_order(order, bar, price)
                 filled_orders.append(order)
                 self.trade_history.append(trade)
                 new_trades.append(trade)
 
         self.orders = remaining_orders
-        self._update_equity(bars)
+        self._update_equity(self.last_bars)
 
         return {
             "filled_orders": filled_orders,
@@ -110,7 +121,7 @@ class Exchange:
             "has_fill": len(filled_orders) > 0,
             "has_open_orders": len(self.orders) > 0,
             "cash": self.cash,
-            "positions": dict(self.positions),
+            "positions": dict(self.positions) if self.copy_positions_on_bar else self.positions,
             "equity": self.equity,
         }
 
@@ -130,7 +141,7 @@ class Exchange:
             order.status = OrderStatus.REJECTED
             return None
 
-        self._apply_trade(order.symbol, side, quantity, notional, fee)
+        self._apply_trade(order.symbol, side, quantity, notional, fee, action, order.position_id)
         order.status = OrderStatus.FILLED
         return Trade(
             order_id=order.order_id,
@@ -139,6 +150,7 @@ class Exchange:
             symbol=order.symbol,
             action=action,
             position_id=order.position_id,
+            pair_id=order.pair_id,
             side=side,
             quantity=quantity,
             price=price,
@@ -148,6 +160,114 @@ class Exchange:
             ts=bar["ts"],
             target_hedge_ratio=order.target_hedge_ratio,
         )
+
+    def _execute_prepared_order(self, order, bar, price):
+        quantity = float(order.quantity)
+        notional = price * quantity
+        fee = notional * self.fee_rate
+        slippage = abs(price - bar["open"]) * quantity
+        side = self._value(order.side)
+        action = self._value(order.action)
+
+        self._apply_trade(order.symbol, side, quantity, notional, fee, action, order.position_id)
+        order.status = OrderStatus.FILLED
+        return Trade(
+            order_id=order.order_id,
+            group_id=order.group_id,
+            exchange=order.exchange,
+            symbol=order.symbol,
+            action=action,
+            position_id=order.position_id,
+            pair_id=order.pair_id,
+            side=side,
+            quantity=quantity,
+            price=price,
+            notional=notional,
+            fee=fee,
+            slippage=slippage,
+            ts=bar["ts"],
+            target_hedge_ratio=order.target_hedge_ratio,
+        )
+
+    def _pending_order_groups(self):
+        groups = {}
+        for order in self.orders:
+            key = order.group_id or order.order_id
+            groups.setdefault(key, []).append(order)
+        return groups
+
+    def _group_has_current_bars(self, orders, bars):
+        return all(order.symbol in bars for order in orders)
+
+    def _reject_group(self, orders, rejected_orders):
+        for order in orders:
+            order.status = OrderStatus.REJECTED
+            rejected_orders.append(order)
+
+    def _prepare_group_execution(self, orders, bars):
+        prepared = []
+        positions = dict(self.positions)
+        position_lots = {pid: dict(lots) for pid, lots in self.position_lots.items()}
+
+        for order in orders:
+            bar = bars.get(order.symbol)
+            if bar is None:
+                return "waiting", []
+
+            price = self._get_trade_price(order, bar)
+            if price is None:
+                if order.status == OrderStatus.REJECTED:
+                    return "rejected", []
+                return "waiting", []
+
+            quantity = float(order.quantity)
+            side = self._value(order.side)
+            action = self._value(order.action)
+            if not self._can_execute_against(order, side, action, quantity, positions, position_lots):
+                return "rejected", []
+
+            self._simulate_trade_state(order, side, action, quantity, positions, position_lots)
+            prepared.append((order, bar, price))
+
+        return "ready", prepared
+
+    def _can_execute_against(self, order, side, action, quantity, positions, position_lots):
+        if side not in [OrderSide.BUY.value, OrderSide.SELL.value]:
+            return False
+
+        if action == OrderAction.OPEN.value:
+            return True
+
+        if action != OrderAction.CLOSE.value:
+            return False
+
+        current_position = positions.get(order.symbol, 0.0)
+        if order.position_id:
+            lot_position = position_lots.get(order.position_id, {}).get(order.symbol, 0.0)
+            if side == OrderSide.SELL.value:
+                return lot_position > 0 and quantity <= lot_position + 1e-12
+            return lot_position < 0 and quantity <= abs(lot_position) + 1e-12
+
+        if side == OrderSide.SELL.value:
+            return current_position > 0 and quantity <= current_position + 1e-12
+        return current_position < 0 and quantity <= abs(current_position) + 1e-12
+
+    def _simulate_trade_state(self, order, side, action, quantity, positions, position_lots):
+        delta = quantity if side == OrderSide.BUY.value else -quantity
+        new_position = positions.get(order.symbol, 0.0) + delta
+        positions[order.symbol] = 0.0 if abs(new_position) < 1e-12 else new_position
+
+        if not order.position_id or action not in {OrderAction.OPEN.value, OrderAction.CLOSE.value}:
+            return
+
+        lots = position_lots.setdefault(order.position_id, {})
+        new_lot_quantity = lots.get(order.symbol, 0.0) + delta
+        if abs(new_lot_quantity) < 1e-12:
+            lots.pop(order.symbol, None)
+        else:
+            lots[order.symbol] = new_lot_quantity
+        if not lots:
+            position_lots.pop(order.position_id, None)
 
     def _can_execute(self, order, side, action, quantity):
         if side not in [OrderSide.BUY.value, OrderSide.SELL.value]:
@@ -160,21 +280,43 @@ class Exchange:
             return False
 
         current_position = self.positions.get(order.symbol, 0.0)
+        if order.position_id:
+            lot_position = self.position_lots.get(order.position_id, {}).get(order.symbol, 0.0)
+            if side == OrderSide.SELL.value:
+                return lot_position > 0 and quantity <= lot_position + 1e-12
+            return lot_position < 0 and quantity <= abs(lot_position) + 1e-12
+
         if side == OrderSide.SELL.value:
             return current_position > 0 and quantity <= current_position + 1e-12
         return current_position < 0 and quantity <= abs(current_position) + 1e-12
 
-    def _apply_trade(self, symbol, side, quantity, notional, fee):
+    def _apply_trade(self, symbol, side, quantity, notional, fee, action=None, position_id=None):
         if side == OrderSide.BUY.value:
             self.cash -= notional + fee
-            new_position = self.positions.get(symbol, 0.0) + quantity
+            delta = quantity
         else:
             self.cash += notional - fee
-            new_position = self.positions.get(symbol, 0.0) - quantity
+            delta = -quantity
 
+        new_position = self.positions.get(symbol, 0.0) + delta
         if abs(new_position) < 1e-12:
             new_position = 0.0
         self.positions[symbol] = new_position
+        self._apply_position_lot(symbol, delta, action, position_id)
+
+    def _apply_position_lot(self, symbol, delta, action, position_id):
+        if not position_id or action not in {OrderAction.OPEN.value, OrderAction.CLOSE.value}:
+            return
+
+        lots = self.position_lots.setdefault(position_id, {})
+        new_quantity = lots.get(symbol, 0.0) + delta
+        if abs(new_quantity) < 1e-12:
+            lots.pop(symbol, None)
+        else:
+            lots[symbol] = new_quantity
+
+        if not lots:
+            self.position_lots.pop(position_id, None)
 
     def _margin_rejected_order_ids(self, bars):
         rejected = set()

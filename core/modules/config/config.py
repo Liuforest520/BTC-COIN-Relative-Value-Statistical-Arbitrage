@@ -1,5 +1,8 @@
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
+import re
+from typing import Any
 
 import yaml
 
@@ -7,14 +10,9 @@ import yaml
 @dataclass
 class SetupConfig:
     name: str
-    pair: dict
-    signal_name: str
-    signal: dict
-    sizing_name: str
-    position_sizing: dict
-    position_management_name: str
-    position_management: dict
-    hedge_method: str
+    strategy_type: str
+    pairs: list[dict]
+    pipeline: dict
 
 
 @dataclass
@@ -28,6 +26,10 @@ class Config:
     slippage_bps: float
     funding_enabled: bool
     risk: dict
+    backtest_start_time: Any = None
+    backtest_start_ts: int | None = None
+    backtest_end_time: Any = None
+    backtest_end_ts: int | None = None
 
 
 def load_config(path: str | Path = "config/config.yaml") -> Config:
@@ -36,11 +38,22 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
 
     setup_name = raw["active_setup"]
     setup = _build_setup_config(raw, setup_name)
+    backtest = raw.get("backtest", {})
+    start_time = backtest.get("start_time", backtest.get("start_ts"))
+    end_time = backtest.get("end_time", backtest.get("end_ts"))
+    start_ts = _parse_optional_timestamp(start_time)
+    end_ts = _parse_optional_timestamp(end_time)
+    if start_ts is not None and end_ts is not None and end_ts < start_ts:
+        raise ValueError("backtest end_time must be greater than or equal to start_time")
 
     return Config(
         symbols=raw["data"]["symbols"],
         benchmarks=raw["data"].get("benchmarks", {}),
-        initial_cash=float(raw["backtest"]["initial_cash"]),
+        initial_cash=float(backtest["initial_cash"]),
+        backtest_start_time=start_time,
+        backtest_start_ts=start_ts,
+        backtest_end_time=end_time,
+        backtest_end_ts=end_ts,
         active_setup=setup_name,
         strategy=setup,
         fee_rate=float(raw["cost"]["fee_rate"]),
@@ -57,33 +70,20 @@ def _build_setup_config(raw: dict, setup_name: str) -> SetupConfig:
         raise ValueError(f"active_setup {setup_name!r} not found, available: {available}")
 
     setup = setups[setup_name]
-    signal_name = setup["signal"]
-    sizing_name = setup["position_sizing"]
-    management_name = setup.get("position_management", "default")
-    signal = _lookup(raw, "signals", signal_name)
-    sizing = _lookup(raw, "position_sizing", sizing_name)
-    management = _lookup(raw, "position_management", management_name)
-    pair = setup.get("pair", raw.get("pair", {}))
+    pipeline = setup.get("pipeline")
+    pairs = setup.get("pairs")
+
+    if not pairs:
+        raise ValueError(f"setup {setup_name!r} must define pairs for the multi-pair framework")
+    if not pipeline:
+        raise ValueError(f"setup {setup_name!r} must define pipeline for the multi-pair framework")
 
     return SetupConfig(
         name=setup_name,
-        pair=pair,
-        signal_name=signal_name,
-        signal=dict(signal),
-        sizing_name=sizing_name,
-        position_sizing=dict(sizing),
-        position_management_name=management_name,
-        position_management=dict(management),
-        hedge_method=sizing["method"],
+        strategy_type=setup.get("strategy", setup.get("strategy_type", "auto")),
+        pairs=list(pairs),
+        pipeline=dict(pipeline),
     )
-
-
-def _lookup(raw: dict, section: str, name: str) -> dict:
-    values = raw.get(section, {})
-    if name not in values:
-        available = ", ".join(str(item) for item in values)
-        raise ValueError(f"{section}.{name!r} not found, available: {available}")
-    return values[name]
 
 
 def _as_bool(value) -> bool:
@@ -92,3 +92,60 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _parse_optional_timestamp(value) -> int | None:
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+
+    if isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = int(float(text))
+    except ValueError:
+        dt = _parse_datetime_text(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+
+    if parsed > 10_000_000_000_000_000:
+        return parsed // 1000
+    if parsed > 10_000_000_000:
+        return parsed
+    return parsed * 1000
+
+
+def _parse_datetime_text(text: str) -> datetime:
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    match = re.fullmatch(
+        r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?",
+        text,
+    )
+    if not match:
+        raise ValueError(f"invalid timestamp: {text!r}")
+
+    year, month, day, hour, minute, second = match.groups()
+    return datetime(
+        int(year),
+        int(month),
+        int(day),
+        int(hour or 0),
+        int(minute or 0),
+        int(second or 0),
+    )

@@ -7,18 +7,18 @@ import shutil
 
 import polars as pl
 
-from core.modules.reporting.plots import (
-    plot_attribution,
-    plot_backtest_summary,
-    plot_drawdown,
-    plot_neutrality,
-    plot_signal,
+from core.modules.reporting.equity_summary import export_equity_summary_html
+from core.modules.logger import logger
+from core.modules.reporting.pair_summary import (
+    build_pair_summary,
+    compact_pair_summary_markdown,
+    pair_defs_from_config,
+    write_compact_pair_summary_csv,
 )
-from core.modules.reporting.utils import normalize_rows
 
 
 KEY_METRIC_ROWS = [
-    ("业绩", "年化收益", "annualized_return"),
+    ("业绩", "复合年化收益（CAGR）", "annualized_return"),
     ("业绩", "年化波动", "annualized_volatility"),
     ("业绩", "夏普", "sharpe"),
     ("业绩", "卡玛", "calmar"),
@@ -27,23 +27,21 @@ KEY_METRIC_ROWS = [
     ("交易", "盈亏比", "profit_loss_ratio"),
     ("交易", "平均持仓周期", "average_holding_minutes"),
     ("交易", "日均换手率", "daily_turnover"),
-    ("市场中性", "组合对 BTC 的 Beta", "portfolio_beta_btc"),
-    ("市场中性", "组合对 COIN 的 Beta", "portfolio_beta_coin"),
-    ("市场中性", "组合对 SPY 的 Beta", "portfolio_beta_spy"),
-    ("市场中性", "组合对 QQQ 的 Beta", "portfolio_beta_qqq"),
-    ("市场中性", "组合对 BTC 的相关性", "portfolio_corr_btc"),
-    ("市场中性", "组合对 COIN 的相关性", "portfolio_corr_coin"),
-    ("市场中性", "组合对 SPY 的相关性", "portfolio_corr_spy"),
-    ("市场中性", "组合对 QQQ 的相关性", "portfolio_corr_qqq"),
-    ("市场中性", "开仓对冲比例通过率", "hedge_ratio_pass_rate"),
-    ("市场中性", "平均对冲比例偏离度", "average_hedge_ratio_deviation"),
     ("成本", "手续费", "total_fee"),
     ("成本", "滑点", "total_slippage"),
     ("成本", "资金费率", "funding_fee"),
 ]
 
 
-def export_backtest_report(result, config_path, output_root="results/backtests", run_name=None):
+def export_backtest_report(
+    result,
+    config_path,
+    output_root="results/backtests",
+    run_name=None,
+    include_trade_review=True,
+    review_max_points=2000,
+    review_max_pairs=20,
+):
     config_path = Path(config_path)
     run_name = run_name or _run_name(result)
     output_dir = Path(output_root) / run_name
@@ -64,20 +62,46 @@ def export_backtest_report(result, config_path, output_root="results/backtests",
     _write_csv(output_dir / "funding_payments.csv", _object_rows(result.funding_payments))
     _write_csv(output_dir / "risk_history.csv", _object_rows(result.risk_history))
     _write_json(output_dir / "final_position_valuation.json", result.final_position_valuation)
+    if getattr(result, 'pair_curve', None):
+        _write_csv(output_dir / "pair_curve.csv", result.pair_curve)
+    pair_metrics = _per_pair_metrics(result, config_output)
+    if pair_metrics:
+        write_compact_pair_summary_csv(output_dir / "pair_metrics.csv", pair_metrics)
+        (output_dir / "pair_metrics_summary.md").write_text(
+            compact_pair_summary_markdown(pair_metrics),
+            encoding="utf-8",
+        )
 
     return_attribution = return_attribution_rows(result)
     risk_attribution = risk_attribution_rows(result)
     _write_csv(output_dir / "return_attribution.csv", return_attribution)
     _write_csv(output_dir / "risk_attribution.csv", risk_attribution)
 
-    plot_backtest_summary(result, output_dir / "equity_position_summary.png")
-    plot_drawdown(result, output_dir / "drawdown_curve.png")
-    plot_signal(result, output_dir / "signal_visualization.png")
-    plot_neutrality(result, output_dir / "market_neutrality.png")
-    plot_attribution(return_attribution, risk_attribution, output_dir / "attribution.png")
+    export_equity_summary_html(result, output_dir / "portfolio_summary.html")
 
     _write_markdown_summary(output_dir / "summary.md", result, config_output, return_attribution, risk_attribution)
+    if include_trade_review:
+        try:
+            _export_trade_review(output_dir, review_max_points, review_max_pairs)
+        except Exception as exc:
+            logger.exception("trade review export failed for {}: {}", output_dir, exc)
+            (output_dir / "trade_review_error.txt").write_text(
+                f"Trade review generation failed: {type(exc).__name__}: {exc}\n",
+                encoding="utf-8",
+            )
     return output_dir
+
+
+def _export_trade_review(output_dir, max_points, max_pairs):
+    # Lazy import avoids coupling the base CSV exporter to the HTML module at
+    # import time while keeping every full report on one consistent path.
+    from core.modules.reporting.trade_review import export_trade_review_html
+
+    return export_trade_review_html(
+        output_dir,
+        max_points=max_points,
+        max_pairs=max_pairs,
+    )
 
 
 def key_metric_rows(metrics):
@@ -120,9 +144,6 @@ def risk_attribution_rows(result):
     return [
         {"item": "最大回撤", "value": abs(metrics.get("max_drawdown") or 0.0)},
         {"item": "年化波动", "value": metrics.get("annualized_volatility") or 0.0},
-        {"item": "平均对冲比例偏离", "value": metrics.get("average_hedge_ratio_deviation") or 0.0},
-        {"item": "最终净敞口比例", "value": abs(metrics.get("final_net_exposure_ratio") or 0.0)},
-        {"item": "最终总敞口比例", "value": metrics.get("final_gross_exposure_ratio") or 0.0},
     ]
 
 
@@ -149,11 +170,8 @@ def _write_markdown_summary(path, result, config_path, return_attribution, risk_
             "",
             "## 图表文件",
             "",
-            "- `equity_position_summary.png`: 净值曲线、回撤区域、持仓比例",
-            "- `drawdown_curve.png`: 回撤曲线",
-            "- `signal_visualization.png`: 信号可视化",
-            "- `market_neutrality.png`: 市场中性验证图",
-            "- `attribution.png`: 收益归因、风险归因",
+            "- `portfolio_summary.html`: 总资金曲线交互网页",
+            "- `trade_review.html`: 组合交易复盘与单 Pair 分析入口",
             "",
             "## 明细文件",
             "",
@@ -163,11 +181,24 @@ def _write_markdown_summary(path, result, config_path, return_attribution, risk_
             "- `signal_curve.csv`: 每一分钟信号、z-score、alpha/beta",
             "- `funding_payments.csv`: 资金费率扣费记录",
             "- `risk_history.csv`: 风控检查记录",
+            "- `pair_metrics.csv`: 每个 pair 的交易笔数、胜率、收益率、总盈亏、回撤和持仓时间",
+            "- `pair_metrics_summary.md`: 每个 pair 的中文核心指标汇总表",
             "- `return_attribution.csv`: 收益归因",
             "- `risk_attribution.csv`: 风险归因",
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _per_pair_metrics(result, config_path: Path) -> list[dict]:
+    """Compute per-pair PnL/win-rate summary from filled trades."""
+    return build_pair_summary(
+        trades=getattr(result, "trades", None),
+        position_curve=getattr(result, "position_curve", None),
+        funding_payments=getattr(result, "funding_payments", None),
+        pair_defs=pair_defs_from_config(Path(config_path)),
+        initial_equity=(getattr(result, "metrics", {}) or {}).get("initial_equity"),
+    )
 
 
 def _run_name(result):
@@ -179,8 +210,11 @@ def _run_name(result):
 
 
 def _write_csv(path, rows):
-    rows = normalize_rows(rows)
-    frame = pl.DataFrame(rows, infer_schema_length=None)
+    rows = list(rows or [])
+    # Polars can union keys from sparse row dictionaries directly.  Avoid
+    # expanding every minute-level compact signal row into a wide Python dict,
+    # which otherwise multiplies report-export memory usage.
+    frame = pl.from_dicts(rows, infer_schema_length=None) if rows else pl.DataFrame()
     if frame.is_empty():
         path.write_text("", encoding="utf-8")
         return

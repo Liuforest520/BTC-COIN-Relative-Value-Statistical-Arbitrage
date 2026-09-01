@@ -1,0 +1,155 @@
+# 旧版参数迁移配置：zscore_reversion_pair / cointegration_reversion_zscore 的
+# 参数映射到新 multi-pair pipeline（rolling OLS + 等待回归入场 + fixed_add 加仓）
+data:
+  symbols:
+    1000SHIBUSDT: {exchange: binance, path: data/1000SHIBUSDT_1m.csv}
+    AAVEUSDT: {exchange: binance, path: data/AAVEUSDT_1m.csv}
+    ADAUSDT: {exchange: binance, path: data/ADAUSDT_1m.csv}
+    AGLDUSDT: {exchange: binance, path: data/AGLDUSDT_1m.csv}
+    ALGOUSDT: {exchange: binance, path: data/ALGOUSDT_1m.csv}
+    ALICEUSDT: {exchange: binance, path: data/ALICEUSDT_1m.csv}
+    ANTHROPICUSDT: {exchange: binance, path: data/ANTHROPICUSDT_1m.csv}
+    APEUSDT: {exchange: binance, path: data/APEUSDT_1m.csv}
+    APTUSDT: {exchange: binance, path: data/APTUSDT_1m.csv}
+    ARBUSDT: {exchange: binance, path: data/ARBUSDT_1m.csv}
+    ARUSDT: {exchange: binance, path: data/ARUSDT_1m.csv}
+    ATOMUSDT: {exchange: binance, path: data/ATOMUSDT_1m.csv}
+    AVAXUSDT: {exchange: binance, path: data/AVAXUSDT_1m.csv}
+    BABYUSDT: {exchange: binance, path: data/BABYUSDT_1m.csv}
+    BICOUSDT: {exchange: binance, path: data/BICOUSDT_1m.csv}
+    BLURUSDT: {exchange: binance, path: data/BLURUSDT_1m.csv}
+    BNBUSDT: {exchange: binance, path: data/BNBUSDT_1m.csv}
+    BTCUSDT: {exchange: binance, path: data/BTCUSDT_1m.csv}
+    COINUSDT: {exchange: binance, path: data/COINUSDT_1m.csv}
+    CRVUSDT: {exchange: binance, path: data/CRVUSDT_1m.csv}
+    DASHUSDT: {exchange: binance, path: data/DASHUSDT_1m.csv}
+    DOTUSDT: {exchange: binance, path: data/DOTUSDT_1m.csv}
+    DRAMUSDT: {exchange: binance, path: data/DRAMUSDT_1m.csv}
+    DYDXUSDT: {exchange: binance, path: data/DYDXUSDT_1m.csv}
+    EIGENUSDT: {exchange: binance, path: data/EIGENUSDT_1m.csv}
+    EWJUSDT: {exchange: binance, path: data/EWJUSDT_1m.csv}
+    EWTUSDT: {exchange: binance, path: data/EWTUSDT_1m.csv}
+    EWYUSDT: {exchange: binance, path: data/EWYUSDT_1m.csv}
+    FETUSDT: {exchange: binance, path: data/FETUSDT_1m.csv}
+    FILUSDT: {exchange: binance, path: data/FILUSDT_1m.csv}
+    GALAUSDT: {exchange: binance, path: data/GALAUSDT_1m.csv}
+    HBARUSDT: {exchange: binance, path: data/HBARUSDT_1m.csv}
+    HIGHUSDT: {exchange: binance, path: data/HIGHUSDT_1m.csv}
+    HMSTRUSDT: {exchange: binance, path: data/HMSTRUSDT_1m.csv}
+    ICPUSDT: {exchange: binance, path: data/ICPUSDT_1m.csv}
+    JTOUSDT: {exchange: binance, path: data/JTOUSDT_1m.csv}
+    KORUUSDT: {exchange: binance, path: data/KORUUSDT_1m.csv}
+    LDOUSDT: {exchange: binance, path: data/LDOUSDT_1m.csv}
+    LTCUSDT: {exchange: binance, path: data/LTCUSDT_1m.csv}
+    MSTRUSDT: {exchange: binance, path: data/MSTRUSDT_1m.csv}
+    NFPUSDT: {exchange: binance, path: data/NFPUSDT_1m.csv}
+    OPENAIUSDT: {exchange: binance, path: data/OPENAIUSDT_1m.csv}
+    OPUSDT: {exchange: binance, path: data/OPUSDT_1m.csv}
+    ORDIUSDT: {exchange: binance, path: data/ORDIUSDT_1m.csv}
+    PHAUSDT: {exchange: binance, path: data/PHAUSDT_1m.csv}
+    POLUSDT: {exchange: binance, path: data/POLUSDT_1m.csv}
+    PORTALUSDT: {exchange: binance, path: data/PORTALUSDT_1m.csv}
+    PYTHUSDT: {exchange: binance, path: data/PYTHUSDT_1m.csv}
+    RENDERUSDT: {exchange: binance, path: data/RENDERUSDT_1m.csv}
+    SAMSUNGUSDT: {exchange: binance, path: data/SAMSUNGUSDT_1m.csv}
+    SANDUSDT: {exchange: binance, path: data/SANDUSDT_1m.csv}
+    SEIUSDT: {exchange: binance, path: data/SEIUSDT_1m.csv}
+    SKHYNIXUSDT: {exchange: binance, path: data/SKHYNIXUSDT_1m.csv}
+    SOLUSDT: {exchange: binance, path: data/SOLUSDT_1m.csv}
+    SOXLUSDT: {exchange: binance, path: data/SOXLUSDT_1m.csv}
+    STRKUSDT: {exchange: binance, path: data/STRKUSDT_1m.csv}
+    SUIUSDT: {exchange: binance, path: data/SUIUSDT_1m.csv}
+    TNSRUSDT: {exchange: binance, path: data/TNSRUSDT_1m.csv}
+    UNIUSDT: {exchange: binance, path: data/UNIUSDT_1m.csv}
+    WLDUSDT: {exchange: binance, path: data/WLDUSDT_1m.csv}
+    XAGUSDT: {exchange: binance, path: data/XAGUSDT_1m.csv}
+    XAUTUSDT: {exchange: binance, path: data/XAUTUSDT_1m.csv}
+    XAUUSDT: {exchange: binance, path: data/XAUUSDT_1m.csv}
+    XLMUSDT: {exchange: binance, path: data/XLMUSDT_1m.csv}
+    XPTUSDT: {exchange: binance, path: data/XPTUSDT_1m.csv}
+    XRPUSDT: {exchange: binance, path: data/XRPUSDT_1m.csv}
+    ZECUSDT: {exchange: binance, path: data/ZECUSDT_1m.csv}
+  benchmarks: {}
+backtest:
+  initial_cash: 100000
+  start_time: "2026-3-1"
+active_setup: multi_pair_legacy
+setups:
+  multi_pair_legacy:
+    strategy: multi_pair
+    pairs:
+      # Crypto pairs (10)
+      - {pair_id: "arb_op", x_symbol: ARBUSDT, y_symbol: OPUSDT}
+      - {pair_id: "atom_dot", x_symbol: ATOMUSDT, y_symbol: DOTUSDT}
+      - {pair_id: "avax_sol", x_symbol: AVAXUSDT, y_symbol: SOLUSDT}
+      - {pair_id: "apt_sei", x_symbol: APTUSDT, y_symbol: SEIUSDT}
+      - {pair_id: "fet_rndr", x_symbol: FETUSDT, y_symbol: RENDERUSDT}
+      - {pair_id: "ar_fil", x_symbol: ARUSDT, y_symbol: FILUSDT}
+      - {pair_id: "bico_dydx", x_symbol: BICOUSDT, y_symbol: DYDXUSDT}
+      - {pair_id: "pyth_tnsr", x_symbol: PYTHUSDT, y_symbol: TNSRUSDT}
+      - {pair_id: "aave_uni", x_symbol: AAVEUSDT, y_symbol: UNIUSDT}
+      - {pair_id: "hbar_xrp", x_symbol: HBARUSDT, y_symbol: XRPUSDT}
+      # TradFi pairs (5)
+      - {pair_id: "btc_mstr", x_symbol: BTCUSDT, y_symbol: MSTRUSDT, tags: ["tradfi"]}
+      - {pair_id: "samsung_sk", x_symbol: SAMSUNGUSDT, y_symbol: SKHYNIXUSDT, tags: ["tradfi"]}
+      - {pair_id: "xau_xag", x_symbol: XAUUSDT, y_symbol: XAGUSDT, tags: ["tradfi"]}
+      - {pair_id: "ewj_ewy", x_symbol: EWJUSDT, y_symbol: EWYUSDT, tags: ["tradfi"]}
+      - {pair_id: "anthropic_openai", x_symbol: ANTHROPICUSDT, y_symbol: OPENAIUSDT, tags: ["tradfi"]}
+    pipeline:
+      # ===== 旧版 cointegration_reversion_zscore 参数（rolling OLS）=====
+      estimator:
+        method: rolling_ols
+        regression_method: log_price          # log_price 回归
+        model_lookback_bars: 28800            # 窗口 28800 bar（20天）
+        model_update_interval_bars: 1440      # 每 1440 bar 重估一次
+        hedge_model_lookback_bars: 28800      # hedge_model 窗口
+        hedge_model_update_interval_bars: 1440
+        hedge_regression_method: returns      # hedge_model 用 returns 回归
+        zscore_lookback_bars: 1440
+      # ===== 旧版信号参数（等待回归后入场 + two-stage）=====
+      signal:
+        method: zscore_reversion
+        entry_z: 1.75
+        exit_z: 0.5
+        two_stage_enabled: true
+        two_stage_trigger_z: 2.0
+        two_stage_min_wait_bars: 1
+        reversion_filter_enabled: true
+        reversion_ma_lookback_bars: 60
+        reversion_min_samples: 60
+        reversion_min_ma_gap: 0.0
+        extreme_lookback_bars: 0
+        min_reversion_from_extreme: 0.0
+        slope_lookback_bars: 0
+        min_slope: 0.0
+      # ===== 旧版 sizing：beta_neutral gross 0.5 + fixed_add 加仓 =====
+      sizing:
+        method: beta_neutral
+        equity: 100000
+        gross_exposure_ratio: 0.5
+        max_gross_exposure_ratio: 1.0
+        max_add_times: 3                       # 最多加 3 次
+        add_interval_bars: 720                 # 720 bar 间隔
+        add_gross_exposure_ratio: 0.5
+        require_add_reversion_vs_last_entry: true
+        add_reversion_buffer: 0.0
+      portfolio:
+        method: equal_weight
+        allocation_mode: equal_cap
+        max_open_pairs: 15
+        max_entries_per_pair: 4        # 首仓 + 最多 3 次加仓（对应旧版 max_add_times 3）
+        add_cooldown_bars: 720         # 加仓间隔 720 bar（对应旧版 add_interval_bars 720）
+        min_hold_bars: 0
+      execution:
+        pending_timeout_bars: 5
+        order_type: market
+cost:
+  fee_rate: 0.0005
+  slippage_bps: 1
+  funding_enabled: true
+risk:
+  enabled: false
+  mode: pass_through
+  max_leverage: 1.0
+  order_hedge_ratio_tolerance: 0.02
+  position_hedge_ratio_tolerance: 0.05

@@ -8,6 +8,8 @@ class ExchangeManager:
         self.initial_cash = sum(exchange.initial_cash for exchange in exchanges.values())
         self.equity_curve = []
         self.funding_payments = []
+        self.compact_equity_curve = False
+        self.include_trade_history_on_bar = True
 
     def cancel_all_orders(self):
         for exchange in self.exchanges.values():
@@ -35,10 +37,11 @@ class ExchangeManager:
         positions = {}
         funding_payments = []
         funding_rates = funding_rates or {}
+        blocked_group_ids = self._blocked_group_ids(bars_by_exchange)
 
         for exchange_name, exchange in self.exchanges.items():
             bars = bars_by_exchange.get(exchange_name, {})
-            result = exchange(bars, funding_rates=funding_rates)
+            result = exchange(bars, funding_rates=funding_rates, blocked_group_ids=blocked_group_ids)
             results[exchange_name] = result
             new_trades.extend(result["new_trades"])
             rejected_orders.extend(result["rejected_orders"])
@@ -49,14 +52,21 @@ class ExchangeManager:
         portfolio_state = self._portfolio_state(results)
         ts = self._current_ts(bars_by_exchange)
         if ts is not None:
-            self.equity_curve.append({"ts": ts, "equity": portfolio_state["equity"]})
+            if self.compact_equity_curve:
+                self.equity_curve["ts"].append(ts)
+                self.equity_curve["equity"].append(portfolio_state["equity"])
+            else:
+                self.equity_curve.append({"ts": ts, "equity": portfolio_state["equity"]})
 
         return {
             "results": results,
             "new_trades": new_trades,
             "rejected_orders": rejected_orders,
             "funding_payments": funding_payments,
-            "trades": self._all_trades(results),
+            # Detailed backtests expose the cumulative trade snapshot for
+            # compatibility. Sweeps disable it because rebuilding the full
+            # history on every bar makes a run quadratic in its trade count.
+            "trades": self._all_trades(results) if self.include_trade_history_on_bar else [],
             "positions": positions,
             "cash": portfolio_state["cash"],
             "equity": portfolio_state["equity"],
@@ -109,3 +119,20 @@ class ExchangeManager:
                 if isinstance(bar, list) and bar:
                     return bar[0]
         return None
+
+    def _blocked_group_ids(self, bars_by_exchange):
+        """Keep grouped pair orders atomic when one leg has no current bar."""
+        groups = {}
+        for exchange in self.exchanges.values():
+            for order in exchange.orders:
+                if order.group_id:
+                    groups.setdefault(order.group_id, []).append(order)
+
+        blocked = set()
+        for group_id, orders in groups.items():
+            for order in orders:
+                exchange_bars = bars_by_exchange.get(order.exchange, {})
+                if order.symbol not in exchange_bars:
+                    blocked.add(group_id)
+                    break
+        return blocked

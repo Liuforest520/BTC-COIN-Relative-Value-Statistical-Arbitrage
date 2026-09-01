@@ -18,3 +18,4 @@ class Trade:
     funding_fee: float = 0.0
     position_id: str | None = None
     target_hedge_ratio: float | None = None
+    pair_id: str | None = None

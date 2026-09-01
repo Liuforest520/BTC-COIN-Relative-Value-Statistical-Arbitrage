@@ -5,7 +5,7 @@ import polars as pl
 from core.modules.data.loader import _read_csv
 
 
-FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000
+MINUTE_MS = 60 * 1000
 
 
 def load_funding_data(file_path: str | Path, symbol: str | None = None) -> pl.DataFrame:
@@ -22,7 +22,11 @@ def load_funding_data(file_path: str | Path, symbol: str | None = None) -> pl.Da
         pl.col("funding_rate").cast(pl.Float64, strict=False),
     )
     frame = frame.with_columns(
-        (pl.col("funding_time") // FUNDING_INTERVAL_MS * FUNDING_INTERVAL_MS).alias("ts")
+        (
+            (pl.col("funding_time") + MINUTE_MS // 2)
+            // MINUTE_MS
+            * MINUTE_MS
+        ).alias("ts")
     )
 
     if "symbol" not in frame.columns:

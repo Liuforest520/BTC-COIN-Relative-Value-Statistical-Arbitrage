@@ -2,6 +2,7 @@ from core.modules.risk.base import RiskResult
 from core.modules.risk.dollar_neutral import DollarNeutralRisk
 from core.modules.risk.hedge_ratio import HedgeRatioRisk
 from core.modules.risk.pair_completeness import PairCompletenessRisk
+from core.modules.risk.pass_through import PassThroughRisk
 from core.modules.risk.position_hedge_ratio import PositionHedgeRatioRisk
 
 
@@ -73,7 +74,13 @@ class RiskManager:
 
 def build_risk_manager(strategy_config, risk_config=None):
     risk_config = risk_config or {}
-    hedge_method = strategy_config.hedge_method
+    if _pass_through_enabled(risk_config):
+        return RiskManager(
+            pre_trade_risks=[PassThroughRisk("PreTradePassThroughRisk")],
+            post_trade_risks=[PassThroughRisk("PostTradePassThroughRisk")],
+        )
+
+    hedge_method = _strategy_hedge_method(strategy_config)
     order_tolerance = float(risk_config.get("order_hedge_ratio_tolerance", 0.02))
     position_tolerance = float(risk_config.get("position_hedge_ratio_tolerance", 0.05))
 
@@ -92,3 +99,28 @@ def build_risk_manager(strategy_config, risk_config=None):
             PositionHedgeRatioRisk(hedge_method=hedge_method, max_deviation=position_tolerance),
         ],
     )
+
+
+def _pass_through_enabled(risk_config):
+    mode = str(risk_config.get("mode", "")).strip().lower()
+    if mode in {"pass_through", "passthrough", "disabled", "off", "none"}:
+        return True
+    if "enabled" in risk_config:
+        return not _as_bool(risk_config.get("enabled"))
+    return False
+
+
+def _strategy_hedge_method(strategy_config):
+    pipeline = getattr(strategy_config, "pipeline", {}) or {}
+    sizing = pipeline.get("sizing", {}) if isinstance(pipeline, dict) else {}
+    return sizing.get("method", "beta_neutral")
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
