@@ -11,3 +11,5 @@ class FundingPayment:
     mark_price: float
     notional: float
     payment: float
+    position_id: str | None = None
+    pair_id: str | None = None

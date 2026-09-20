@@ -36,6 +36,10 @@ class Exchange:
         # when that same lot is closed.  Mark-price changes affect equity via
         # unrealized PnL, but must not consume otherwise unallocated cash.
         self.position_reserved_margin: dict[str, dict[str, float]] = {}
+        # Isolated capital account for every logical Pair position.  Free cash
+        # is removed once at entry; subsequent fees, funding and PnL stay in
+        # this position account until the position is closed.
+        self.position_capital: dict[str, float] = {}
         self.position_pair_ids: dict[str, str] = {}
         self.orders = []
         self.order_history = []
@@ -90,9 +94,10 @@ class Exchange:
         """Mark at the executable open and settle funding once."""
         bars = self._format_bars(bars)
         self.last_bars.update(bars)
-        # An opening decision must not use the same bar's future close.
-        self._update_account(self.last_bars, price_field="open")
         funding_payments = self._apply_funding(bars, funding_rates or {})
+        # Funding uses the current executable open directly. Recalculate the
+        # marked account once afterwards so open decisions see funding-adjusted
+        # capital without repeating the same full account scan.
         self._update_account(self.last_bars, price_field="open")
         return bars, funding_payments
 
@@ -162,13 +167,39 @@ class Exchange:
                     if getattr(order, "requested_quantity", None) is None:
                         order.fill_scale = 1.0
 
+        position_ids = {
+            order.position_id or order.group_id or order.order_id
+            for order, _bar, _price in prepared
+        }
+        reserved_before = {
+            position_id: self._position_reserved_total(position_id)
+            for position_id in position_ids
+        }
+        capital_before = {
+            position_id: self._position_capital_value(position_id)
+            for position_id in position_ids
+        }
+        realized_by_position = {position_id: 0.0 for position_id in position_ids}
+        fees_by_position = {position_id: 0.0 for position_id in position_ids}
+
         trades = []
         filled = []
         for order, bar, price in prepared:
-            trade = self._execute_prepared_order(order, bar, price)
+            trade, realized = self._execute_prepared_order(order, bar, price)
+            position_id = order.position_id or order.group_id or order.order_id
+            realized_by_position[position_id] += realized
+            fees_by_position[position_id] += float(trade.fee)
             filled.append(order)
             self.trade_history.append(trade)
             trades.append(trade)
+        self._settle_group_capital(
+            prepared,
+            reserved_before,
+            capital_before,
+            realized_by_position,
+            fees_by_position,
+            is_open=is_open,
+        )
         # The next group on this bar must see the newly reserved/released margin.
         self._update_account(self.last_bars, price_field="open")
         return self._group_result(filled_orders=filled, new_trades=trades)
@@ -204,38 +235,32 @@ class Exchange:
         return low
 
     def _projected_available_balance(self, prepared, scale, bars):
-        wallet = float(self.wallet_balance)
         lots = deepcopy(self.position_lots)
-        entries = deepcopy(self.position_entry_prices)
         reserved_margin = deepcopy(self.position_reserved_margin)
+        reserved_before = self._reserved_margin_total(reserved_margin)
         for order, price in prepared:
             quantity = float(order.quantity) * float(scale)
-            wallet -= price * quantity * self.fee_rate
             side = self._value(order.side)
             delta = quantity if side == OrderSide.BUY.value else -quantity
             position_id = order.position_id or order.group_id or order.order_id
             self._apply_reserved_margin_change_to(
                 reserved_margin, lots, position_id, order.symbol, delta, price
             )
-            self._apply_lot_change_to(lots, entries, position_id, order.symbol, delta, price)
-        metrics = self._account_metrics(
-            bars,
-            price_field="open",
-            wallet_balance=wallet,
-            position_lots=lots,
-            entry_prices=entries,
-            reserved_margin=reserved_margin,
-        )
-        return metrics["available_balance"]
+            self._apply_lot_change_to(lots, {}, position_id, order.symbol, delta, price)
+        reserved_after = self._reserved_margin_total(reserved_margin)
+        additional_reserve = max(0.0, reserved_after - reserved_before)
+        return float(self.available_balance) - additional_reserve
 
     def projected_account_after_orders(self, orders, bars, scale=1.0):
         """Project metrics after proportionally executing open or close orders."""
-        wallet = float(self.wallet_balance)
+        free_cash = float(self.available_balance)
         lots = deepcopy(self.position_lots)
         entries = deepcopy(self.position_entry_prices)
         reserved_margin = deepcopy(self.position_reserved_margin)
+        capital = deepcopy(self.position_capital)
         positions = deepcopy(self.positions)
         scale = max(0.0, min(1.0, float(scale)))
+        affected = {}
 
         for order in orders:
             bar = bars.get(order.symbol)
@@ -253,15 +278,36 @@ class Exchange:
             delta = quantity if side == OrderSide.BUY.value else -quantity
             position_id = order.position_id or order.group_id or order.order_id
             fee = price * quantity * self.fee_rate
-
-            if action == OrderAction.OPEN.value:
-                wallet -= fee
-            elif action == OrderAction.CLOSE.value:
-                wallet += self._realized_pnl_from(
-                    lots, entries, position_id, order.symbol, delta, price
-                ) - fee
-            else:
+            if action not in {OrderAction.OPEN.value, OrderAction.CLOSE.value}:
                 return None
+
+            info = affected.setdefault(
+                position_id,
+                {
+                    "before_reserve": sum(
+                        max(0.0, float(value))
+                        for value in reserved_margin.get(position_id, {}).values()
+                    ),
+                    "before_capital": float(
+                        capital.get(
+                            position_id,
+                            sum(
+                                max(0.0, float(value))
+                                for value in reserved_margin.get(position_id, {}).values()
+                            ),
+                        )
+                    ),
+                    "realized": 0.0,
+                    "fees": 0.0,
+                    "actions": set(),
+                },
+            )
+            info["actions"].add(action)
+            info["fees"] += fee
+            if action == OrderAction.CLOSE.value:
+                info["realized"] += self._realized_pnl_from(
+                    lots, entries, position_id, order.symbol, delta, price
+                )
 
             self._apply_reserved_margin_change_to(
                 reserved_margin, lots, position_id, order.symbol, delta, price
@@ -273,14 +319,39 @@ class Exchange:
             if abs(positions[order.symbol]) < 1e-12:
                 positions.pop(order.symbol, None)
 
+        for position_id, info in affected.items():
+            after_reserve = sum(
+                max(0.0, float(value))
+                for value in reserved_margin.get(position_id, {}).values()
+            )
+            before_reserve = float(info["before_reserve"])
+            before_capital = float(info["before_capital"])
+            if info["actions"] == {OrderAction.OPEN.value}:
+                added = max(0.0, after_reserve - before_reserve)
+                free_cash -= added
+                capital[position_id] = before_capital + added - float(info["fees"])
+                continue
+
+            capital_after = before_capital + float(info["realized"]) - float(info["fees"])
+            if after_reserve <= 1e-12:
+                free_cash += max(0.0, capital_after)
+                capital.pop(position_id, None)
+                continue
+            released = max(0.0, before_reserve - after_reserve)
+            fraction = min(1.0, released / before_reserve) if before_reserve > 1e-12 else 0.0
+            release = max(0.0, capital_after) * fraction
+            free_cash += release
+            capital[position_id] = capital_after - release
+
         return self._account_metrics(
             bars,
             price_field="open",
-            wallet_balance=wallet,
             position_lots=lots,
             entry_prices=entries,
             reserved_margin=reserved_margin,
             positions=positions,
+            available_balance=free_cash,
+            position_capital=capital,
         )
 
     def _execute_prepared_order(self, order, bar, price):
@@ -292,7 +363,7 @@ class Exchange:
         action = self._value(order.action)
         position_id = order.position_id or order.group_id or order.order_id
         order.position_id = position_id
-        self._apply_trade(
+        realized = self._apply_trade(
             order.symbol, side, quantity, price, fee, action, position_id,
             pair_id=order.pair_id,
         )
@@ -329,7 +400,7 @@ class Exchange:
             fill_scale=order.fill_scale,
             para=order.para,
             rebalance_batch_id=order.rebalance_batch_id,
-        )
+        ), realized
 
     def _prepare_group_execution(self, orders, bars):
         prepared = []
@@ -387,8 +458,8 @@ class Exchange:
         position_id=None, pair_id=None,
     ):
         delta = quantity if side == OrderSide.BUY.value else -quantity
+        realized = 0.0
         if action == OrderAction.OPEN.value:
-            self.wallet_balance -= fee
             if position_id and pair_id:
                 self.position_pair_ids[position_id] = pair_id
             self._apply_reserved_margin_change_to(
@@ -405,7 +476,6 @@ class Exchange:
             )
         elif action == OrderAction.CLOSE.value:
             realized = self._realized_pnl(position_id, symbol, delta, price)
-            self.wallet_balance += realized - fee
             self._apply_reserved_margin_change_to(
                 self.position_reserved_margin,
                 self.position_lots,
@@ -420,13 +490,13 @@ class Exchange:
             )
         else:
             raise ValueError(f"unsupported trade action: {action!r}")
-        self.cash = self.wallet_balance
         self.positions[symbol] = self.positions.get(symbol, 0.0) + delta
         if abs(self.positions[symbol]) < 1e-12:
             self.positions.pop(symbol, None)
         if position_id and position_id not in self.position_lots:
             self.position_pair_ids.pop(position_id, None)
             self.position_reserved_margin.pop(position_id, None)
+        return float(realized)
 
     def _realized_pnl(self, position_id, symbol, close_delta, close_price):
         return self._realized_pnl_from(
@@ -508,20 +578,114 @@ class Exchange:
         if not position_margin:
             reserved_margin.pop(position_id, None)
 
+    @staticmethod
+    def _reserved_margin_total(reserved_margin) -> float:
+        return sum(
+            max(0.0, float(value))
+            for symbols in reserved_margin.values()
+            for value in symbols.values()
+        )
+
+    def _position_reserved_total(self, position_id: str) -> float:
+        return sum(
+            max(0.0, float(value))
+            for value in self.position_reserved_margin.get(position_id, {}).values()
+        )
+
+    def _position_capital_value(self, position_id: str) -> float:
+        if position_id in self.position_capital:
+            return float(self.position_capital[position_id])
+        # Compatibility for fixtures/checkpoints created before isolated Pair
+        # capital was explicit: the fixed entry reserve is the Pair capital.
+        return self._position_reserved_total(position_id)
+
+    def _settle_group_capital(
+        self,
+        prepared,
+        reserved_before,
+        capital_before,
+        realized_by_position,
+        fees_by_position,
+        *,
+        is_open: bool,
+    ) -> None:
+        """Apply one atomic group's cash movement to isolated Pair accounts."""
+        position_ids = {
+            order.position_id or order.group_id or order.order_id
+            for order, _bar, _price in prepared
+        }
+        if is_open:
+            total_added = 0.0
+            for position_id in position_ids:
+                before_reserve = float(reserved_before.get(position_id, 0.0))
+                after_reserve = self._position_reserved_total(position_id)
+                added = max(0.0, after_reserve - before_reserve)
+                total_added += added
+                self.position_capital[position_id] = (
+                    float(capital_before.get(position_id, 0.0))
+                    + added
+                    - float(fees_by_position.get(position_id, 0.0))
+                )
+            if total_added > float(self.available_balance) + 1e-7:
+                raise RuntimeError(
+                    "open execution exceeded isolated available balance: "
+                    f"required={total_added:.12f} available={self.available_balance:.12f}"
+                )
+            self.available_balance = max(0.0, float(self.available_balance) - total_added)
+        else:
+            for position_id in position_ids:
+                before_reserve = float(reserved_before.get(position_id, 0.0))
+                after_reserve = self._position_reserved_total(position_id)
+                released_reserve = max(0.0, before_reserve - after_reserve)
+                capital_after_pnl = (
+                    float(capital_before.get(position_id, before_reserve))
+                    + float(realized_by_position.get(position_id, 0.0))
+                    - float(fees_by_position.get(position_id, 0.0))
+                )
+                if after_reserve <= 1e-12:
+                    release = max(0.0, capital_after_pnl)
+                    self.available_balance += release
+                    self.position_capital.pop(position_id, None)
+                    continue
+
+                fraction = (
+                    min(1.0, released_reserve / before_reserve)
+                    if before_reserve > 1e-12 else 0.0
+                )
+                release = max(0.0, capital_after_pnl) * fraction
+                self.available_balance += release
+                self.position_capital[position_id] = capital_after_pnl - release
+
+        self._sync_wallet_balance()
+
+    def _sync_wallet_balance(self) -> None:
+        # Negative Pair capital is isolated and cannot consume free cash or a
+        # different Pair's capital.  Its contribution to account cash is zero.
+        self.wallet_balance = float(self.available_balance) + sum(
+            max(0.0, float(value)) for value in self.position_capital.values()
+        )
+        self.cash = self.wallet_balance
+
     def _account_metrics(
         self, bars, price_field="close", wallet_balance=None,
         position_lots=None, entry_prices=None, reserved_margin=None,
-        positions=None,
+        positions=None, available_balance=None, position_capital=None,
     ):
         wallet = self.wallet_balance if wallet_balance is None else float(wallet_balance)
+        free_cash = (
+            self.available_balance
+            if available_balance is None else float(available_balance)
+        )
         lots = self.position_lots if position_lots is None else position_lots
         entries = self.position_entry_prices if entry_prices is None else entry_prices
         margin_lots = (
             self.position_reserved_margin
             if reserved_margin is None else reserved_margin
         )
+        capital_map = self.position_capital if position_capital is None else position_capital
         aggregate_positions = self.positions if positions is None else positions
         unrealized = 0.0
+        unrealized_by_position: dict[str, float] = {}
         gross = 0.0
         net = 0.0
         compatibility_margin = 0.0
@@ -533,7 +697,11 @@ class Exchange:
                     continue
                 quantity = float(quantity)
                 entry = float(entries.get(position_id, {}).get(symbol, mark))
-                unrealized += quantity * (mark - entry)
+                position_pnl = quantity * (mark - entry)
+                unrealized += position_pnl
+                unrealized_by_position[position_id] = (
+                    unrealized_by_position.get(position_id, 0.0) + position_pnl
+                )
                 gross += abs(quantity * mark)
                 net += quantity * mark
                 covered[symbol] = covered.get(symbol, 0.0) + quantity
@@ -561,6 +729,32 @@ class Exchange:
             for symbols in margin_lots.values()
             for value in symbols.values()
         ) + compatibility_margin
+        isolated_account = bool(margin_lots or capital_map)
+        if isolated_account:
+            position_ids = set(lots) | set(margin_lots) | set(capital_map)
+            realized_capital = 0.0
+            marked_capital = 0.0
+            for position_id in position_ids:
+                if position_id in capital_map:
+                    capital = float(capital_map[position_id])
+                else:
+                    capital = sum(
+                        max(0.0, float(value))
+                        for value in margin_lots.get(position_id, {}).values()
+                    )
+                realized_capital += max(0.0, capital)
+                marked_capital += max(
+                    0.0,
+                    capital + float(unrealized_by_position.get(position_id, 0.0)),
+                )
+            wallet = max(0.0, free_cash) + realized_capital
+            equity = max(0.0, free_cash) + marked_capital
+            reported_available = max(0.0, free_cash)
+        else:
+            # Compatibility for callers that seed aggregate/legacy positions
+            # without the isolated position ledgers.
+            equity = wallet + unrealized
+            reported_available = max(0.0, wallet - used_margin)
         return {
             "wallet_balance": wallet,
             "unrealized_pnl": unrealized,
@@ -568,10 +762,7 @@ class Exchange:
             "gross_exposure": gross,
             "net_exposure": net,
             "used_margin": used_margin,
-            # Free capital is wallet capital that has not been reserved by an
-            # open lot.  Unrealized PnL is reported in equity only; it must not
-            # reach into the unallocated cash balance.
-            "available_balance": wallet - used_margin,
+            "available_balance": reported_available,
         }
 
     def _update_account(self, bars, price_field="close"):
@@ -604,29 +795,35 @@ class Exchange:
     def _apply_funding_rates(self, bars, funding_rates, event_ts=None):
         payments = []
         for symbol, funding_rate in funding_rates.items():
-            quantity = self.positions.get(symbol, 0.0)
-            if abs(quantity) < 1e-12:
-                continue
             bar = bars.get(symbol)
             if bar is None:
                 continue
-            mark_price = float(bar["close"])
-            notional = abs(float(quantity) * mark_price)
-            payment = float(quantity) * mark_price * float(funding_rate)
-            self.wallet_balance -= payment
-            self.cash = self.wallet_balance
-            funding_payment = FundingPayment(
-                exchange=self.exchange_name,
-                symbol=symbol,
-                ts=event_ts if event_ts is not None else bar["ts"],
-                funding_rate=float(funding_rate),
-                quantity=float(quantity),
-                mark_price=mark_price,
-                notional=notional,
-                payment=payment,
-            )
-            self.funding_history.append(funding_payment)
-            payments.append(funding_payment)
+            # Funding is settled during begin_bar, so the current bar's close is
+            # not known yet. Use the executable/open price to avoid look-ahead.
+            mark_price = float(bar["open"])
+            for position_id, symbols in list(self.position_lots.items()):
+                quantity = float(symbols.get(symbol, 0.0) or 0.0)
+                if abs(quantity) < 1e-12:
+                    continue
+                notional = abs(quantity * mark_price)
+                payment = quantity * mark_price * float(funding_rate)
+                current_capital = self._position_capital_value(position_id)
+                self.position_capital[position_id] = current_capital - payment
+                funding_payment = FundingPayment(
+                    exchange=self.exchange_name,
+                    symbol=symbol,
+                    ts=event_ts if event_ts is not None else bar["ts"],
+                    funding_rate=float(funding_rate),
+                    quantity=quantity,
+                    mark_price=mark_price,
+                    notional=notional,
+                    payment=payment,
+                    position_id=position_id,
+                    pair_id=self.position_pair_ids.get(position_id),
+                )
+                self.funding_history.append(funding_payment)
+                payments.append(funding_payment)
+        self._sync_wallet_balance()
         return payments
 
     @staticmethod

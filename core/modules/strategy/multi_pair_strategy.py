@@ -561,16 +561,17 @@ class MultiPairStrategy(BaseStrategy):
                 # quality gate.
                 if any(not self._profitable_replacement_allowed(item[3]) for item in requirements):
                     continue
-            old_state = old_pipeline.state.sizing_state
             if self.rebalance_cfg.eviction_min_holding_bars > 0:
                 entry_bar = old_pipeline.state.protection_state.entry_bar_index
                 if entry_bar is not None and bar_index - entry_bar < self.rebalance_cfg.eviction_min_holding_bars:
                     continue
-            gross = float(old_state.current_gross_notional or 0.0)
-            if gross <= 0:
-                old_bundle = bundles.get(pair_id)
-                if old_bundle is not None:
-                    gross = abs(old_state.x_quantity * old_bundle.x_bar.close) + abs(old_state.y_quantity * old_bundle.y_bar.close)
+            # Closing a Pair releases only its remaining isolated net equity,
+            # never its current gross market value.  Losses therefore cannot
+            # be financed by another Pair or by unallocated account cash.
+            releasable = self._pair_releasable_equity(
+                old_pipeline, bundles.get(pair_id)
+            )
+            old_state = old_pipeline.state.sizing_state
             if rebalance_batch_id is None:
                 rebalance_batch_id = str(uuid4())[:8]
             close_orders = self._close_orders(
@@ -587,7 +588,7 @@ class MultiPairStrategy(BaseStrategy):
             orders.extend(close_orders)
             self._pending_rebalance_pair_ids.add(pair_id)
             selected.append(pair_id)
-            release += max(0.0, gross)
+            release += releasable
             if release >= release_needed - 1e-9:
                 break
 
@@ -599,14 +600,28 @@ class MultiPairStrategy(BaseStrategy):
         return orders
 
     def _pair_unrealized_return(self, pipeline, bundle):
-        state = pipeline.state.sizing_state
         pstate = pipeline.state.protection_state
         if bundle is None or pstate.entry_gross_notional <= 0:
             return 0.0
+        pnl = self._pair_mark_net_pnl(pipeline, bundle)
+        return float(pnl / max(pstate.entry_gross_notional, 1e-12))
+
+    def _pair_releasable_equity(self, pipeline, bundle):
+        pstate = pipeline.state.protection_state
+        if bundle is None or pstate.entry_gross_notional <= 0:
+            return 0.0
+        return max(
+            0.0,
+            float(pstate.entry_gross_notional) + self._pair_mark_net_pnl(pipeline, bundle),
+        )
+
+    def _pair_mark_net_pnl(self, pipeline, bundle):
+        state = pipeline.state.sizing_state
+        pstate = pipeline.state.protection_state
         side = state.position_side or pstate.side
         x_entry = pstate.entry_x_price or bundle.x_bar.close
         y_entry = pstate.entry_y_price or bundle.y_bar.close
-        pnl = mark_net_pnl(
+        return float(mark_net_pnl(
             side,
             float(bundle.x_bar.close),
             float(bundle.y_bar.close),
@@ -618,8 +633,7 @@ class MultiPairStrategy(BaseStrategy):
             pstate.funding_cost,
             self.fee_rate,
             self.slippage_rate,
-        )
-        return float(pnl / max(pstate.entry_gross_notional, 1e-12))
+        ))
 
     def _profitable_replacement_allowed(self, candidate):
         rule = self.rebalance_cfg.profitable_position_replacement
@@ -1431,6 +1445,15 @@ class MultiPairStrategy(BaseStrategy):
             amount = float(getattr(payment, "payment", 0.0) or 0.0)
             if not symbol or amount == 0.0:
                 continue
+            pair_id = getattr(payment, "pair_id", None)
+            position_id = getattr(payment, "position_id", None)
+            if pair_id in self.pipelines:
+                pstate = self.pipelines[pair_id].state.protection_state
+                if pstate.active and (
+                    position_id is None or pstate.position_id == position_id
+                ):
+                    pstate.funding_cost += amount
+                    continue
             active = []
             total = 0.0
             for pipeline in self.pipelines.values():

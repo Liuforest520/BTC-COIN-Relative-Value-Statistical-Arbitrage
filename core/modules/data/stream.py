@@ -67,7 +67,7 @@ def _iter_polars_csv_bars(path: Path, encoding: str) -> Iterator[list]:
         path,
         columns=sources,
         schema_overrides=schema_overrides,
-        batch_size=50_000,
+        batch_size=10_000,
         n_threads=1,
         ignore_errors=True,
         encoding="utf8-lossy" if encoding == "utf-8-sig" else "utf8",

@@ -1,10 +1,7 @@
 from core.modules.exchange.exchange import Exchange
 from core.modules.models import (
     Order,
-    OrderAction,
-    OrderSide,
     OrderStatus,
-    OrderType,
 )
 
 
@@ -47,9 +44,6 @@ class ExchangeManager:
         positions = {}
         funding_payments = []
         funding_rates = funding_rates or {}
-        margin_events = []
-        forced_deleveraging_orders = []
-
         formatted_bars = {}
         per_exchange = {}
         for exchange_name, exchange in self.exchanges.items():
@@ -65,8 +59,6 @@ class ExchangeManager:
                 "new_trades": [],
                 "funding_payments": payments,
             }
-
-        opening_margin_event = None
 
         # Execute complete logical Pair groups sequentially.  This makes the
         # available margin consumed by an earlier group visible to every later
@@ -99,16 +91,6 @@ class ExchangeManager:
                     )
                 continue
             actions = {getattr(o.action, "value", o.action) for o in group_orders}
-            # Existing close orders get the first chance to release margin.
-            # Before the first non-close group, enforce the account invariant
-            # so pending opens cannot execute against a negative free balance.
-            if opening_margin_event is None and actions != {"close"}:
-                opening_margin_event = self._force_margin_deleveraging(
-                    formatted_bars, per_exchange, stage="open"
-                )
-                margin_events.append(opening_margin_event)
-                forced_deleveraging_orders.extend(opening_margin_event["orders"])
-                new_trades.extend(opening_margin_event["trades"])
             batch_ids = {getattr(o, "rebalance_batch_id", None) for o in group_orders}
             if actions == {"open"} and batch_ids.intersection(failed_rebalance_batches):
                 rejected = self._reject_group_orders({group_id})
@@ -200,31 +182,8 @@ class ExchangeManager:
                 per_exchange[exchange_name]["new_trades"].extend(result["new_trades"])
                 new_trades.extend(result["new_trades"])
 
-        if opening_margin_event is None:
-            opening_margin_event = self._force_margin_deleveraging(
-                formatted_bars, per_exchange, stage="open"
-            )
-            margin_events.append(opening_margin_event)
-            forced_deleveraging_orders.extend(opening_margin_event["orders"])
-            new_trades.extend(opening_margin_event["trades"])
-
         for exchange in self.exchanges.values():
             exchange.finish_bar()
-
-        # A position can become under-margined between the open and close even
-        # when no new order was accepted.  Forced account deleveraging is an
-        # exchange invariant, so it executes at the observed close rather than
-        # leaving a negative free balance until a strategy order arrives.
-        close_bars = self._close_execution_bars(formatted_bars)
-        closing_margin_event = self._force_margin_deleveraging(
-            close_bars, per_exchange, stage="close"
-        )
-        margin_events.append(closing_margin_event)
-        forced_deleveraging_orders.extend(closing_margin_event["orders"])
-        new_trades.extend(closing_margin_event["trades"])
-        if closing_margin_event["triggered"]:
-            for exchange in self.exchanges.values():
-                exchange.finish_bar()
 
         for exchange_name, exchange in self.exchanges.items():
             result = exchange._result(**per_exchange[exchange_name])
@@ -262,191 +221,15 @@ class ExchangeManager:
             "open_pair_count": portfolio_state["open_pair_count"],
             "open_pair_ids": portfolio_state["open_pair_ids"],
             "pending_open_pair_count": portfolio_state["pending_open_pair_count"],
-            "margin_deficit": max(
-                (float(event["margin_deficit"]) for event in margin_events),
-                default=0.0,
-            ),
-            "forced_deleveraging_triggered": any(
-                bool(event["triggered"]) for event in margin_events
-            ),
-            "forced_deleveraging_scale": max(
-                (float(event["close_fraction"]) for event in margin_events),
-                default=0.0,
-            ),
-            "forced_deleveraging_orders": forced_deleveraging_orders,
+            # Retained as inert compatibility fields for existing reports.
+            "margin_deficit": 0.0,
+            "forced_deleveraging_triggered": False,
+            "forced_deleveraging_scale": 0.0,
+            "forced_deleveraging_orders": [],
             "initial_cash": self.initial_cash,
             "equity_curve": self.equity_curve,
             "has_fill": len(new_trades) > 0,
         }
-
-    def _force_margin_deleveraging(self, formatted_bars, per_exchange, stage):
-        """Fully close the worst Pair(s) until every wallet is funded.
-
-        This is an emergency account fallback, not the normal strategy
-        rebalance path.  Existing positions are never shaved pro rata: a
-        selected Position is closed on both legs in full.  Normal replacement
-        planning remains in ``MultiPairStrategy._plan_rebalance``; new opening
-        groups may still be scaled proportionally at their fill prices.
-        """
-        deficits = {
-            name: max(0.0, -float(exchange.available_balance))
-            for name, exchange in self.exchanges.items()
-        }
-        margin_deficit = sum(deficits.values())
-        empty = {
-            "triggered": False,
-            "close_fraction": 0.0,
-            "margin_deficit": margin_deficit,
-            "orders": [],
-            "trades": [],
-        }
-        if margin_deficit <= 1e-8:
-            return empty
-
-        candidates = {}
-        for exchange_name, exchange in self.exchanges.items():
-            for position_id, symbols in exchange.position_lots.items():
-                pair_id = exchange.position_pair_ids.get(position_id)
-                key = (str(pair_id or position_id), str(position_id))
-                candidate = candidates.setdefault(
-                    key,
-                    {
-                        "pair_id": pair_id,
-                        "position_id": position_id,
-                        "orders": [],
-                        "unrealized_pnl": 0.0,
-                        "reserved_margin": 0.0,
-                    },
-                )
-                group_id = f"forced-margin:{stage}:{self._bar_index}:{position_id}"
-                for symbol, signed_quantity in symbols.items():
-                    quantity = abs(float(signed_quantity))
-                    if quantity <= 1e-12:
-                        continue
-                    bar = formatted_bars.get(exchange_name, {}).get(symbol)
-                    if bar is None:
-                        candidate["missing_bar"] = True
-                        continue
-                    mark = float(bar["open"])
-                    entry = float(
-                        exchange.position_entry_prices
-                        .get(position_id, {})
-                        .get(symbol, mark)
-                    )
-                    candidate["unrealized_pnl"] += (
-                        float(signed_quantity) * (mark - entry)
-                    )
-                    candidate["reserved_margin"] += float(
-                        exchange.position_reserved_margin
-                        .get(position_id, {})
-                        .get(symbol, 0.0)
-                        or 0.0
-                    )
-                    order = Order(
-                        order_id=f"{group_id}:{exchange_name}:{symbol}",
-                        group_id=group_id,
-                        exchange=exchange_name,
-                        symbol=symbol,
-                        action=OrderAction.CLOSE,
-                        side=(OrderSide.SELL if signed_quantity > 0 else OrderSide.BUY),
-                        order_type=OrderType.MARKET,
-                        quantity=quantity,
-                        requested_quantity=quantity,
-                        position_id=position_id,
-                        pair_id=pair_id,
-                        exit_reason="forced_margin_pair_exit",
-                        protection_trigger="margin_deleveraging",
-                        protection_rule="margin_deleveraging",
-                        exit_class="stop_loss",
-                        reopen_lock_pending=True,
-                        protection_freeze_bars=0,
-                    )
-                    candidate["orders"].append(order)
-
-        ranked = []
-        for candidate in candidates.values():
-            if candidate.get("missing_bar") or not candidate["orders"]:
-                continue
-            denominator = max(float(candidate["reserved_margin"]), 1e-12)
-            candidate["return"] = float(candidate["unrealized_pnl"]) / denominator
-            ranked.append(candidate)
-        ranked.sort(
-            key=lambda item: (
-                float(item["return"]),
-                str(item.get("pair_id") or ""),
-                str(item["position_id"]),
-            )
-        )
-
-        if not ranked:
-            return empty
-
-        trades = []
-        executed_orders = []
-        for candidate in ranked:
-            if all(exchange.available_balance >= -1e-8 for exchange in self.exchanges.values()):
-                break
-            group_orders = candidate["orders"]
-            local_groups = {}
-            for order in group_orders:
-                local_groups.setdefault(order.exchange, []).append(order)
-            valid = True
-            for exchange_name, local_orders in local_groups.items():
-                status, _prepared = self.exchanges[exchange_name]._prepare_group_execution(
-                    local_orders, formatted_bars[exchange_name]
-                )
-                if status != "ready":
-                    valid = False
-                    break
-            if not valid:
-                continue
-
-            # Validate the complete Pair before executing either leg.  Every
-            # selected close uses fill_scale=1.0 by construction.
-            for exchange_name, local_orders in local_groups.items():
-                exchange = self.exchanges[exchange_name]
-                exchange.order_history.extend(local_orders)
-                result = exchange.execute_group(
-                    local_orders, formatted_bars[exchange_name]
-                )
-                if result["waiting"] or result["rejected_orders"]:
-                    raise RuntimeError("forced full-Pair margin exit failed after validation")
-                per_exchange[exchange_name]["filled_orders"].extend(result["filled_orders"])
-                per_exchange[exchange_name]["new_trades"].extend(result["new_trades"])
-                executed_orders.extend(result["filled_orders"])
-                trades.extend(result["new_trades"])
-                exchange._update_account(
-                    formatted_bars[exchange_name], price_field="open"
-                )
-
-        return {
-            "triggered": bool(trades),
-            "close_fraction": 1.0 if trades else 0.0,
-            "margin_deficit": margin_deficit,
-            "orders": executed_orders,
-            "trades": trades,
-        }
-
-    def _close_execution_bars(self, formatted_bars):
-        """Build executable bars whose open is the observed close."""
-        current_ts = self._current_ts(formatted_bars)
-        result = {}
-        for exchange_name, exchange in self.exchanges.items():
-            exchange_bars = {}
-            for symbol, bar in exchange.last_bars.items():
-                if symbol not in exchange.positions:
-                    continue
-                close_price = float(bar["close"])
-                exchange_bars[symbol] = {
-                    "ts": current_ts if current_ts is not None else bar.get("ts"),
-                    "open": close_price,
-                    "high": close_price,
-                    "close": close_price,
-                    "low": close_price,
-                    "volume": float(bar.get("volume", 0.0)),
-                }
-            result[exchange_name] = exchange_bars
-        return result
 
     @classmethod
     def from_names(cls, exchange_names, initial_cash=100000.0, fee_rate=0.0005, slippage_bps=1.0, max_leverage=1.0, pending_timeout_bars=0):
@@ -471,7 +254,10 @@ class ExchangeManager:
         used_margin = sum(float(result["used_margin"]) for result in results.values())
         gross_exposure = sum(float(result["gross_exposure"]) for result in results.values())
         net_exposure = sum(float(result["net_exposure"]) for result in results.values())
-        equity = wallet_balance + unrealized_pnl
+        # Each exchange already floors every isolated Pair at zero.  Rebuilding
+        # equity as wallet + aggregate unrealized PnL would let one Pair's loss
+        # leak into free cash or another Pair after its own capital is exhausted.
+        equity = sum(float(result["equity"]) for result in results.values())
         open_pair_ids = sorted({
             pair_id
             for exchange in self.exchanges.values()

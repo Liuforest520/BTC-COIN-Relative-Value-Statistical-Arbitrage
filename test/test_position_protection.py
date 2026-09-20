@@ -145,6 +145,29 @@ def test_funding_payment_is_allocated_once_by_shared_symbol_quantity():
     assert second_state.funding_cost == pytest.approx(1.0)
 
 
+def test_position_attributed_funding_is_not_redistributed_to_shared_pairs():
+    strategy, pipeline = _strategy_with_protection()
+    pipeline.state.protection_state.position_id = "position-p"
+    second = MultiPairStrategy(
+        pairs=[PairDefinition("p2", x_symbol="X", y_symbol="Z")],
+        estimator_ctor=TLSEstimator,
+        estimator_cfg=EstimatorConfig(regression_method="price", position_update_policy="freeze"),
+        protection_cfg=ProtectionConfig(enabled=True),
+    )
+    second_state = second.pipelines["p2"].state.protection_state
+    second_state.active = True
+    second_state.position_id = "position-p2"
+    strategy.pipelines["p2"] = second.pipelines["p2"]
+
+    payment = SimpleNamespace(
+        symbol="X", payment=2.0, pair_id="p", position_id="position-p"
+    )
+    strategy.on_funding_payments([payment])
+
+    assert pipeline.state.protection_state.funding_cost == pytest.approx(2.0)
+    assert second_state.funding_cost == pytest.approx(0.0)
+
+
 def test_factory_rejects_protection_for_update_or_return_models():
     setup = SimpleNamespace(
         pairs=[{"pair_id": "p", "x_symbol": "X", "y_symbol": "Y"}],
@@ -537,7 +560,7 @@ def test_rebalance_close_is_frozen_without_model_update_lock():
     assert all(order.reopen_lock_pending is False for order in orders)
 
 
-def test_rebalance_releases_only_first_candidate_shortfall():
+def test_rebalance_release_uses_pair_net_liquidation_value():
     from core.modules.models.pipeline_types import RawPairTarget
     from core.modules.strategy.config import RebalanceConfig
 
@@ -581,4 +604,4 @@ def test_rebalance_releases_only_first_candidate_shortfall():
     orders = strategy._plan_rebalance({"new": candidate}, bundles, 1)
     assert len(orders) == 2
     assert strategy._pending_rebalance_pair_ids == {"old_a"}
-    assert strategy._pending_rebalance_release == 100.0
+    assert strategy._pending_rebalance_release == pytest.approx(89.946)
