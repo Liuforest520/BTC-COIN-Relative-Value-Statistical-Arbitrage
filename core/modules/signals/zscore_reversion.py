@@ -1,8 +1,23 @@
 """
-Z-score reversion signal: enter only after z-score starts reverting toward mean.
+Z-score reversion signals: enter only after the z-score starts reverting.
 
-Two-stage gating: arm at trigger_z, fire when z-score crosses back into entry band.
-Reversion filter: optionally require z-score MA to confirm reversion direction.
+Three mutually exclusive signal choices are registered:
+
+* ``simple_zscore`` (``signals/zscore.py``)
+    Hit ``entry_z`` and enter immediately.  No confirmation layer.
+
+* ``zscore_reversion_two_stage`` -- :class:`TwoStageReversionSignal`
+    Arm at ``two_stage_trigger_z``, enter only when the z-score pulls back into
+    the entry band (``two_stage_entry_z`` +/- ``two_stage_entry_window_z``),
+    with an optional wait limit.  The MA filter is forced off.
+
+* ``zscore_reversion_ma`` -- :class:`MAReversionSignal`
+    Require the short z-score MA to turn toward the mean before entering.
+    The two-stage state machine is forced off.
+
+``zscore_reversion`` (:class:`ZScoreReversionSignal`) is the legacy combined
+class kept for reproductions of older configs; new configs should name one of
+the two dedicated classes above.
 """
 from __future__ import annotations
 
@@ -15,22 +30,47 @@ from core.modules.models.pipeline_types import (
     register_signal,
 )
 from core.modules.data.rolling_window import ensure_deque, percentiles_from_tail, tail_values
-from core.modules.signals.position_exit_zscore import (
-    resolve_position_exit_decision,
-    resolve_position_exit_zscore,
-)
+from core.modules.signals.exit_rules import resolve_position_exit_decision
+
+# The legacy name is constructed once per pair; warn once per process instead of
+# flooding the log with one line per pair.
+_LEGACY_WARNING_EMITTED = False
+
+
+def _warn_legacy_signal_once(two_stage_enabled, reversion_filter_enabled) -> None:
+    global _LEGACY_WARNING_EMITTED
+    if _LEGACY_WARNING_EMITTED:
+        return
+    _LEGACY_WARNING_EMITTED = True
+    from core.modules.logger import logger
+
+    logger.warning(
+        "signal.method 'zscore_reversion' is the legacy combined signal "
+        "(two_stage_enabled={}, reversion_filter_enabled={}); prefer "
+        "'zscore_reversion_two_stage' or 'zscore_reversion_ma'",
+        two_stage_enabled,
+        reversion_filter_enabled,
+    )
 
 
 @register_signal("zscore_reversion")
 class ZScoreReversionSignal:
-    """Signal that waits for z-score reversion before entering.
+    """Legacy combined signal: two-stage gating and/or the MA reversion filter.
 
-    Compared to plain ZScoreSignal, this adds:
+    Compared to plain ``simple_zscore``, this adds:
       - Two-stage: arm when crossing trigger_z; fire only when reverting back
         across entry_z toward zero.
       - Reversion filter: short MA must move in the expected direction versus
         long MA.
+
+    Kept so older configs reproduce; the behaviour depends on both
+    ``two_stage_enabled`` and ``reversion_filter_enabled``, which is exactly the
+    ambiguity the two dedicated subclasses remove.
     """
+
+    # Subclasses turn this off so only the legacy name logs the migration hint.
+    legacy_combined = True
+    signal_method = "zscore_reversion"
 
     def __init__(
         self,
@@ -54,6 +94,7 @@ class ZScoreReversionSignal:
         # Reversion filter
         reversion_filter_enabled: bool = True,
         reversion_ma_lookback_bars: int = 60,
+        reversion_ma_short_lookback_bars: int | None = None,
         reversion_min_samples: int | None = None,
         # Two-stage expiry
         two_stage_max_wait_bars: int = 0,
@@ -87,7 +128,10 @@ class ZScoreReversionSignal:
         self.two_stage_levels = two_stage_levels
 
         self.reversion_filter_enabled = bool(reversion_filter_enabled)
-        self.reversion_ma_lookback_bars = int(reversion_ma_lookback_bars)
+        self.reversion_ma_lookback_bars = max(5, int(reversion_ma_lookback_bars))
+        configured_short = reversion_ma_short_lookback_bars
+        self.reversion_ma_short_lookback_bars = max(1, int(configured_short)) if configured_short is not None else max(1, self.reversion_ma_lookback_bars // 4)
+        self.reversion_ma_short_lookback_bars = min(self.reversion_ma_short_lookback_bars, self.reversion_ma_lookback_bars)
         self.reversion_min_samples = int(reversion_min_samples or reversion_ma_lookback_bars)
         self.two_stage_max_wait_bars = int(two_stage_max_wait_bars)
         self.pair_quality_filter_enabled = bool(pair_quality_filter_enabled)
@@ -101,15 +145,18 @@ class ZScoreReversionSignal:
             int(self.entry_rule_lookback_bars),
             int(self.entry_rule_min_samples),
             int(self.reversion_ma_lookback_bars),
+            int(self.reversion_ma_short_lookback_bars),
             1,
         )
+        if self.legacy_combined:
+            _warn_legacy_signal_once(self.two_stage_enabled, self.reversion_filter_enabled)
 
     def evaluate(self, state: SignalState, estimator: EstimatorOutput,
                  bar_index: int, para: dict | None = None) -> SignalOutput:
         if not estimator.ready or estimator.spread_std is None:
             return SignalOutput(pair_id=self.pair_id, bar_index=bar_index,
                                ready=False, reason="estimator not ready",
-                               para={"signal": {"method": "zscore_reversion", "blocked_by": "estimator"}})
+                               para={"signal": {"method": self.signal_method, "blocked_by": "estimator"}})
 
         # Compute zscore
         std = estimator.spread_std
@@ -135,39 +182,38 @@ class ZScoreReversionSignal:
         side = self._candidate_side(zscore, state)
         action = "none"
         reason = f"zscore={zscore:.4f}"
-        close_zscore, close_zscore_method, _ = resolve_position_exit_zscore(para, zscore)
-
-        # Close inside the exit band or after crossing to the opposite Z side.
+        # Positive exit_z is a band; zero/negative values require reversal.
         should_close, close_reason = resolve_position_exit_decision(
-            para, close_zscore, self.exit_z
+            para, zscore, self.exit_z
         )
         if should_close:
             action = "close"
-            if close_reason == "direction_reversed":
+            if close_reason in {"direction_reversed", "reversal_threshold_reached"}:
                 position_side = ((para or {}).get("position") or {}).get("side")
-                reason = (
-                    f"{close_zscore_method} zscore direction reversed for "
-                    f"{position_side}: {close_zscore:.4f}"
-                )
+                if close_reason == "reversal_threshold_reached":
+                    reason = (
+                        f"zscore reached opposite exit {self.exit_z:.4f} "
+                        f"for {position_side}: {zscore:.4f}"
+                    )
+                else:
+                    reason = (
+                        f"zscore direction reversed for {position_side}: {zscore:.4f}"
+                    )
             else:
                 reason = (
-                    f"{close_zscore_method} zscore within exit: "
-                    f"{close_zscore:.4f}"
+                    f"zscore within exit: {zscore:.4f}"
                 )
             self._clear_two_stage(state)
             return SignalOutput(
                 pair_id=self.pair_id, bar_index=bar_index, ready=True,
-                action=action, side=None, zscore=close_zscore,
+                action=action, side=None, zscore=zscore,
                 entry_z_upper=state.entry_z_upper, entry_z_lower=state.entry_z_lower,
-                exit_z=self.exit_z, signal_strength=abs(close_zscore),
+                exit_z=self.exit_z, signal_strength=abs(zscore),
                 entry_thresholds_ready=state.entry_thresholds_ready, reason=reason,
                 para={"signal": {
-                    "method": "zscore_reversion",
+                    "method": self.signal_method,
                     "action": action,
-                    "zscore": close_zscore,
-                    "standard_zscore": zscore,
-                    "position_exit_zscore": close_zscore,
-                    "position_exit_zscore_method": close_zscore_method,
+                    "zscore": zscore,
                     "reason": reason,
                 }},
             )
@@ -185,7 +231,7 @@ class ZScoreReversionSignal:
                 entry_z_upper=state.entry_z_upper, entry_z_lower=state.entry_z_lower,
                 exit_z=self.exit_z, signal_strength=abs(zscore),
                 entry_thresholds_ready=state.entry_thresholds_ready, reason=reason,
-                para={"signal": {"method": "zscore_reversion", "action": "none", "zscore": zscore, "reason": reason}},
+                para={"signal": {"method": self.signal_method, "action": "none", "zscore": zscore, "reason": reason}},
             )
 
         # Two-stage arm or direct reversion
@@ -213,7 +259,7 @@ class ZScoreReversionSignal:
                 exit_z=self.exit_z, signal_strength=abs(zscore),
                 entry_thresholds_ready=state.entry_thresholds_ready,
                 reason=checks["reason"],
-                para={"signal": {"method": "zscore_reversion", "reversion_checks": checks}},
+                para={"signal": {"method": self.signal_method, "reversion_checks": checks}},
             )
         entry_checks = self._entry_checks(estimator, zscore, para)
         if not entry_checks["passed"]:
@@ -230,7 +276,7 @@ class ZScoreReversionSignal:
             reason=f"reversion open {side} z={zscore:.4f}",
             para={
                 "signal": {
-                    "method": "zscore_reversion",
+                    "method": self.signal_method,
                     "reversion_checks": checks,
                 }
             },
@@ -254,7 +300,7 @@ class ZScoreReversionSignal:
                 exit_z=self.exit_z, signal_strength=abs(zscore),
                 entry_thresholds_ready=state.entry_thresholds_ready,
                 reason=f"two-stage arm {side} z={zscore:.4f}",
-                para={"signal": {"method": "zscore_reversion", "two_stage": "armed"}},
+                para={"signal": {"method": self.signal_method, "two_stage": "armed"}},
             )
 
         if side == "long_x" and zscore >= trigger and state.armed_side is None:
@@ -277,7 +323,7 @@ class ZScoreReversionSignal:
             exit_z=self.exit_z, signal_strength=abs(zscore),
             entry_thresholds_ready=state.entry_thresholds_ready,
             reason=f"two-stage {'armed' if state.armed_side else 'idle'} z={zscore:.4f}",
-            para={"signal": {"method": "zscore_reversion", "two_stage": "armed" if state.armed_side else "idle"}},
+            para={"signal": {"method": self.signal_method, "two_stage": "armed" if state.armed_side else "idle"}},
         )
 
     def _two_stage_fire_check(
@@ -302,7 +348,7 @@ class ZScoreReversionSignal:
                 reason=f"two-stage reset {old_side}: crossed opposite entry band z={zscore:.4f}",
                 para={
                     "signal": {
-                        "method": "zscore_reversion",
+                        "method": self.signal_method,
                         "two_stage": "reset_opposite_band",
                         "old_side": old_side,
                     }
@@ -321,7 +367,7 @@ class ZScoreReversionSignal:
                 reason=f"two-stage reset {old_side}: crossed zero z={zscore:.4f}",
                 para={
                     "signal": {
-                        "method": "zscore_reversion",
+                        "method": self.signal_method,
                         "two_stage": "reset_crossed_zero",
                         "old_side": old_side,
                     }
@@ -341,7 +387,7 @@ class ZScoreReversionSignal:
                 reason=f"two-stage reset {old_side}: expired after {elapsed} bars",
                 para={
                     "signal": {
-                        "method": "zscore_reversion",
+                        "method": self.signal_method,
                         "two_stage": "reset_expired",
                         "old_side": old_side,
                         "elapsed_bars": elapsed,
@@ -363,7 +409,7 @@ class ZScoreReversionSignal:
                 exit_z=self.exit_z, signal_strength=abs(zscore),
                 entry_thresholds_ready=state.entry_thresholds_ready,
                 reason=f"two-stage armed waiting: z={zscore:.4f} entry_z={entry_z:.4f}",
-                para={"signal": {"method": "zscore_reversion", "two_stage": "waiting"}},
+                para={"signal": {"method": self.signal_method, "two_stage": "waiting"}},
             )
 
         if self._missed_entry_window(armed_side, zscore, entry_z):
@@ -382,7 +428,7 @@ class ZScoreReversionSignal:
                 ),
                 para={
                     "signal": {
-                        "method": "zscore_reversion",
+                        "method": self.signal_method,
                         "two_stage": "reset_missed_entry_window",
                         "old_side": old_side,
                         "entry_z": entry_z,
@@ -401,7 +447,7 @@ class ZScoreReversionSignal:
                 exit_z=self.exit_z, signal_strength=abs(zscore),
                 entry_thresholds_ready=state.entry_thresholds_ready,
                 reason=checks["reason"],
-                para={"signal": {"method": "zscore_reversion", "two_stage": "blocked", "reversion_checks": checks}},
+                para={"signal": {"method": self.signal_method, "two_stage": "blocked", "reversion_checks": checks}},
             )
 
         entry_checks = self._entry_checks(estimator, zscore, para)
@@ -421,7 +467,7 @@ class ZScoreReversionSignal:
             reason=f"two-stage fire {armed_side} z={zscore:.4f}",
             para={
                 "signal": {
-                    "method": "zscore_reversion",
+                    "method": self.signal_method,
                     "two_stage": "fire",
                     "reversion_checks": checks,
                 }
@@ -437,7 +483,7 @@ class ZScoreReversionSignal:
         # short_x comes from negative z-score, so require upward reversion.
         if self.reversion_filter_enabled and len(state.zscore_history) >= self.reversion_min_samples:
             recent = tail_values(state.zscore_history, self.reversion_ma_lookback_bars)
-            short_n = max(5, len(recent) // 4)
+            short_n = min(len(recent), max(1, int(self.reversion_ma_short_lookback_bars)))
             short_ma = float(np.mean(recent[-short_n:]))
             long_ma = float(np.mean(recent))
             gap = short_ma - long_ma
@@ -501,7 +547,7 @@ class ZScoreReversionSignal:
             entry_thresholds_ready=state.entry_thresholds_ready,
             reason=entry_checks["reason"],
             para={"signal": {
-                "method": "zscore_reversion",
+                "method": self.signal_method,
                 "two_stage": "blocked" if two_stage else None,
                 "entry_checks": entry_checks,
                 "reversion_checks": reversion_checks,
@@ -607,3 +653,74 @@ class ZScoreReversionSignal:
         state.armed_zscore = None
         state.armed_trigger_z = None
         state.armed_entry_z = None
+
+
+@register_signal("zscore_reversion_two_stage")
+class TwoStageReversionSignal(ZScoreReversionSignal):
+    """Two-stage reversion entry -- and nothing else.
+
+    The z-score must first reach ``two_stage_trigger_z`` (arming) and may only
+    enter after pulling back to ``two_stage_entry_z``.  Entry must land inside
+    ``two_stage_entry_z`` +/- ``two_stage_entry_window_z`` when that window is
+    configured, and the armed state expires after ``two_stage_max_wait_bars``.
+
+    ``reversion_filter_enabled`` is forced off and ``two_stage_enabled`` is
+    forced on, so the config only has to name this method.  Contradicting keys
+    left over from an older config are ignored; the factory logs one warning per
+    run when it sees them.
+    """
+
+    legacy_combined = False
+    signal_method = "zscore_reversion_two_stage"
+
+    def __init__(
+        self,
+        *args,
+        two_stage_enabled: bool | None = None,
+        reversion_filter_enabled: bool | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            two_stage_enabled=True,
+            reversion_filter_enabled=False,
+            **kwargs,
+        )
+        if self.two_stage_trigger_z is None and not self.two_stage_levels:
+            raise ValueError(
+                "zscore_reversion_two_stage requires two_stage_trigger_z "
+                "(or two_stage_levels)"
+            )
+
+
+@register_signal("zscore_reversion_ma")
+class MAReversionSignal(ZScoreReversionSignal):
+    """MA-confirmed reversion entry -- and nothing else.
+
+    Enter only when the z-score short MA (the most recent quarter of
+    ``reversion_ma_lookback_bars``) has moved toward the mean relative to the
+    full-window MA.  The ``entry_z`` thresholds still decide *when* the pair is
+    a candidate; this class only adds the confirmation.
+
+    ``two_stage_enabled`` is forced off and ``reversion_filter_enabled`` is
+    forced on; contradicting keys are ignored (the factory warns once per run).
+    """
+
+    legacy_combined = False
+    signal_method = "zscore_reversion_ma"
+
+    def __init__(
+        self,
+        *args,
+        two_stage_enabled: bool | None = None,
+        reversion_filter_enabled: bool | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            two_stage_enabled=False,
+            reversion_filter_enabled=True,
+            **kwargs,
+        )
+        self.reversion_ma_lookback_bars = max(5, int(self.reversion_ma_lookback_bars))
+        self.reversion_min_samples = max(5, int(self.reversion_min_samples))

@@ -1,156 +1,823 @@
-﻿data:
+data:
   symbols:
-    1000SHIBUSDT: {exchange: binance, path: data/1000SHIBUSDT/1000SHIBUSDT-1m.csv}
-    AAVEUSDT: {exchange: binance, path: data/AAVEUSDT/AAVEUSDT-1m.csv, funding_path: data/AAVEUSDT/AAVEUSDT-funding_rate_daily.csv}
-    ADAUSDT: {exchange: binance, path: data/ADAUSDT/ADAUSDT-1m.csv}
-    AGLDUSDT: {exchange: binance, path: data/AGLDUSDT/AGLDUSDT-1m.csv}
-    ALGOUSDT: {exchange: binance, path: data/ALGOUSDT/ALGOUSDT-1m.csv}
-    ALICEUSDT: {exchange: binance, path: data/ALICEUSDT/ALICEUSDT-1m.csv}
-    ANTHROPICUSDT: {exchange: binance, path: data/ANTHROPICUSDT/ANTHROPICUSDT-1m.csv, funding_path: data/ANTHROPICUSDT/ANTHROPICUSDT-funding_rate_daily.csv}
-    APEUSDT: {exchange: binance, path: data/APEUSDT/APEUSDT-1m.csv}
-    APTUSDT: {exchange: binance, path: data/APTUSDT/APTUSDT-1m.csv, funding_path: data/APTUSDT/APTUSDT-funding_rate_daily.csv}
-    ARBUSDT: {exchange: binance, path: data/ARBUSDT/ARBUSDT-1m.csv, funding_path: data/ARBUSDT/ARBUSDT-funding_rate_daily.csv}
-    ARUSDT: {exchange: binance, path: data/ARUSDT/ARUSDT-1m.csv, funding_path: data/ARUSDT/ARUSDT-funding_rate_daily.csv}
-    ATOMUSDT: {exchange: binance, path: data/ATOMUSDT/ATOMUSDT-1m.csv, funding_path: data/ATOMUSDT/ATOMUSDT-funding_rate_daily.csv}
-    AVAXUSDT: {exchange: binance, path: data/AVAXUSDT/AVAXUSDT-1m.csv, funding_path: data/AVAXUSDT/AVAXUSDT-funding_rate_daily.csv}
-    BABYUSDT: {exchange: binance, path: data/BABYUSDT/BABYUSDT-1m.csv}
-    BICOUSDT: {exchange: binance, path: data/BICOUSDT/BICOUSDT-1m.csv, funding_path: data/BICOUSDT/BICOUSDT-funding_rate_daily.csv}
-    BLURUSDT: {exchange: binance, path: data/BLURUSDT/BLURUSDT-1m.csv}
-    BNBUSDT: {exchange: binance, path: data/BNBUSDT/BNBUSDT-1m.csv}
-    BTCUSDT: {exchange: binance, path: data/BTCUSDT/BTCUSDT-1m.csv, funding_path: data/BTCUSDT/BTCUSDT-funding_rate_daily.csv}
-    COINUSDT: {exchange: binance, path: data/COINUSDT/COINUSDT-1m.csv}
-    CRVUSDT: {exchange: binance, path: data/CRVUSDT/CRVUSDT-1m.csv}
-    DASHUSDT: {exchange: binance, path: data/DASHUSDT/DASHUSDT-1m.csv}
-    DOTUSDT: {exchange: binance, path: data/DOTUSDT/DOTUSDT-1m.csv, funding_path: data/DOTUSDT/DOTUSDT-funding_rate_daily.csv}
-    DRAMUSDT: {exchange: binance, path: data/DRAMUSDT/DRAMUSDT-1m.csv}
-    DYDXUSDT: {exchange: binance, path: data/DYDXUSDT/DYDXUSDT-1m.csv, funding_path: data/DYDXUSDT/DYDXUSDT-funding_rate_daily.csv}
-    EIGENUSDT: {exchange: binance, path: data/EIGENUSDT/EIGENUSDT-1m.csv}
-    EWJUSDT: {exchange: binance, path: data/EWJUSDT/EWJUSDT-1m.csv, funding_path: data/EWJUSDT/EWJUSDT-funding_rate_daily.csv}
-    EWTUSDT: {exchange: binance, path: data/EWTUSDT/EWTUSDT-1m.csv}
-    EWYUSDT: {exchange: binance, path: data/EWYUSDT/EWYUSDT-1m.csv, funding_path: data/EWYUSDT/EWYUSDT-funding_rate_daily.csv}
-    FETUSDT: {exchange: binance, path: data/FETUSDT/FETUSDT-1m.csv, funding_path: data/FETUSDT/FETUSDT-funding_rate_daily.csv}
-    FILUSDT: {exchange: binance, path: data/FILUSDT/FILUSDT-1m.csv, funding_path: data/FILUSDT/FILUSDT-funding_rate_daily.csv}
-    GALAUSDT: {exchange: binance, path: data/GALAUSDT/GALAUSDT-1m.csv}
-    HBARUSDT: {exchange: binance, path: data/HBARUSDT/HBARUSDT-1m.csv, funding_path: data/HBARUSDT/HBARUSDT-funding_rate_daily.csv}
-    HIGHUSDT: {exchange: binance, path: data/HIGHUSDT/HIGHUSDT-1m.csv}
-    HMSTRUSDT: {exchange: binance, path: data/HMSTRUSDT/HMSTRUSDT-1m.csv}
-    ICPUSDT: {exchange: binance, path: data/ICPUSDT/ICPUSDT-1m.csv}
-    JTOUSDT: {exchange: binance, path: data/JTOUSDT/JTOUSDT-1m.csv}
-    KORUUSDT: {exchange: binance, path: data/KORUUSDT/KORUUSDT-1m.csv}
-    LDOUSDT: {exchange: binance, path: data/LDOUSDT/LDOUSDT-1m.csv}
-    LTCUSDT: {exchange: binance, path: data/LTCUSDT/LTCUSDT-1m.csv}
-    MSTRUSDT: {exchange: binance, path: data/MSTRUSDT/MSTRUSDT-1m.csv, funding_path: data/MSTRUSDT/MSTRUSDT-funding_rate_daily.csv}
-    NFPUSDT: {exchange: binance, path: data/NFPUSDT/NFPUSDT-1m.csv}
-    OPENAIUSDT: {exchange: binance, path: data/OPENAIUSDT/OPENAIUSDT-1m.csv, funding_path: data/OPENAIUSDT/OPENAIUSDT-funding_rate_daily.csv}
-    OPUSDT: {exchange: binance, path: data/OPUSDT/OPUSDT-1m.csv, funding_path: data/OPUSDT/OPUSDT-funding_rate_daily.csv}
-    ORDIUSDT: {exchange: binance, path: data/ORDIUSDT/ORDIUSDT-1m.csv}
-    PHAUSDT: {exchange: binance, path: data/PHAUSDT/PHAUSDT-1m.csv}
-    POLUSDT: {exchange: binance, path: data/POLUSDT/POLUSDT-1m.csv}
-    PORTALUSDT: {exchange: binance, path: data/PORTALUSDT/PORTALUSDT-1m.csv}
-    PYTHUSDT: {exchange: binance, path: data/PYTHUSDT/PYTHUSDT-1m.csv, funding_path: data/PYTHUSDT/PYTHUSDT-funding_rate_daily.csv}
-    RENDERUSDT: {exchange: binance, path: data/RENDERUSDT/RENDERUSDT-1m.csv, funding_path: data/RENDERUSDT/RENDERUSDT-funding_rate_daily.csv}
-    SAMSUNGUSDT: {exchange: binance, path: data/SAMSUNGUSDT/SAMSUNGUSDT-1m.csv, funding_path: data/SAMSUNGUSDT/SAMSUNGUSDT-funding_rate_daily.csv}
-    SANDUSDT: {exchange: binance, path: data/SANDUSDT/SANDUSDT-1m.csv}
-    SEIUSDT: {exchange: binance, path: data/SEIUSDT/SEIUSDT-1m.csv, funding_path: data/SEIUSDT/SEIUSDT-funding_rate_daily.csv}
-    SKHYNIXUSDT: {exchange: binance, path: data/SKHYNIXUSDT/SKHYNIXUSDT-1m.csv, funding_path: data/SKHYNIXUSDT/SKHYNIXUSDT-funding_rate_daily.csv}
-    SOLUSDT: {exchange: binance, path: data/SOLUSDT/SOLUSDT-1m.csv, funding_path: data/SOLUSDT/SOLUSDT-funding_rate_daily.csv}
-    SOXLUSDT: {exchange: binance, path: data/SOXLUSDT/SOXLUSDT-1m.csv}
-    STRKUSDT: {exchange: binance, path: data/STRKUSDT/STRKUSDT-1m.csv}
-    SUIUSDT: {exchange: binance, path: data/SUIUSDT/SUIUSDT-1m.csv}
-    TNSRUSDT: {exchange: binance, path: data/TNSRUSDT/TNSRUSDT-1m.csv, funding_path: data/TNSRUSDT/TNSRUSDT-funding_rate_daily.csv}
-    UNIUSDT: {exchange: binance, path: data/UNIUSDT/UNIUSDT-1m.csv, funding_path: data/UNIUSDT/UNIUSDT-funding_rate_daily.csv}
-    WLDUSDT: {exchange: binance, path: data/WLDUSDT/WLDUSDT-1m.csv}
-    XAGUSDT: {exchange: binance, path: data/XAGUSDT/XAGUSDT-1m.csv, funding_path: data/XAGUSDT/XAGUSDT-funding_rate_daily.csv}
-    XAUTUSDT: {exchange: binance, path: data/XAUTUSDT/XAUTUSDT-1m.csv}
-    XAUUSDT: {exchange: binance, path: data/XAUUSDT/XAUUSDT-1m.csv, funding_path: data/XAUUSDT/XAUUSDT-funding_rate_daily.csv}
-    XLMUSDT: {exchange: binance, path: data/XLMUSDT/XLMUSDT-1m.csv}
-    XPTUSDT: {exchange: binance, path: data/XPTUSDT/XPTUSDT-1m.csv}
-    XRPUSDT: {exchange: binance, path: data/XRPUSDT/XRPUSDT-1m.csv, funding_path: data/XRPUSDT/XRPUSDT-funding_rate_daily.csv}
-    ZECUSDT: {exchange: binance, path: data/ZECUSDT/ZECUSDT-1m.csv}
+    1000SHIBUSDT:
+      exchange: binance
+      path: data/1000SHIBUSDT/1000SHIBUSDT-1m.csv
+      funding_path: data/1000SHIBUSDT/1000SHIBUSDT-funding_rate_daily.csv
+    AAOIUSDT:
+      exchange: binance
+      path: data/AAOIUSDT/AAOIUSDT-1m.csv
+      funding_path: data/AAOIUSDT/AAOIUSDT-funding_rate_daily.csv
+    AAVEUSDT:
+      exchange: binance
+      path: data/AAVEUSDT/AAVEUSDT-1m.csv
+      funding_path: data/AAVEUSDT/AAVEUSDT-funding_rate_daily.csv
+    ADAUSDT:
+      exchange: binance
+      path: data/ADAUSDT/ADAUSDT-1m.csv
+      funding_path: data/ADAUSDT/ADAUSDT-funding_rate_daily.csv
+    AGLDUSDT:
+      exchange: binance
+      path: data/AGLDUSDT/AGLDUSDT-1m.csv
+      funding_path: data/AGLDUSDT/AGLDUSDT-funding_rate_daily.csv
+    ALGOUSDT:
+      exchange: binance
+      path: data/ALGOUSDT/ALGOUSDT-1m.csv
+      funding_path: data/ALGOUSDT/ALGOUSDT-funding_rate_daily.csv
+    ALICEUSDT:
+      exchange: binance
+      path: data/ALICEUSDT/ALICEUSDT-1m.csv
+      funding_path: data/ALICEUSDT/ALICEUSDT-funding_rate_daily.csv
+    AMATUSDT:
+      exchange: binance
+      path: data/AMATUSDT/AMATUSDT-1m.csv
+      funding_path: data/AMATUSDT/AMATUSDT-funding_rate_daily.csv
+    AMDUSDT:
+      exchange: binance
+      path: data/AMDUSDT/AMDUSDT-1m.csv
+      funding_path: data/AMDUSDT/AMDUSDT-funding_rate_daily.csv
+    ANTHROPICUSDT:
+      exchange: binance
+      path: data/ANTHROPICUSDT/ANTHROPICUSDT-1m.csv
+      funding_path: data/ANTHROPICUSDT/ANTHROPICUSDT-funding_rate_daily.csv
+    APEUSDT:
+      exchange: binance
+      path: data/APEUSDT/APEUSDT-1m.csv
+      funding_path: data/APEUSDT/APEUSDT-funding_rate_daily.csv
+    APTUSDT:
+      exchange: binance
+      path: data/APTUSDT/APTUSDT-1m.csv
+      funding_path: data/APTUSDT/APTUSDT-funding_rate_daily.csv
+    ARBUSDT:
+      exchange: binance
+      path: data/ARBUSDT/ARBUSDT-1m.csv
+      funding_path: data/ARBUSDT/ARBUSDT-funding_rate_daily.csv
+    ARMUSDT:
+      exchange: binance
+      path: data/ARMUSDT/ARMUSDT-1m.csv
+      funding_path: data/ARMUSDT/ARMUSDT-funding_rate_daily.csv
+    ARUSDT:
+      exchange: binance
+      path: data/ARUSDT/ARUSDT-1m.csv
+      funding_path: data/ARUSDT/ARUSDT-funding_rate_daily.csv
+    ATOMUSDT:
+      exchange: binance
+      path: data/ATOMUSDT/ATOMUSDT-1m.csv
+      funding_path: data/ATOMUSDT/ATOMUSDT-funding_rate_daily.csv
+    AVAXUSDT:
+      exchange: binance
+      path: data/AVAXUSDT/AVAXUSDT-1m.csv
+      funding_path: data/AVAXUSDT/AVAXUSDT-funding_rate_daily.csv
+    AVGOUSDT:
+      exchange: binance
+      path: data/AVGOUSDT/AVGOUSDT-1m.csv
+      funding_path: data/AVGOUSDT/AVGOUSDT-funding_rate_daily.csv
+    BABYUSDT:
+      exchange: binance
+      path: data/BABYUSDT/BABYUSDT-1m.csv
+      funding_path: data/BABYUSDT/BABYUSDT-funding_rate_daily.csv
+    BEUSDT:
+      exchange: binance
+      path: data/BEUSDT/BEUSDT-1m.csv
+      funding_path: data/BEUSDT/BEUSDT-funding_rate_daily.csv
+    BICOUSDT:
+      exchange: binance
+      path: data/BICOUSDT/BICOUSDT-1m.csv
+      funding_path: data/BICOUSDT/BICOUSDT-funding_rate_daily.csv
+    BLURUSDT:
+      exchange: binance
+      path: data/BLURUSDT/BLURUSDT-1m.csv
+      funding_path: data/BLURUSDT/BLURUSDT-funding_rate_daily.csv
+    BNBUSDT:
+      exchange: binance
+      path: data/BNBUSDT/BNBUSDT-1m.csv
+      funding_path: data/BNBUSDT/BNBUSDT-funding_rate_daily.csv
+    BTCUSDT:
+      exchange: binance
+      path: data/BTCUSDT/BTCUSDT-1m.csv
+      funding_path: data/BTCUSDT/BTCUSDT-funding_rate_daily.csv
+    COHRUSDT:
+      exchange: binance
+      path: data/COHRUSDT/COHRUSDT-1m.csv
+      funding_path: data/COHRUSDT/COHRUSDT-funding_rate_daily.csv
+    COINUSDT:
+      exchange: binance
+      path: data/COINUSDT/COINUSDT-1m.csv
+      funding_path: data/COINUSDT/COINUSDT-funding_rate_daily.csv
+    CRCLUSDT:
+      exchange: binance
+      path: data/CRCLUSDT/CRCLUSDT-1m.csv
+      funding_path: data/CRCLUSDT/CRCLUSDT-funding_rate_daily.csv
+    CRVUSDT:
+      exchange: binance
+      path: data/CRVUSDT/CRVUSDT-1m.csv
+      funding_path: data/CRVUSDT/CRVUSDT-funding_rate_daily.csv
+    CRWVUSDT:
+      exchange: binance
+      path: data/CRWVUSDT/CRWVUSDT-1m.csv
+      funding_path: data/CRWVUSDT/CRWVUSDT-funding_rate_daily.csv
+    DASHUSDT:
+      exchange: binance
+      path: data/DASHUSDT/DASHUSDT-1m.csv
+      funding_path: data/DASHUSDT/DASHUSDT-funding_rate_daily.csv
+    DOTUSDT:
+      exchange: binance
+      path: data/DOTUSDT/DOTUSDT-1m.csv
+      funding_path: data/DOTUSDT/DOTUSDT-funding_rate_daily.csv
+    DRAMUSDT:
+      exchange: binance
+      path: data/DRAMUSDT/DRAMUSDT-1m.csv
+      funding_path: data/DRAMUSDT/DRAMUSDT-funding_rate_daily.csv
+    DYDXUSDT:
+      exchange: binance
+      path: data/DYDXUSDT/DYDXUSDT-1m.csv
+      funding_path: data/DYDXUSDT/DYDXUSDT-funding_rate_daily.csv
+    EIGENUSDT:
+      exchange: binance
+      path: data/EIGENUSDT/EIGENUSDT-1m.csv
+      funding_path: data/EIGENUSDT/EIGENUSDT-funding_rate_daily.csv
+    EWJUSDT:
+      exchange: binance
+      path: data/EWJUSDT/EWJUSDT-1m.csv
+      funding_path: data/EWJUSDT/EWJUSDT-funding_rate_daily.csv
+    EWTUSDT:
+      exchange: binance
+      path: data/EWTUSDT/EWTUSDT-1m.csv
+      funding_path: data/EWTUSDT/EWTUSDT-funding_rate_daily.csv
+    EWYUSDT:
+      exchange: binance
+      path: data/EWYUSDT/EWYUSDT-1m.csv
+      funding_path: data/EWYUSDT/EWYUSDT-funding_rate_daily.csv
+    FETUSDT:
+      exchange: binance
+      path: data/FETUSDT/FETUSDT-1m.csv
+      funding_path: data/FETUSDT/FETUSDT-funding_rate_daily.csv
+    FILUSDT:
+      exchange: binance
+      path: data/FILUSDT/FILUSDT-1m.csv
+      funding_path: data/FILUSDT/FILUSDT-funding_rate_daily.csv
+    GALAUSDT:
+      exchange: binance
+      path: data/GALAUSDT/GALAUSDT-1m.csv
+      funding_path: data/GALAUSDT/GALAUSDT-funding_rate_daily.csv
+    GLWUSDT:
+      exchange: binance
+      path: data/GLWUSDT/GLWUSDT-1m.csv
+      funding_path: data/GLWUSDT/GLWUSDT-funding_rate_daily.csv
+    HBARUSDT:
+      exchange: binance
+      path: data/HBARUSDT/HBARUSDT-1m.csv
+      funding_path: data/HBARUSDT/HBARUSDT-funding_rate_daily.csv
+    HIGHUSDT:
+      exchange: binance
+      path: data/HIGHUSDT/HIGHUSDT-1m.csv
+      funding_path: data/HIGHUSDT/HIGHUSDT-funding_rate_daily.csv
+    HMSTRUSDT:
+      exchange: binance
+      path: data/HMSTRUSDT/HMSTRUSDT-1m.csv
+      funding_path: data/HMSTRUSDT/HMSTRUSDT-funding_rate_daily.csv
+    ICPUSDT:
+      exchange: binance
+      path: data/ICPUSDT/ICPUSDT-1m.csv
+      funding_path: data/ICPUSDT/ICPUSDT-funding_rate_daily.csv
+    INTCUSDT:
+      exchange: binance
+      path: data/INTCUSDT/INTCUSDT-1m.csv
+      funding_path: data/INTCUSDT/INTCUSDT-funding_rate_daily.csv
+    IRENUSDT:
+      exchange: binance
+      path: data/IRENUSDT/IRENUSDT-1m.csv
+      funding_path: data/IRENUSDT/IRENUSDT-funding_rate_daily.csv
+    JTOUSDT:
+      exchange: binance
+      path: data/JTOUSDT/JTOUSDT-1m.csv
+      funding_path: data/JTOUSDT/JTOUSDT-funding_rate_daily.csv
+    KORUUSDT:
+      exchange: binance
+      path: data/KORUUSDT/KORUUSDT-1m.csv
+      funding_path: data/KORUUSDT/KORUUSDT-funding_rate_daily.csv
+    LDOUSDT:
+      exchange: binance
+      path: data/LDOUSDT/LDOUSDT-1m.csv
+      funding_path: data/LDOUSDT/LDOUSDT-funding_rate_daily.csv
+    LITEUSDT:
+      exchange: binance
+      path: data/LITEUSDT/LITEUSDT-1m.csv
+      funding_path: data/LITEUSDT/LITEUSDT-funding_rate_daily.csv
+    LTCUSDT:
+      exchange: binance
+      path: data/LTCUSDT/LTCUSDT-1m.csv
+      funding_path: data/LTCUSDT/LTCUSDT-funding_rate_daily.csv
+    MRVLUSDT:
+      exchange: binance
+      path: data/MRVLUSDT/MRVLUSDT-1m.csv
+      funding_path: data/MRVLUSDT/MRVLUSDT-funding_rate_daily.csv
+    MSTRUSDT:
+      exchange: binance
+      path: data/MSTRUSDT/MSTRUSDT-1m.csv
+      funding_path: data/MSTRUSDT/MSTRUSDT-funding_rate_daily.csv
+    MUUSDT:
+      exchange: binance
+      path: data/MUUSDT/MUUSDT-1m.csv
+      funding_path: data/MUUSDT/MUUSDT-funding_rate_daily.csv
+    NBISUSDT:
+      exchange: binance
+      path: data/NBISUSDT/NBISUSDT-1m.csv
+      funding_path: data/NBISUSDT/NBISUSDT-funding_rate_daily.csv
+    NFPUSDT:
+      exchange: binance
+      path: data/NFPUSDT/NFPUSDT-1m.csv
+      funding_path: data/NFPUSDT/NFPUSDT-funding_rate_daily.csv
+    NOKUSDT:
+      exchange: binance
+      path: data/NOKUSDT/NOKUSDT-1m.csv
+      funding_path: data/NOKUSDT/NOKUSDT-funding_rate_daily.csv
+    NVDAUSDT:
+      exchange: binance
+      path: data/NVDAUSDT/NVDAUSDT-1m.csv
+      funding_path: data/NVDAUSDT/NVDAUSDT-funding_rate_daily.csv
+    OPENAIUSDT:
+      exchange: binance
+      path: data/OPENAIUSDT/OPENAIUSDT-1m.csv
+      funding_path: data/OPENAIUSDT/OPENAIUSDT-funding_rate_daily.csv
+    OPUSDT:
+      exchange: binance
+      path: data/OPUSDT/OPUSDT-1m.csv
+      funding_path: data/OPUSDT/OPUSDT-funding_rate_daily.csv
+    ORCLUSDT:
+      exchange: binance
+      path: data/ORCLUSDT/ORCLUSDT-1m.csv
+      funding_path: data/ORCLUSDT/ORCLUSDT-funding_rate_daily.csv
+    ORDIUSDT:
+      exchange: binance
+      path: data/ORDIUSDT/ORDIUSDT-1m.csv
+      funding_path: data/ORDIUSDT/ORDIUSDT-funding_rate_daily.csv
+    PHAUSDT:
+      exchange: binance
+      path: data/PHAUSDT/PHAUSDT-1m.csv
+      funding_path: data/PHAUSDT/PHAUSDT-funding_rate_daily.csv
+    PLTRUSDT:
+      exchange: binance
+      path: data/PLTRUSDT/PLTRUSDT-1m.csv
+      funding_path: data/PLTRUSDT/PLTRUSDT-funding_rate_daily.csv
+    POLUSDT:
+      exchange: binance
+      path: data/POLUSDT/POLUSDT-1m.csv
+      funding_path: data/POLUSDT/POLUSDT-funding_rate_daily.csv
+    PORTALUSDT:
+      exchange: binance
+      path: data/PORTALUSDT/PORTALUSDT-1m.csv
+      funding_path: data/PORTALUSDT/PORTALUSDT-funding_rate_daily.csv
+    PYTHUSDT:
+      exchange: binance
+      path: data/PYTHUSDT/PYTHUSDT-1m.csv
+      funding_path: data/PYTHUSDT/PYTHUSDT-funding_rate_daily.csv
+    QCOMUSDT:
+      exchange: binance
+      path: data/QCOMUSDT/QCOMUSDT-1m.csv
+      funding_path: data/QCOMUSDT/QCOMUSDT-funding_rate_daily.csv
+    RENDERUSDT:
+      exchange: binance
+      path: data/RENDERUSDT/RENDERUSDT-1m.csv
+      funding_path: data/RENDERUSDT/RENDERUSDT-funding_rate_daily.csv
+    RKLBUSDT:
+      exchange: binance
+      path: data/RKLBUSDT/RKLBUSDT-1m.csv
+      funding_path: data/RKLBUSDT/RKLBUSDT-funding_rate_daily.csv
+    SAMSUNGUSDT:
+      exchange: binance
+      path: data/SAMSUNGUSDT/SAMSUNGUSDT-1m.csv
+      funding_path: data/SAMSUNGUSDT/SAMSUNGUSDT-funding_rate_daily.csv
+    SANDUSDT:
+      exchange: binance
+      path: data/SANDUSDT/SANDUSDT-1m.csv
+      funding_path: data/SANDUSDT/SANDUSDT-funding_rate_daily.csv
+    SEIUSDT:
+      exchange: binance
+      path: data/SEIUSDT/SEIUSDT-1m.csv
+      funding_path: data/SEIUSDT/SEIUSDT-funding_rate_daily.csv
+    SKHYNIXUSDT:
+      exchange: binance
+      path: data/SKHYNIXUSDT/SKHYNIXUSDT-1m.csv
+      funding_path: data/SKHYNIXUSDT/SKHYNIXUSDT-funding_rate_daily.csv
+    SNDKUSDT:
+      exchange: binance
+      path: data/SNDKUSDT/SNDKUSDT-1m.csv
+      funding_path: data/SNDKUSDT/SNDKUSDT-funding_rate_daily.csv
+    SOLUSDT:
+      exchange: binance
+      path: data/SOLUSDT/SOLUSDT-1m.csv
+      funding_path: data/SOLUSDT/SOLUSDT-funding_rate_daily.csv
+    SOXLUSDT:
+      exchange: binance
+      path: data/SOXLUSDT/SOXLUSDT-1m.csv
+      funding_path: data/SOXLUSDT/SOXLUSDT-funding_rate_daily.csv
+    STRKUSDT:
+      exchange: binance
+      path: data/STRKUSDT/STRKUSDT-1m.csv
+      funding_path: data/STRKUSDT/STRKUSDT-funding_rate_daily.csv
+    SUIUSDT:
+      exchange: binance
+      path: data/SUIUSDT/SUIUSDT-1m.csv
+      funding_path: data/SUIUSDT/SUIUSDT-funding_rate_daily.csv
+    TNSRUSDT:
+      exchange: binance
+      path: data/TNSRUSDT/TNSRUSDT-1m.csv
+      funding_path: data/TNSRUSDT/TNSRUSDT-funding_rate_daily.csv
+    TSLAUSDT:
+      exchange: binance
+      path: data/TSLAUSDT/TSLAUSDT-1m.csv
+      funding_path: data/TSLAUSDT/TSLAUSDT-funding_rate_daily.csv
+    TSMUSDT:
+      exchange: binance
+      path: data/TSMUSDT/TSMUSDT-1m.csv
+      funding_path: data/TSMUSDT/TSMUSDT-funding_rate_daily.csv
+    UNIUSDT:
+      exchange: binance
+      path: data/UNIUSDT/UNIUSDT-1m.csv
+      funding_path: data/UNIUSDT/UNIUSDT-funding_rate_daily.csv
+    WLDUSDT:
+      exchange: binance
+      path: data/WLDUSDT/WLDUSDT-1m.csv
+      funding_path: data/WLDUSDT/WLDUSDT-funding_rate_daily.csv
+    XAGUSDT:
+      exchange: binance
+      path: data/XAGUSDT/XAGUSDT-1m.csv
+      funding_path: data/XAGUSDT/XAGUSDT-funding_rate_daily.csv
+    XAUTUSDT:
+      exchange: binance
+      path: data/XAUTUSDT/XAUTUSDT-1m.csv
+      funding_path: data/XAUTUSDT/XAUTUSDT-funding_rate_daily.csv
+    XAUUSDT:
+      exchange: binance
+      path: data/XAUUSDT/XAUUSDT-1m.csv
+      funding_path: data/XAUUSDT/XAUUSDT-funding_rate_daily.csv
+    XLMUSDT:
+      exchange: binance
+      path: data/XLMUSDT/XLMUSDT-1m.csv
+      funding_path: data/XLMUSDT/XLMUSDT-funding_rate_daily.csv
+    XPTUSDT:
+      exchange: binance
+      path: data/XPTUSDT/XPTUSDT-1m.csv
+      funding_path: data/XPTUSDT/XPTUSDT-funding_rate_daily.csv
+    XRPUSDT:
+      exchange: binance
+      path: data/XRPUSDT/XRPUSDT-1m.csv
+      funding_path: data/XRPUSDT/XRPUSDT-funding_rate_daily.csv
+    ZECUSDT:
+      exchange: binance
+      path: data/ZECUSDT/ZECUSDT-1m.csv
+      funding_path: data/ZECUSDT/ZECUSDT-funding_rate_daily.csv
   benchmarks: {}
 backtest:
-  initial_cash: 100000
-  start_time: "2025-01-01"
+  initial_cash: 3000000
+  start_time: '2024-01-01'
+  end_time: '2025-06-30 23:59:00'
 active_setup: multi_pair_beta
 setups:
   multi_pair_beta:
     strategy: multi_pair
     pairs:
-      # Crypto pairs (10)
-      - {pair_id: "arb_op", x_symbol: ARBUSDT, y_symbol: OPUSDT}
-      - {pair_id: "atom_dot", x_symbol: ATOMUSDT, y_symbol: DOTUSDT}
-      - {pair_id: "avax_sol", x_symbol: AVAXUSDT, y_symbol: SOLUSDT}
-      - {pair_id: "apt_sei", x_symbol: APTUSDT, y_symbol: SEIUSDT}
-      - {pair_id: "fet_rndr", x_symbol: FETUSDT, y_symbol: RENDERUSDT}
-      - {pair_id: "ar_fil", x_symbol: ARUSDT, y_symbol: FILUSDT}
-      - {pair_id: "bico_dydx", x_symbol: BICOUSDT, y_symbol: DYDXUSDT}
-      - {pair_id: "pyth_tnsr", x_symbol: PYTHUSDT, y_symbol: TNSRUSDT}
-      - {pair_id: "aave_uni", x_symbol: AAVEUSDT, y_symbol: UNIUSDT}
-      - {pair_id: "hbar_xrp", x_symbol: HBARUSDT, y_symbol: XRPUSDT}
-      # TradFi pairs (5)
-      - {pair_id: "btc_mstr", x_symbol: BTCUSDT, y_symbol: MSTRUSDT, tags: ["tradfi"]}
-      - {pair_id: "samsung_sk", x_symbol: SAMSUNGUSDT, y_symbol: SKHYNIXUSDT, tags: ["tradfi"]}
-      - {pair_id: "xau_xag", x_symbol: XAUUSDT, y_symbol: XAGUSDT, tags: ["tradfi"]}
-      - {pair_id: "ewj_ewy", x_symbol: EWJUSDT, y_symbol: EWYUSDT, tags: ["tradfi"]}
-      - {pair_id: "anthropic_openai", x_symbol: ANTHROPICUSDT, y_symbol: OPENAIUSDT, tags: ["tradfi"]}
+    - pair_id: arb_op
+      target_capital: 150000
+      x_symbol: ARBUSDT
+      y_symbol: OPUSDT
+    - pair_id: atom_dot
+      target_capital: 150000
+      x_symbol: ATOMUSDT
+      y_symbol: DOTUSDT
+    - pair_id: 1000shib_pol
+      target_capital: 150000
+      x_symbol: 1000SHIBUSDT
+      y_symbol: POLUSDT
+    - pair_id: avax_dot
+      target_capital: 150000
+      x_symbol: AVAXUSDT
+      y_symbol: DOTUSDT
+    - pair_id: bico_dydx
+      target_capital: 150000
+      x_symbol: BICOUSDT
+      y_symbol: DYDXUSDT
+    - pair_id: op_strk
+      target_capital: 150000
+      x_symbol: OPUSDT
+      y_symbol: STRKUSDT
+    - pair_id: fet_pha
+      target_capital: 73457.80975
+      x_symbol: FETUSDT
+      y_symbol: PHAUSDT
+    - pair_id: fet_render
+      target_capital: 150000
+      x_symbol: FETUSDT
+      y_symbol: RENDERUSDT
+    - pair_id: bico_pyth
+      target_capital: 150000
+      x_symbol: BICOUSDT
+      y_symbol: PYTHUSDT
+    - pair_id: bico_eigen
+      target_capital: 150000
+      x_symbol: BICOUSDT
+      y_symbol: EIGENUSDT
+    - pair_id: fil_pha
+      target_capital: 73457.80975
+      x_symbol: FILUSDT
+      y_symbol: PHAUSDT
+    - pair_id: blur_gala
+      target_capital: 87386.56622
+      x_symbol: BLURUSDT
+      y_symbol: GALAUSDT
+    - pair_id: atom_avax
+      target_capital: 150000
+      x_symbol: ATOMUSDT
+      y_symbol: AVAXUSDT
+    - pair_id: ordi_portal
+      target_capital: 150000
+      x_symbol: ORDIUSDT
+      y_symbol: PORTALUSDT
+    - pair_id: agld_gala
+      target_capital: 72425.95319
+      x_symbol: AGLDUSDT
+      y_symbol: GALAUSDT
+    - pair_id: dot_sei
+      target_capital: 150000
+      x_symbol: DOTUSDT
+      y_symbol: SEIUSDT
+    - pair_id: agld_blur
+      target_capital: 72425.95319
+      x_symbol: AGLDUSDT
+      y_symbol: BLURUSDT
+    - pair_id: fil_render
+      target_capital: 150000
+      x_symbol: FILUSDT
+      y_symbol: RENDERUSDT
+    - pair_id: pyth_tnsr
+      target_capital: 98047.90946
+      x_symbol: PYTHUSDT
+      y_symbol: TNSRUSDT
+    - pair_id: arb_strk
+      target_capital: 150000
+      x_symbol: ARBUSDT
+      y_symbol: STRKUSDT
+    - pair_id: atom_sei
+      target_capital: 150000
+      x_symbol: ATOMUSDT
+      y_symbol: SEIUSDT
+    - pair_id: fil_wld
+      target_capital: 300000
+      x_symbol: FILUSDT
+      y_symbol: WLDUSDT
+    - pair_id: dydx_ldo
+      target_capital: 150000
+      x_symbol: DYDXUSDT
+      y_symbol: LDOUSDT
+    - pair_id: avax_sol
+      target_capital: 300000
+      x_symbol: AVAXUSDT
+      y_symbol: SOLUSDT
+    - pair_id: eigen_jto
+      target_capital: 150000
+      x_symbol: EIGENUSDT
+      y_symbol: JTOUSDT
+    - pair_id: aave_crv
+      target_capital: 150000
+      x_symbol: AAVEUSDT
+      y_symbol: CRVUSDT
+    - pair_id: eigen_tnsr
+      target_capital: 98047.90946
+      x_symbol: EIGENUSDT
+      y_symbol: TNSRUSDT
+    - pair_id: sol_sui
+      target_capital: 150000
+      x_symbol: SOLUSDT
+      y_symbol: SUIUSDT
+    - pair_id: dash_zec
+      target_capital: 150000
+      x_symbol: DASHUSDT
+      y_symbol: ZECUSDT
+    - pair_id: anthropic_openai
+      target_capital: 600000
+      x_symbol: ANTHROPICUSDT
+      y_symbol: OPENAIUSDT
+      tags:
+      - tradfi
+    - pair_id: samsung_skhynix
+      target_capital: 600000
+      x_symbol: SAMSUNGUSDT
+      y_symbol: SKHYNIXUSDT
+      tags:
+      - tradfi
+    - pair_id: xau_xag
+      target_capital: 600000
+      x_symbol: XAUUSDT
+      y_symbol: XAGUSDT
+      tags:
+      - tradfi
+    - pair_id: xaut_xau
+      target_capital: 600000
+      x_symbol: XAUTUSDT
+      y_symbol: XAUUSDT
+      tags:
+      - tradfi
+    - pair_id: btc_mstr
+      target_capital: 600000
+      x_symbol: BTCUSDT
+      y_symbol: MSTRUSDT
+      tags:
+      - tradfi
+    - pair_id: xag_xpt
+      target_capital: 213058.6222
+      x_symbol: XAGUSDT
+      y_symbol: XPTUSDT
+      tags:
+      - tradfi
+    - pair_id: dram_koru
+      target_capital: 600000
+      x_symbol: DRAMUSDT
+      y_symbol: KORUUSDT
+      tags:
+      - tradfi
+    - pair_id: koru_soxl
+      target_capital: 600000
+      x_symbol: KORUUSDT
+      y_symbol: SOXLUSDT
+      tags:
+      - tradfi
+    - pair_id: xau_xpt
+      target_capital: 213058.6222
+      x_symbol: XAUUSDT
+      y_symbol: XPTUSDT
+      tags:
+      - tradfi
+    - pair_id: btc_coin
+      target_capital: 600000
+      x_symbol: BTCUSDT
+      y_symbol: COINUSDT
+      tags:
+      - tradfi
+    - pair_id: ewj_ewy
+      target_capital: 61017.8538
+      x_symbol: EWJUSDT
+      y_symbol: EWYUSDT
+      tags:
+      - tradfi
+    - pair_id: bnb_coin
+      target_capital: 600000
+      x_symbol: BNBUSDT
+      y_symbol: COINUSDT
+      tags:
+      - tradfi
+    - pair_id: dram_ewt
+      target_capital: 21638.59442
+      x_symbol: DRAMUSDT
+      y_symbol: EWTUSDT
+      tags:
+      - tradfi
+    - pair_id: ewt_soxl
+      target_capital: 21638.59442
+      x_symbol: EWTUSDT
+      y_symbol: SOXLUSDT
+      tags:
+      - tradfi
+    - pair_id: sndk_mu
+      target_capital: 600000
+      x_symbol: SNDKUSDT
+      y_symbol: MUUSDT
+      tags:
+      - tradfi
+    - pair_id: nvda_tsla
+      target_capital: 600000
+      x_symbol: NVDAUSDT
+      y_symbol: TSLAUSDT
+      tags:
+      - tradfi
+    - pair_id: glw_arm
+      target_capital: 293389.9802
+      x_symbol: GLWUSDT
+      y_symbol: ARMUSDT
+      tags:
+      - tradfi
+    - pair_id: crcl_coin
+      target_capital: 600000
+      x_symbol: CRCLUSDT
+      y_symbol: COINUSDT
+      tags:
+      - tradfi
+    - pair_id: orcl_tsm
+      target_capital: 600000
+      x_symbol: ORCLUSDT
+      y_symbol: TSMUSDT
+      tags:
+      - tradfi
+    - pair_id: qcom_crwv
+      target_capital: 411868.7602
+      x_symbol: QCOMUSDT
+      y_symbol: CRWVUSDT
+      tags:
+      - tradfi
+    - pair_id: amd_nbis
+      target_capital: 600000
+      x_symbol: AMDUSDT
+      y_symbol: NBISUSDT
+      tags:
+      - tradfi
+    - pair_id: pltr_avgo
+      target_capital: 560302.6055
+      x_symbol: PLTRUSDT
+      y_symbol: AVGOUSDT
+      tags:
+      - tradfi
+    - pair_id: intc_amd
+      target_capital: 600000
+      x_symbol: INTCUSDT
+      y_symbol: AMDUSDT
+      tags:
+      - tradfi
+    - pair_id: nok_qcom
+      target_capital: 405585.9989
+      x_symbol: NOKUSDT
+      y_symbol: QCOMUSDT
+      tags:
+      - tradfi
+    - pair_id: be_amat
+      target_capital: 413048.2646
+      x_symbol: BEUSDT
+      y_symbol: AMATUSDT
+      tags:
+      - tradfi
+    - pair_id: amat_crwv
+      target_capital: 411868.7602
+      x_symbol: AMATUSDT
+      y_symbol: CRWVUSDT
+      tags:
+      - tradfi
+    - pair_id: lite_be
+      target_capital: 413048.2646
+      x_symbol: LITEUSDT
+      y_symbol: BEUSDT
+      tags:
+      - tradfi
+    - pair_id: mrvl_aaoi
+      target_capital: 600000
+      x_symbol: MRVLUSDT
+      y_symbol: AAOIUSDT
+      tags:
+      - tradfi
+    - pair_id: orcl_avgo
+      target_capital: 600000
+      x_symbol: ORCLUSDT
+      y_symbol: AVGOUSDT
+      tags:
+      - tradfi
+    - pair_id: lite_arm
+      target_capital: 293389.9802
+      x_symbol: LITEUSDT
+      y_symbol: ARMUSDT
+      tags:
+      - tradfi
+    - pair_id: nbis_glw
+      target_capital: 383639.9068
+      x_symbol: NBISUSDT
+      y_symbol: GLWUSDT
+      tags:
+      - tradfi
+    - pair_id: iren_cohr
+      target_capital: 155297.8991
+      x_symbol: IRENUSDT
+      y_symbol: COHRUSDT
+      tags:
+      - tradfi
+    - pair_id: amd_arm
+      target_capital: 293389.9802
+      x_symbol: AMDUSDT
+      y_symbol: ARMUSDT
+      tags:
+      - tradfi
+    - pair_id: crwv_cohr
+      target_capital: 402727.9242
+      x_symbol: CRWVUSDT
+      y_symbol: COHRUSDT
+      tags:
+      - tradfi
+    - pair_id: nbis_aaoi
+      target_capital: 600000
+      x_symbol: NBISUSDT
+      y_symbol: AAOIUSDT
+      tags:
+      - tradfi
+    - pair_id: nbis_arm
+      target_capital: 293389.9802
+      x_symbol: NBISUSDT
+      y_symbol: ARMUSDT
+      tags:
+      - tradfi
+    - pair_id: nok_crwv
+      target_capital: 405585.9989
+      x_symbol: NOKUSDT
+      y_symbol: CRWVUSDT
+      tags:
+      - tradfi
+    - pair_id: amat_cohr
+      target_capital: 402727.9242
+      x_symbol: AMATUSDT
+      y_symbol: COHRUSDT
+      tags:
+      - tradfi
+    - pair_id: mrvl_nbis
+      target_capital: 600000
+      x_symbol: MRVLUSDT
+      y_symbol: NBISUSDT
+      tags:
+      - tradfi
+    - pair_id: arm_cohr
+      target_capital: 293389.9802
+      x_symbol: ARMUSDT
+      y_symbol: COHRUSDT
+      tags:
+      - tradfi
+    - pair_id: rklb_nok
+      target_capital: 405585.9989
+      x_symbol: RKLBUSDT
+      y_symbol: NOKUSDT
+      tags:
+      - tradfi
+    - pair_id: rklb_crwv
+      target_capital: 411868.7602
+      x_symbol: RKLBUSDT
+      y_symbol: CRWVUSDT
+      tags:
+      - tradfi
+    - pair_id: rklb_qcom
+      target_capital: 454505.1593
+      x_symbol: RKLBUSDT
+      y_symbol: QCOMUSDT
+      tags:
+      - tradfi
+    - pair_id: rklb_be
+      target_capital: 413048.2646
+      x_symbol: RKLBUSDT
+      y_symbol: BEUSDT
+      tags:
+      - tradfi
     pipeline:
       estimator:
-        method: rolling_ols
-        regression_method: log_price  # log_price | log_return
-        return_interval_bars: 1  # Return fit, residual, ADF, and live Z-score horizon; 60 means 60m
-        model_lookback_bars: 28800  # fit window and initial warmup length
-        model_update_interval_bars: 1440
+        method: tls
+        regression_method: log_price
+        model_lookback_bars: 2880
+        model_update_interval_bars: 240
         position_update_policy: freeze
-        residual_adf_max_pvalue: 0.4
+        residual_adf_max_pvalue: 1.0
         residual_adf_maxlag: 1
         residual_adf_regression: c
-        dols_lead_lag_order: 1
-        ewls_half_life_bars: 1440
-        huber_delta: 1.345
-        huber_iterations: 5
-        age_wls_profile: medium
-        age_bucket_end_bars: [720, 4320, 11520, 28800]  # 20D: 12H / 3D / 8D / 20D
-        age_bucket_weights:  # null uses age_wls_profile; provide a list for a custom scheme
-        winsor_lower_quantile: 0.005
-        winsor_upper_quantile: 0.995
-        winsor_quantile_method: linear
-        residual_wls_profile: medium
-        short_model_lookback_bars: 10080
-        shock_score_boundaries: [1.5, 2.0, 3.0]
-        shock_weights:  # null uses residual_wls_profile; provide a list for custom weights
       signal:
-        method: zscore_reversion
-        entry_z: 1.75
+        method: zscore_reversion_ma
+        entry_z: 3.0
         exit_z: 0.5
-        position_exit_zscore_method: standard  # standard | sum_zscore | cumulative_return
         entry_rule_method: fixed_z
-        two_stage_enabled: true
-        two_stage_trigger_z: 2.0
-        two_stage_entry_z: 1.75
-        two_stage_entry_window_z:
-        two_stage_max_wait_bars: 0
-        reversion_filter_enabled: true
-        reversion_ma_lookback_bars: 60
-        reversion_min_samples: 60
+        reversion_ma_lookback_bars: 120
+        reversion_ma_short_lookback_bars: 30
+        reversion_min_samples: 120
       sizing:
         method: beta_neutral
         hedge_beta_lookback_bars: 1440
         hedge_beta_min_samples: 1440
       portfolio:
-        method: equal_weight
-        allocation_mode: equal_cap
+        method: pair_target_capital
+        allocation_mode: target_capital
         min_signal_score: 0.0
-        max_open_pairs: 10
+        minimum_entry_capital_ratio: 0.5
         max_entries_per_pair: 1
         add_cooldown_bars: 720
         min_hold_bars: 0
       execution:
-        pending_timeout_bars: 0
+        pending_timeout_bars: 1440
         order_type: market
+      rebalance:
+        enabled: true
+        minimum_entry_capital_ratio: 0.5
+        closed_pair_freeze_model_lookback_multiplier: 0.5
+        eviction_min_holding_bars: 60
+        profitable_position_replacement:
+          enabled: true
+          min_theoretical_zero_return_x_move: 0.20
+          max_adf_pvalue: 0.4
+      protection:
+        enabled: true
+        stop_loss_enabled: true
+        stop_loss_freeze_bars: 0
+        pair_loss_stop_enabled: true
+        pair_loss_stop_return: 0.05
+        pair_loss_stop_freeze_bars: 0
+        pair_loss_stop_freeze_model_lookback_multiplier: 1.0
+        take_profit_enabled: true
+        take_profit_return: 0.03
+        max_holding_time_enabled: true
+        max_holding_time_model_lookback_multiplier: 2.0
+        max_holding_time_freeze_bars: 0
+        wait_for_model_update_after_non_z_exit: true
 cost:
   fee_rate: 0.0005
   slippage_bps: 1
-  funding_enabled: false
+  funding_enabled: true
 risk:
   enabled: false
   mode: pass_through
@@ -158,3 +825,5 @@ risk:
   diagnostic_sample_interval_bars: 60
   order_hedge_ratio_tolerance: 0.02
   position_hedge_ratio_tolerance: 0.05
+report:
+  run_name: tls_log_price_L2D_U4H_MA_PTC_rebalance_v1

@@ -20,7 +20,20 @@ class OrderPlanner:
                           x_exchange: str = "binance", y_exchange: str = "binance",
                           hedge_ratio: float = 1.0,
                           action: str = "open",
-                          position_id: str | None = None) -> list[Order]:
+                          position_id: str | None = None,
+                          exit_reason: str | None = None,
+                          protection_trigger: str | None = None,
+                          exit_class: str | None = None,
+                          reopen_lock_pending: bool | None = None,
+                          protection_max_holding_bars: int | None = None,
+                          protection_max_holding_deadline_bar: int | None = None,
+                          protection_pair_loss_stop_return: float | None = None,
+                          protection_pair_loss_stop_freeze_bars: int | None = None,
+                          protection_pair_loss_stop_freeze_until_bar: int | None = None,
+                          protection_rule: str | None = None,
+                          protection_freeze_bars: int | None = None,
+                          protection_freeze_until_bar: int | None = None,
+                          rebalance_batch_id: str | None = None) -> list[Order]:
         if not allocated.selected and action != "close":
             return []
 
@@ -35,6 +48,16 @@ class OrderPlanner:
             order_position_id = str(uuid4())[:8]
         orders = []
         reverse = (action == "close")
+        raw_para = getattr(allocated, "para", {}) or {}
+        portfolio_para = raw_para.get("portfolio", {}) if isinstance(raw_para, dict) else {}
+        order_para = {}
+        if isinstance(raw_para, dict) and isinstance(raw_para.get("portfolio"), dict):
+            rebalance_batch_id = rebalance_batch_id or raw_para["portfolio"].get("rebalance_batch_id")
+        if isinstance(raw_para, dict) and raw_para.get("protection"):
+            # Keep only the small frozen-model snapshot needed after the
+            # signal has become a filled order; do not retain full diagnostic
+            # payloads on every Order/Trade object.
+            order_para["protection"] = dict(raw_para["protection"])
 
         # long_x / short_spread: buy X, sell Y. short_x / long_spread: sell X, buy Y.
         if side in ("long_x", "short_spread"):
@@ -58,6 +81,17 @@ class OrderPlanner:
                 order_type=self.order_type, quantity=abs(allocated.final_x_quantity),
                 price=px, position_id=order_position_id,
                 target_hedge_ratio=target_hedge_ratio, pair_id=allocated.pair_id,
+                exit_reason=exit_reason, protection_trigger=protection_trigger,
+                exit_class=exit_class, reopen_lock_pending=reopen_lock_pending,
+                protection_max_holding_bars=protection_max_holding_bars,
+                protection_max_holding_deadline_bar=protection_max_holding_deadline_bar,
+                protection_pair_loss_stop_return=protection_pair_loss_stop_return,
+                protection_pair_loss_stop_freeze_bars=protection_pair_loss_stop_freeze_bars,
+                protection_pair_loss_stop_freeze_until_bar=protection_pair_loss_stop_freeze_until_bar,
+                protection_rule=protection_rule,
+                protection_freeze_bars=protection_freeze_bars,
+                protection_freeze_until_bar=protection_freeze_until_bar,
+                para=order_para, rebalance_batch_id=rebalance_batch_id,
             ))
 
         if allocated.final_y_quantity > 0:
@@ -72,6 +106,17 @@ class OrderPlanner:
                 order_type=self.order_type, quantity=abs(allocated.final_y_quantity),
                 price=py, position_id=order_position_id,
                 target_hedge_ratio=target_hedge_ratio, pair_id=allocated.pair_id,
+                exit_reason=exit_reason, protection_trigger=protection_trigger,
+                exit_class=exit_class, reopen_lock_pending=reopen_lock_pending,
+                protection_max_holding_bars=protection_max_holding_bars,
+                protection_max_holding_deadline_bar=protection_max_holding_deadline_bar,
+                protection_pair_loss_stop_return=protection_pair_loss_stop_return,
+                protection_pair_loss_stop_freeze_bars=protection_pair_loss_stop_freeze_bars,
+                protection_pair_loss_stop_freeze_until_bar=protection_pair_loss_stop_freeze_until_bar,
+                protection_rule=protection_rule,
+                protection_freeze_bars=protection_freeze_bars,
+                protection_freeze_until_bar=protection_freeze_until_bar,
+                para=order_para, rebalance_batch_id=rebalance_batch_id,
             ))
 
         return orders

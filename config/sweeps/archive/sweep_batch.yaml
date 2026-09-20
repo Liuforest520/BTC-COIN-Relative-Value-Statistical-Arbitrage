@@ -42,8 +42,6 @@ experiments:
     params:
       <<: *common_params
       setups.multi_pair_beta.pipeline.estimator.method: [tls]
-      setups.multi_pair_beta.pipeline.estimator.regression_method: [log_return]
-      setups.multi_pair_beta.pipeline.estimator.return_interval_bars: [1]
       setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [7200, 14400, 28800, 43200, 86400]
       setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
   - name: tls_3d_update
@@ -51,8 +49,6 @@ experiments:
     params:
       <<: *common_params
       setups.multi_pair_beta.pipeline.estimator.method: [tls]
-      setups.multi_pair_beta.pipeline.estimator.regression_method: [log_return]
-      setups.multi_pair_beta.pipeline.estimator.return_interval_bars: [1]
       setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
       setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
 
@@ -146,8 +142,6 @@ experiments:
     params:
       <<: *common_params
       setups.multi_pair_beta.pipeline.estimator.method: [huber]
-      setups.multi_pair_beta.pipeline.estimator.regression_method: [log_return]
-      setups.multi_pair_beta.pipeline.estimator.return_interval_bars: [1]
       setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [7200, 14400, 28800, 43200, 86400]
       setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [1440]
       setups.multi_pair_beta.pipeline.estimator.huber_delta: [1.96]
@@ -157,8 +151,6 @@ experiments:
     params:
       <<: *common_params
       setups.multi_pair_beta.pipeline.estimator.method: [huber]
-      setups.multi_pair_beta.pipeline.estimator.regression_method: [log_return]
-      setups.multi_pair_beta.pipeline.estimator.return_interval_bars: [1]
       setups.multi_pair_beta.pipeline.estimator.model_lookback_bars: [28800, 43200, 86400]
       setups.multi_pair_beta.pipeline.estimator.model_update_interval_bars: [4320]
       setups.multi_pair_beta.pipeline.estimator.huber_delta: [1.96]

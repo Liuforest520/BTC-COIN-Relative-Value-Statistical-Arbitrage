@@ -3,7 +3,7 @@ Recursive Least Squares estimator with exponential forgetting.
 """
 from __future__ import annotations
 
-from math import isfinite, log
+from math import log
 
 import numpy as np
 
@@ -32,6 +32,8 @@ class RLSEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.lam = rls_forgetting_factor  # 0 < lambda <= 1
         self.model_lookback_bars = max(10, int(model_lookback_bars))
 
@@ -133,4 +135,6 @@ class RLSEstimator:
     def _transform(self, x, y):
         if self.regression_method == "log_price":
             return log(max(x, 1e-12)), log(max(y, 1e-12))
+        if self.regression_method != "price":
+            raise ValueError(f"unsupported regression_method: {self.regression_method}")
         return float(x), float(y)

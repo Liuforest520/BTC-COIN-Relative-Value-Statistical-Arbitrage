@@ -1,351 +1,133 @@
-"""
-Portfolio allocation strategies.
-
-v1 keeps portfolio logic simple: cap pair/symbol usage from max_open_pairs.
-"""
+"""Portfolio allocation strategies."""
 from __future__ import annotations
 
 from copy import deepcopy
-
+from math import isfinite
 from core.modules.models.pipeline_types import (
-    AllocatedPairTarget,
-    PortfolioAllocation,
-    PortfolioState,
-    RawPairTarget,
-    register_portfolio,
+    AllocatedPairTarget, PortfolioAllocation, PortfolioState, RawPairTarget,
+    register_portfolio, PORTFOLIO_REGISTRY,
 )
 
 
-@register_portfolio("equal_weight")
-class EqualWeightAllocator:
-    """Cap each pair and each symbol at equity / max_open_pairs."""
+@register_portfolio("pair_target_capital")
+class PairTargetCapitalAllocator:
+    """Allocate each Pair's configured gross target from free account margin.
 
-    def __init__(
-        self,
-        max_open_pairs: int = 10,
-        allocation_mode: str = "equal_cap",
-        min_signal_score: float = 0.0,
-        max_gross_exposure_ratio: float = 2.0,
-        max_net_exposure_ratio: float = 0.2,
-        max_symbol_exposure_ratio: float = 0.5,
-        target_net_beta: float = 0.0,
-        min_pair_weight: float = 0.01,
-        equity: float = 100000.0,
-        total_pair_count: int | None = None,
-        **kwargs,
-    ):
-        self.max_open_pairs = max_open_pairs
-        self.allocation_mode = str(allocation_mode or "equal_cap")
-        self.min_signal_score = max(float(min_signal_score), 0.0)
-        self.max_gross_exposure_ratio = max_gross_exposure_ratio
-        self.max_net_exposure_ratio = max_net_exposure_ratio
-        self.max_symbol_exposure_ratio = max_symbol_exposure_ratio
-        self.target_net_beta = target_net_beta
-        self.min_pair_weight = min_pair_weight
-        self.equity = equity
-        self.total_pair_count = total_pair_count
+    There is deliberately no concurrent-Pair count and no per-symbol cap here.
+    Both legs consume gross margin; the exchange performs the final common
+    proportional scale at executable prices.
+    """
+    def __init__(self, equity=100000.0, minimum_entry_capital_ratio=0.5,
+                 allocation_mode="target_capital", min_signal_score=0.0,
+                 min_pair_weight=0.0, **_kwargs):
+        self.equity = float(equity)
+        self.minimum_entry_capital_ratio = float(minimum_entry_capital_ratio)
+        if not isfinite(self.minimum_entry_capital_ratio) or not 0.0 < self.minimum_entry_capital_ratio <= 1.0:
+            raise ValueError("minimum_entry_capital_ratio must be in (0, 1]")
+        self.allocation_mode = str(allocation_mode or "target_capital")
+        self.min_signal_score = max(0.0, float(min_signal_score or 0.0))
+        self.min_pair_weight = max(0.0, float(min_pair_weight or 0.0))
 
-    def allocate(
-        self,
-        state: PortfolioState,
-        targets: dict[str, RawPairTarget],
-        bar_index: int,
-    ) -> PortfolioAllocation:
-        """Apply per-pair and per-symbol gross caps."""
-        ready = {k: v for k, v in targets.items() if v.ready}
+    def allocate(self, state: PortfolioState, targets: dict[str, RawPairTarget], bar_index: int):
+        ready = [(pid, raw) for pid, raw in targets.items()
+                 if raw.ready and _target_score(raw) >= self.min_signal_score]
         if not ready:
-            return PortfolioAllocation(
-                bar_index=bar_index,
-                reason="no ready pairs",
-            )
-
-        cap_count = max(1, int(self.max_open_pairs or 1))
-        max_pair_gross = float(self.equity) / cap_count
-        max_symbol_notional = float(self.equity) / cap_count
-        pair_targets: dict[str, AllocatedPairTarget] = {}
-        existing_symbol_exposure = getattr(state, "symbol_exposure_map", {}) or {}
-        symbol_exposure: dict[str, float] = {
-            str(k): _float_or_default(v, 0.0)
-            for k, v in existing_symbol_exposure.items()
-            if k != "_gross"
-        }
-
-        scored_ready = self._rank_ready_targets(ready)
-        selected_pool = scored_ready[:self.max_open_pairs]
-        score_sum = sum(score for _pair_id, _raw, score in selected_pool)
-        gross_budget = self._gross_budget(max_pair_gross, selected_pool)
-
-        selected_ids = []
-        for pair_id, raw, score in selected_pool:
-            portfolio_para = raw.para.get("portfolio", {}) if isinstance(raw.para, dict) else {}
-            remaining_pair_gross = _float_or_default(
-                portfolio_para.get("remaining_pair_gross"),
-                max_pair_gross,
-            )
-            entry_gross_cap = _float_or_default(
-                portfolio_para.get("entry_gross_cap"),
-                max_pair_gross,
-            )
-            pair_cap = max(0.0, min(max_pair_gross, remaining_pair_gross, entry_gross_cap))
-            alloc_cap = self._candidate_gross_cap(pair_cap, gross_budget, score, score_sum)
-            if alloc_cap <= 0:
-                continue
-            alloc_cap = _cap_by_symbol_limit(raw, alloc_cap, symbol_exposure, max_symbol_notional)
-            if alloc_cap <= 0:
-                continue
-
-            pair_targets[pair_id] = _allocated_from_gross(
-                pair_id,
-                raw,
-                alloc_cap,
-                self.equity,
-                (
-                    f"{self.allocation_mode} score={score:.4f} "
-                    f"max_pair_gross={max_pair_gross:.2f} "
-                    f"entry_cap={entry_gross_cap:.2f} remaining={remaining_pair_gross:.2f} "
-                    f"gross={alloc_cap:.2f}"
-                ),
-            )
-            _add_symbol_exposure(raw, pair_targets[pair_id], symbol_exposure)
-            selected_ids.append(pair_id)
-
-        symbol_exposure["_gross"] = sum(
-            at.final_x_notional + at.final_y_notional for at in pair_targets.values()
-        )
-
-        return PortfolioAllocation(
-            bar_index=bar_index,
-            selected_pair_ids=selected_ids,
-            pair_targets=pair_targets,
-            symbol_exposure_map=symbol_exposure,
-            portfolio_gross_exposure=sum(
-                at.final_x_notional + at.final_y_notional for at in pair_targets.values()
-            ),
-            portfolio_net_exposure=_portfolio_net_exposure(pair_targets),
-            reason=(
-                f"pair_symbol_cap selected={len(selected_ids)}/{len(ready)} "
-                f"cap=1/{cap_count} mode={self.allocation_mode}"
-            ),
-        )
-
-    def _rank_ready_targets(self, ready: dict[str, RawPairTarget]) -> list[tuple[str, RawPairTarget, float]]:
-        scored = []
-        for pair_id, raw in ready.items():
-            score = _target_score(raw)
-            if score < self.min_signal_score:
-                continue
-            scored.append((pair_id, raw, score))
-
+            return PortfolioAllocation(bar_index=bar_index, reason="no ready pairs")
         if self.allocation_mode == "score_weighted":
-            return sorted(scored, key=lambda item: (-item[2], item[0]))
-        return scored
+            ready.sort(key=lambda item: (-_target_score(item[1]), item[0]))
 
-    def _gross_budget(self, max_pair_gross: float, selected_pool: list[tuple[str, RawPairTarget, float]]) -> float:
-        if self.allocation_mode != "score_weighted":
-            return 0.0
-        return max_pair_gross * len(selected_pool)
-
-    def _candidate_gross_cap(
-        self,
-        pair_cap: float,
-        gross_budget: float,
-        score: float,
-        score_sum: float,
-    ) -> float:
-        if self.allocation_mode != "score_weighted":
-            return pair_cap
-        if score_sum <= 1e-12:
-            return pair_cap
-        weighted = gross_budget * score / score_sum
-        return max(0.0, min(pair_cap, weighted))
-
-
-@register_portfolio("risk_parity")
-class RiskParityAllocator(EqualWeightAllocator):
-    """Risk parity: each selected pair contributes equal risk.
-
-    Weight ∝ 1/vol where vol is estimated from pair spread returns.
-    """
-
-    def __init__(self, covariance_lookback_bars: int = 1440, **kwargs):
-        super().__init__(**kwargs)
-        self.cov_lookback = covariance_lookback_bars
-
-    def allocate(self, state: PortfolioState, targets: dict[str, RawPairTarget],
-                 bar_index: int) -> PortfolioAllocation:
-        ready = {k: v for k, v in targets.items() if v.ready}
-        if not ready:
-            return PortfolioAllocation(bar_index=bar_index, reason="no ready pairs")
-
-        # Weight by 1/vol using signal strength as inverse volatility proxy
-        inv_vols = {}
-        for pid, t in ready.items():
-            inv_vols[pid] = max(t.signal_strength, 0.1)
-
-        total_inv = sum(inv_vols.values())
-        if total_inv <= 0:
-            return PortfolioAllocation(bar_index=bar_index, reason="zero vol")
-
-        selected = sorted(ready.items(), key=lambda x: -inv_vols[x[0]])[:self.max_open_pairs]
-        pair_targets = {}
-        for pid, raw in selected:
-            w = inv_vols[pid] / total_inv
-            if w < self.min_pair_weight:
+        # Zero available balance is a real account state, not a reason to
+        # create buying power from equity.  Fall back only for legacy state
+        # objects that do not expose available_balance at all.
+        if hasattr(state, "available_balance"):
+            available_before = float(getattr(state, "available_balance") or 0.0)
+        else:
+            available_before = float(getattr(state, "equity", 0.0) or 0.0)
+        # A direct allocator fixture may omit account context entirely.  The
+        # live strategy always supplies a ready PortfolioState with the
+        # exchange-reported balance, so this fallback cannot create live cash.
+        if (available_before <= 0 and not getattr(state, "ready", False)
+                and float(getattr(state, "equity", 0.0) or 0.0) <= 0):
+            available_before = self.equity
+        available = max(0.0, available_before)
+        pair_targets, selected, skipped = {}, [], []
+        for pair_id, raw in ready:
+            target = _raw_target_capital(raw)
+            if target <= 0:
+                target = max(0.0, float(raw.gross_notional or raw.x_notional + raw.y_notional))
+            minimum = target * self.minimum_entry_capital_ratio
+            if target <= 0 or available < minimum - 1e-9:
+                skipped.append(pair_id)
                 continue
-            pair_targets[pid] = _allocated_from_gross(
-                pid,
-                raw,
-                float(self.equity) * float(self.max_gross_exposure_ratio) * w,
-                self.equity,
-                f"risk_parity inv_vol={inv_vols[pid]:.3f} w={w:.4f}",
+            gross = min(target, available)
+            if gross < minimum - 1e-9:
+                skipped.append(pair_id)
+                continue
+            pair_targets[pair_id] = _allocated_from_gross(
+                pair_id, raw, gross, self.equity,
+                f"pair_target_capital target={target:.2f} allocated={gross:.2f}",
             )
-
+            selected.append(pair_id)
+            available -= gross
+            if available <= 1e-9:
+                break
         return PortfolioAllocation(
-            bar_index=bar_index,
-            selected_pair_ids=list(pair_targets.keys()),
+            bar_index=bar_index, selected_pair_ids=selected,
             pair_targets=pair_targets,
-            portfolio_gross_exposure=sum(
-                at.final_x_notional + at.final_y_notional for at in pair_targets.values()
-            ),
+            portfolio_gross_exposure=sum(t.final_x_notional + t.final_y_notional for t in pair_targets.values()),
             portfolio_net_exposure=_portfolio_net_exposure(pair_targets),
-            reason=f"risk_parity selected={len(pair_targets)}/{len(ready)}",
+            reason=f"pair_target_capital selected={len(selected)}/{len(ready)} skipped={len(skipped)}",
+            constraint_report={"available_before": available_before,
+                               "available_after_plan": available,
+                               "skipped_pair_ids": skipped},
         )
 
 
-@register_portfolio("min_variance")
-class MinVarianceAllocator(EqualWeightAllocator):
-    """Minimum-variance portfolio: min w'Σw, ignoring μ.
-
-    Uses identity Σ as fallback (= equal weight).
-    When covariance matrix is available, solves unconstrained:
-        w* = Σ^{-1} 1 / (1' Σ^{-1} 1)
-    """
-
-    def allocate(self, state: PortfolioState, targets: dict[str, RawPairTarget],
-                 bar_index: int) -> PortfolioAllocation:
-        ready = {k: v for k, v in targets.items() if v.ready}
-        if not ready:
-            return PortfolioAllocation(bar_index=bar_index, reason="no ready pairs")
-
-        ranked = sorted(ready.items(), key=lambda x: -x[1].signal_strength)
-        selected = ranked[:self.max_open_pairs]
-        n = len(selected)
-
-        # Identity covariance -> equal weight
-        w = 1.0 / n
-
-        pair_targets = {}
-        for pid, raw in selected:
-            if w < self.min_pair_weight:
-                continue
-            pair_targets[pid] = _allocated_from_gross(
-                pid,
-                raw,
-                float(self.equity) * float(self.max_gross_exposure_ratio) * w,
-                self.equity,
-                f"min_variance w={w:.4f}",
-            )
-
-        return PortfolioAllocation(
-            bar_index=bar_index, selected_pair_ids=list(pair_targets.keys()),
-            pair_targets=pair_targets,
-            portfolio_gross_exposure=sum(
-                at.final_x_notional + at.final_y_notional for at in pair_targets.values()
-            ),
-            portfolio_net_exposure=_portfolio_net_exposure(pair_targets),
-            reason=f"min_variance selected={len(pair_targets)}/{len(ready)}",
-        )
+# Compatibility labels retain import/config compatibility but all resolve to
+# the target-capital allocator; none implements slot/count limits.
+EquitySlotAllocator = PairTargetCapitalAllocator
+EqualWeightAllocator = PairTargetCapitalAllocator
+RiskParityAllocator = PairTargetCapitalAllocator
+MinVarianceAllocator = PairTargetCapitalAllocator
+ConstrainedQPAllocator = PairTargetCapitalAllocator
+MaxSharpeAllocator = PairTargetCapitalAllocator
+for _name in ("equity_slot", "equal_weight", "risk_parity", "min_variance",
+              "constrained_qp", "max_sharpe"):
+    PORTFOLIO_REGISTRY[_name] = PairTargetCapitalAllocator
 
 
-@register_portfolio("constrained_qp")
-class ConstrainedQPAllocator(EqualWeightAllocator):
-    """Constrained QP: min w'Σw + λ * turnover, s.t. sum(w)=1, w>=0, bounds.
-
-    Falls back to equal weight when no solver is available.
-    """
-
-    def __init__(self, turnover_penalty: float = 0.0, risk_aversion: float = 1.0,
-                 **kwargs):
-        super().__init__(**kwargs)
-        self.turnover_penalty = float(turnover_penalty)
-        self.risk_aversion = float(risk_aversion)
-
-    def allocate(self, state: PortfolioState, targets: dict[str, RawPairTarget],
-                 bar_index: int) -> PortfolioAllocation:
-        ready = {k: v for k, v in targets.items() if v.ready}
-        if not ready:
-            return PortfolioAllocation(bar_index=bar_index, reason="no ready pairs")
-
-        ranked = sorted(ready.items(), key=lambda x: -x[1].signal_strength)
-        selected = ranked[:self.max_open_pairs]
-        n = len(selected)
-        w = 1.0 / n
-
-        pair_targets = {}
-        for pid, raw in selected:
-            if w < self.min_pair_weight:
-                continue
-            pair_targets[pid] = _allocated_from_gross(
-                pid,
-                raw,
-                float(self.equity) * float(self.max_gross_exposure_ratio) * w,
-                self.equity,
-                f"constrained_qp w={w:.4f}",
-            )
-
-        return PortfolioAllocation(
-            bar_index=bar_index, selected_pair_ids=list(pair_targets.keys()),
-            pair_targets=pair_targets,
-            portfolio_gross_exposure=sum(
-                at.final_x_notional + at.final_y_notional for at in pair_targets.values()
-            ),
-            portfolio_net_exposure=_portfolio_net_exposure(pair_targets),
-            reason=f"constrained_qp selected={len(pair_targets)}/{len(ready)}",
-        )
-
-
-@register_portfolio("max_sharpe")
-class MaxSharpeAllocator(EqualWeightAllocator):
-    """Maximum Sharpe (tangency) portfolio.
-
-    When returns are available, solves w* ∝ Σ^{-1} μ.
-    With risk_aversion λ, falls back to min_variance.
-    """
-
-    def allocate(self, state: PortfolioState, targets: dict[str, RawPairTarget],
-                 bar_index: int) -> PortfolioAllocation:
-        ready = {k: v for k, v in targets.items() if v.ready}
-        if not ready:
-            return PortfolioAllocation(bar_index=bar_index, reason="no ready pairs")
-
-        ranked = sorted(ready.items(), key=lambda x: -x[1].signal_strength)
-        selected = ranked[:self.max_open_pairs]
-        n = len(selected)
-
-        # Without return estimates, fall back to equal weight
-        w = 1.0 / n
-        pair_targets = {}
-        for pid, raw in selected:
-            if w < self.min_pair_weight:
-                continue
-            pair_targets[pid] = _allocated_from_gross(
-                pid,
-                raw,
-                float(self.equity) * float(self.max_gross_exposure_ratio) * w,
-                self.equity,
-                f"max_sharpe w={w:.4f}",
-            )
-
-        return PortfolioAllocation(
-            bar_index=bar_index, selected_pair_ids=list(pair_targets.keys()),
-            pair_targets=pair_targets,
-            portfolio_gross_exposure=sum(
-                at.final_x_notional + at.final_y_notional for at in pair_targets.values()
-            ),
-            portfolio_net_exposure=_portfolio_net_exposure(pair_targets),
-            reason=f"max_sharpe selected={len(pair_targets)}/{len(ready)}",
-        )
-
+def _raw_target_capital(raw):
+    # For an add-on, gross_notional is the remaining amount for this entry;
+    # do not allocate the Pair's full target a second time.
+    gross = getattr(raw, "gross_notional", None)
+    try:
+        if gross is not None and isfinite(float(gross)) and float(gross) > 0:
+            return max(0.0, float(gross))
+    except (TypeError, ValueError):
+        pass
+    value = getattr(raw, "target_capital", None)
+    if value is not None:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    para = raw.para if isinstance(raw.para, dict) else {}
+    pair = para.get("pair", {}) if isinstance(para.get("pair"), dict) else {}
+    try:
+        pair_target = float(pair.get("target_capital", 0.0) or 0.0)
+        if pair_target > 0:
+            return pair_target
+    except (TypeError, ValueError):
+        pass
+    # Legacy callers may provide only the per-entry cap.  This is a sizing
+    # compatibility fallback, not a concurrent-Pair limit.
+    portfolio = para.get("portfolio", {}) if isinstance(para.get("portfolio"), dict) else {}
+    try:
+        remaining = float(portfolio.get("remaining_pair_gross", 0.0) or 0.0)
+        entry_cap = float(portfolio.get("entry_gross_cap", 0.0) or 0.0)
+        return max(0.0, min(v for v in (remaining, entry_cap) if v > 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 def _portfolio_net_exposure(pair_targets: dict[str, AllocatedPairTarget]) -> float:
     return sum(_signed_net_exposure(target) for target in pair_targets.values())
@@ -409,31 +191,12 @@ def _quantity_from_notional(notional: float, price: float) -> float:
     return notional / price
 
 
-def _cap_by_symbol_limit(
-    raw: RawPairTarget,
-    gross_notional: float,
-    symbol_exposure: dict[str, float],
-    max_symbol_notional: float,
-) -> float:
-    x_symbol = _raw_symbol(raw, "x_symbol")
-    y_symbol = _raw_symbol(raw, "y_symbol")
-    x_weight, y_weight = _weights_from_raw(raw)
-    cap = float(gross_notional)
-
-    if x_symbol and x_weight > 1e-12:
-        remaining = max(0.0, max_symbol_notional - symbol_exposure.get(x_symbol, 0.0))
-        cap = min(cap, remaining / x_weight)
-    if y_symbol and y_weight > 1e-12:
-        remaining = max(0.0, max_symbol_notional - symbol_exposure.get(y_symbol, 0.0))
-        cap = min(cap, remaining / y_weight)
-    return max(0.0, cap)
-
-
 def _add_symbol_exposure(
     raw: RawPairTarget,
     target: AllocatedPairTarget,
     symbol_exposure: dict[str, float],
 ) -> None:
+    """Track per-symbol notional for diagnostics only; never cap it."""
     x_symbol = _raw_symbol(raw, "x_symbol")
     y_symbol = _raw_symbol(raw, "y_symbol")
     if x_symbol:

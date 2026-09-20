@@ -3,4 +3,4 @@
 workers: 4
 sweeps:
   - config/sweeps/archive/sweep_beta_review_best.yaml
-  - config/sweeps/archive/sweep_beta_raw_price.yaml
+  - config/sweeps/archive/sweep_beta_price.yaml

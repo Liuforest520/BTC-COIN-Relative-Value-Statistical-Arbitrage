@@ -1,4 +1,5 @@
 from dataclasses import asdict, is_dataclass
+from enum import Enum
 from math import isfinite, sqrt
 
 import polars as pl
@@ -606,15 +607,72 @@ def _to_frame(data):
     if isinstance(data, pl.DataFrame):
         return data
     if is_dataclass(data):
-        return pl.DataFrame([asdict(data)])
+        return _rows_to_frame([asdict(data)])
     if isinstance(data, list):
         if not data:
             return pl.DataFrame()
         rows = [asdict(item) if is_dataclass(item) else item for item in data]
-        return pl.DataFrame(rows)
+        if rows and all(isinstance(row, dict) for row in rows):
+            return _rows_to_frame(rows)
+        return pl.DataFrame(data)
     if isinstance(data, dict):
         return pl.DataFrame(data)
     return pl.DataFrame(data)
+
+
+def _rows_to_frame(rows: list[dict]) -> pl.DataFrame:
+    """Build metric inputs without inferring sparse exit metadata as Null.
+
+    Most fills have no exit metadata; only protective close fills contain
+    strings such as ``protective_max_holding_time``.  Polars' default
+    ``infer_schema_length=100`` can therefore infer a Null builder from the
+    first rows and fail when it reaches a later close.  Explicit overrides
+    keep the metric path consistent with the report exporter.
+    """
+    normalized = []
+    for row in rows:
+        value = {}
+        for key, item in row.items():
+            if key == "para":
+                continue
+            if isinstance(item, Enum):
+                item = item.value
+            value[key] = item
+        normalized.append(value)
+
+    string_columns = {
+        "order_id", "group_id", "exchange", "symbol", "action", "side",
+        "order_type", "status", "cancel_order_id", "position_id", "pair_id",
+        "exit_reason", "protection_trigger", "exit_class", "protection_stop_reason", "protection_rule",
+        "rebalance_batch_id",
+    }
+    bool_columns = {"reopen_lock_pending"}
+    int_columns = {
+        "ts", "protection_max_holding_bars", "protection_max_holding_deadline_bar",
+        "protection_freeze_bars", "protection_freeze_until_bar",
+        "protection_pair_loss_stop_freeze_bars", "protection_pair_loss_stop_freeze_until_bar",
+        "entry_count", "last_entry_bar_index", "add_cooldown_remaining_bars",
+        "min_hold_remaining_bars",
+    }
+    float_columns = {
+        "quantity", "price", "notional", "fee", "slippage", "requested_quantity",
+        "fill_scale", "funding_fee", "target_hedge_ratio", "protection_stop_x_price",
+        "protection_take_profit_return", "protection_target_residual",
+        "protection_pair_loss_stop_return",
+    }
+    overrides = {}
+    if normalized:
+        columns = {key for row in normalized for key in row}
+        overrides.update({key: pl.Utf8 for key in columns if key in string_columns})
+        overrides.update({key: pl.Boolean for key in columns if key in bool_columns})
+        overrides.update({key: pl.Int64 for key in columns if key in int_columns})
+        overrides.update({key: pl.Float64 for key in columns if key in float_columns})
+    return pl.from_dicts(
+        normalized,
+        schema_overrides=overrides or None,
+        infer_schema_length=100,
+        strict=False,
+    )
 
 
 def _series_mean(frame, column):

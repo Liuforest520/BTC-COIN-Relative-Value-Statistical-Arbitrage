@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 import yaml
+
+from core.modules.reporting.utils import reporting_frame
 
 
 def pair_defs_from_config(config_path: Path) -> list[dict]:
@@ -358,15 +359,7 @@ def _to_frame(data: Any) -> pl.DataFrame:
         return pl.DataFrame()
     if isinstance(data, pl.DataFrame):
         return data
-    rows = []
-    for item in data or []:
-        if is_dataclass(item):
-            rows.append(asdict(item))
-        elif isinstance(item, dict):
-            rows.append(item)
-        else:
-            rows.append(vars(item))
-    return pl.DataFrame(rows, infer_schema_length=None) if rows else pl.DataFrame()
+    return reporting_frame(data)
 
 
 def _normalize_trades(trades: pl.DataFrame) -> pl.DataFrame:

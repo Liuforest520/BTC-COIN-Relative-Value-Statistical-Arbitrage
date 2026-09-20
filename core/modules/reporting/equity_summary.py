@@ -1,71 +1,300 @@
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from argparse import ArgumentParser
+from dataclasses import is_dataclass
+from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
+from types import SimpleNamespace
 import json
 
+import numpy as np
 
-def export_equity_summary_html(result, output_path: Path) -> Path:
+
+MAX_PLOT_POINTS = 8000
+
+
+def export_equity_summary_image(result, output_path: Path) -> Path:
+    """Write the portfolio metrics and equity curve to one static PNG."""
     output_path = Path(output_path)
+    if output_path.suffix.lower() != ".png":
+        raise ValueError("equity summary output must be a .png file")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "title": "Equity Curve",
-        "metrics": _summary_metrics(getattr(result, "metrics", {}) or {}),
-        "equity": _equity_points(getattr(result, "equity_curve", [])),
-    }
-    output_path.write_text(render_equity_summary_html(payload), encoding="utf-8")
+
+    timestamps, equities = _equity_arrays(getattr(result, "equity_curve", []))
+    plot_ts, plot_equity = _downsample_extrema(timestamps, equities, MAX_PLOT_POINTS)
+    metrics = getattr(result, "metrics", {}) or {}
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    figure = plt.figure(figsize=(16, 9), dpi=160, facecolor="#f6f7f9")
+    axis = figure.add_axes((0.07, 0.09, 0.90, 0.62), facecolor="#ffffff")
+    figure.text(
+        0.04,
+        0.955,
+        "Portfolio Summary",
+        fontsize=22,
+        fontweight="bold",
+        color="#17202a",
+        va="top",
+    )
+
+    if len(timestamps):
+        period = (
+            f"{_format_date(timestamps[0])}  -  {_format_date(timestamps[-1])}"
+        )
+        figure.text(0.96, 0.948, period, fontsize=10, color="#667085", ha="right")
+
+    _draw_metric_cards(figure, metrics)
+
+    if len(plot_ts):
+        dates = [
+            datetime.fromtimestamp(float(ts) / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            for ts in plot_ts
+        ]
+        axis.plot(dates, plot_equity, color="#2563eb", linewidth=1.45, label="Equity")
+
+        initial_equity = _safe_float(metrics.get("initial_equity"))
+        if initial_equity is not None:
+            axis.axhline(
+                initial_equity,
+                color="#98a2b3",
+                linewidth=0.9,
+                linestyle=(0, (4, 4)),
+                label="Initial equity",
+            )
+
+        peak = np.maximum.accumulate(equities)
+        drawdowns = np.divide(
+            equities,
+            peak,
+            out=np.ones_like(equities),
+            where=np.abs(peak) > 1e-12,
+        ) - 1.0
+        trough_index = int(np.argmin(drawdowns))
+        trough_date = datetime.fromtimestamp(
+            float(timestamps[trough_index]) / 1000.0,
+            tz=timezone.utc,
+        ).replace(tzinfo=None)
+        axis.scatter(
+            [trough_date],
+            [equities[trough_index]],
+            color="#dc2626",
+            s=28,
+            zorder=4,
+            label=f"Max drawdown {drawdowns[trough_index]:.2%}",
+        )
+
+        axis.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=9))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+        axis.margins(x=0.005)
+    else:
+        axis.text(
+            0.5,
+            0.5,
+            "No equity data",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color="#667085",
+            fontsize=16,
+        )
+
+    axis.set_title("Equity Curve", loc="left", fontsize=14, fontweight="bold", pad=14)
+    axis.set_ylabel("Equity")
+    axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
+    axis.grid(axis="both", color="#e7ebf2", linewidth=0.8)
+    axis.set_axisbelow(True)
+    for spine in axis.spines.values():
+        spine.set_color("#d7dde8")
+    axis.tick_params(colors="#667085", labelsize=9)
+    if len(plot_ts):
+        axis.legend(loc="upper left", frameon=False, ncol=3, fontsize=9)
+
+    temporary_path = output_path.with_name(f".{output_path.stem}.tmp.png")
+    try:
+        figure.savefig(temporary_path, format="png", facecolor=figure.get_facecolor())
+        temporary_path.replace(output_path)
+    finally:
+        plt.close(figure)
+        temporary_path.unlink(missing_ok=True)
+
+    # Stable run names can leave the legacy HTML behind after a report rerun.
+    if output_path.name == "portfolio_summary.png":
+        output_path.with_suffix(".html").unlink(missing_ok=True)
     return output_path
 
 
-def render_equity_summary_html(payload: dict) -> str:
-    data = json.dumps(_json_safe(payload), ensure_ascii=False, separators=(",", ":"))
-    return HTML_TEMPLATE.replace("__PAYLOAD__", data)
+def export_equity_summary_image_from_run_dir(
+    run_dir: Path,
+    output_path: Path | None = None,
+) -> Path:
+    """Regenerate the static portfolio image from an existing backtest."""
+    import polars as pl
+
+    run_dir = Path(run_dir)
+    metrics_path = run_dir / "metrics.json"
+    equity_path = run_dir / "equity_curve.csv"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(f"metrics file not found: {metrics_path}")
+    if not equity_path.is_file():
+        raise FileNotFoundError(f"equity curve not found: {equity_path}")
+
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    equity_curve = pl.read_csv(equity_path, columns=["ts", "equity"])
+    result = SimpleNamespace(metrics=metrics, equity_curve=equity_curve)
+    output = export_equity_summary_image(
+        result,
+        output_path or run_dir / "portfolio_summary.png",
+    )
+    _replace_legacy_summary_reference(run_dir)
+    return output
 
 
-def _equity_points(rows) -> list[dict]:
-    points = []
-    peak = None
-    for row in _rows(rows):
-        ts = _safe_int(row.get("ts"))
-        equity = _safe_float(row.get("equity"))
-        if ts is None or equity is None:
-            continue
-        peak = equity if peak is None else max(peak, equity)
-        points.append({"ts": ts, "equity": equity, "peak": peak})
-    return sorted(points, key=lambda item: item["ts"])
-
-
-def _summary_metrics(metrics: dict) -> list[dict]:
-    items = [
-        ("Final Equity", "final_equity", "money"),
-        ("Total Return", "total_return", "percent"),
-        ("Sharpe", "sharpe", "number"),
-        ("Max Drawdown", "max_drawdown", "percent"),
-        ("Trades", "trade_count", "integer"),
-        ("Win Rate", "win_rate", "percent"),
-        ("Total Fee", "total_fee", "money"),
-        ("Total Slippage", "total_slippage", "money"),
+def _draw_metric_cards(figure, metrics: dict) -> None:
+    cards = [
+        ("Final Equity", metrics.get("final_equity"), "money"),
+        ("Total Return", metrics.get("total_return"), "percent"),
+        ("Sharpe", metrics.get("sharpe"), "number"),
+        ("Max Drawdown", metrics.get("max_drawdown"), "percent"),
+        ("Trades", metrics.get("trade_count"), "integer"),
+        ("Win Rate", metrics.get("win_rate"), "percent"),
+        ("Total Fee", metrics.get("total_fee"), "money"),
+        ("Total Slippage", metrics.get("total_slippage"), "money"),
     ]
-    result = []
-    for label, key, kind in items:
-        value = metrics.get(key)
-        if value is None:
+    left, right = 0.04, 0.96
+    gap = 0.012
+    width = (right - left - 3 * gap) / 4
+    for index, (label, value, kind) in enumerate(cards):
+        row, column = divmod(index, 4)
+        x = left + column * (width + gap)
+        y = 0.875 - row * 0.088
+        figure.text(
+            x,
+            y,
+            f"{label}\n{_format_metric(value, kind)}",
+            fontsize=10,
+            color="#667085",
+            va="top",
+            linespacing=1.7,
+            bbox={
+                "boxstyle": "round,pad=0.65",
+                "facecolor": "#ffffff",
+                "edgecolor": "#d7dde8",
+                "linewidth": 0.8,
+            },
+        )
+
+
+def _equity_arrays(rows) -> tuple[np.ndarray, np.ndarray]:
+    if isinstance(rows, dict):
+        timestamp_values = rows.get("ts", [])
+        equity_values = rows.get("equity", [])
+        if len(timestamp_values) != len(equity_values):
+            return np.array([], dtype=np.int64), np.array([], dtype=float)
+        try:
+            timestamps = np.asarray(timestamp_values, dtype=np.int64)
+            equities = np.asarray(equity_values, dtype=float)
+        except (TypeError, ValueError):
+            return np.array([], dtype=np.int64), np.array([], dtype=float)
+    elif hasattr(rows, "columns") and hasattr(rows, "get_column"):
+        if "ts" not in rows.columns or "equity" not in rows.columns:
+            return np.array([], dtype=np.int64), np.array([], dtype=float)
+        timestamps = np.asarray(rows.get_column("ts").to_numpy(), dtype=np.int64)
+        equities = np.asarray(rows.get_column("equity").to_numpy(), dtype=float)
+    else:
+        timestamp_values = []
+        equity_values = []
+        for row in rows or []:
+            if is_dataclass(row):
+                ts = getattr(row, "ts", None)
+                equity = getattr(row, "equity", None)
+            elif isinstance(row, dict):
+                ts = row.get("ts")
+                equity = row.get("equity")
+            else:
+                ts = getattr(row, "ts", None)
+                equity = getattr(row, "equity", None)
+            safe_ts = _safe_int(ts)
+            safe_equity = _safe_float(equity)
+            if safe_ts is None or safe_equity is None:
+                continue
+            timestamp_values.append(safe_ts)
+            equity_values.append(safe_equity)
+        timestamps = np.asarray(timestamp_values, dtype=np.int64)
+        equities = np.asarray(equity_values, dtype=float)
+
+    valid = np.isfinite(equities)
+    timestamps = timestamps[valid]
+    equities = equities[valid]
+    if len(timestamps) > 1 and np.any(timestamps[1:] < timestamps[:-1]):
+        order = np.argsort(timestamps, kind="stable")
+        timestamps = timestamps[order]
+        equities = equities[order]
+    return timestamps, equities
+
+
+def _downsample_extrema(
+    timestamps: np.ndarray,
+    equities: np.ndarray,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep chronological bucket minima/maxima so drawdowns remain visible."""
+    count = len(timestamps)
+    if count <= max_points or max_points < 4:
+        return timestamps, equities
+
+    bucket_count = max(1, (max_points - 2) // 2)
+    edges = np.linspace(1, count - 1, bucket_count + 1, dtype=np.int64)
+    selected = [0]
+    for start, end in zip(edges[:-1], edges[1:]):
+        if end <= start:
             continue
-        result.append({"label": label, "value": value, "kind": kind})
-    return result
+        values = equities[start:end]
+        minimum = start + int(np.argmin(values))
+        maximum = start + int(np.argmax(values))
+        selected.extend(sorted({minimum, maximum}))
+    selected.append(count - 1)
+    indices = np.asarray(sorted(set(selected)), dtype=np.int64)
+    return timestamps[indices], equities[indices]
 
 
-def _rows(rows) -> list[dict]:
-    result = []
-    for row in rows or []:
-        if is_dataclass(row):
-            result.append(asdict(row))
-        elif isinstance(row, dict):
-            result.append(row)
-        else:
-            result.append(vars(row))
-    return result
+def _format_metric(value, kind: str) -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "-"
+    if kind == "percent":
+        return f"{number:.2%}"
+    if kind == "integer":
+        return f"{int(round(number)):,}"
+    if kind == "money":
+        return f"{number:,.2f}"
+    return f"{number:.3f}"
+
+
+def _format_date(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(
+        float(timestamp_ms) / 1000.0,
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%d")
+
+
+def _replace_legacy_summary_reference(run_dir: Path) -> None:
+    summary_path = Path(run_dir) / "summary.md"
+    if not summary_path.is_file():
+        return
+    content = summary_path.read_text(encoding="utf-8")
+    updated = content.replace(
+        "- `portfolio_summary.html`: 总资金曲线交互网页",
+        "- `portfolio_summary.png`: 总资金曲线与核心指标图片",
+    )
+    if updated != content:
+        summary_path.write_text(updated, encoding="utf-8")
 
 
 def _safe_float(value):
@@ -83,440 +312,14 @@ def _safe_int(value):
         return None
 
 
-def _json_safe(value):
-    if is_dataclass(value):
-        return _json_safe(asdict(value))
-    if isinstance(value, dict):
-        return {key: _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, float):
-        return value if isfinite(value) else None
-    if hasattr(value, "value"):
-        return value.value
-    return value
+def main() -> None:
+    parser = ArgumentParser(description="Generate a portfolio summary PNG from a backtest result")
+    parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    output = export_equity_summary_image_from_run_dir(args.run_dir, args.output)
+    print(output)
 
 
-HTML_TEMPLATE = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Equity Curve</title>
-  <style>
-    :root {
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --ink: #17202a;
-      --muted: #667085;
-      --line: #d7dde8;
-      --grid: #e7ebf2;
-      --blue: #2563eb;
-      --red: #dc2626;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: Inter, "Segoe UI", Arial, sans-serif;
-    }
-    .wrap {
-      width: min(1320px, calc(100vw - 32px));
-      margin: 20px auto 28px;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: flex-end;
-      margin-bottom: 12px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 24px;
-      font-weight: 720;
-      letter-spacing: 0;
-    }
-    .hint {
-      color: var(--muted);
-      font-size: 13px;
-      white-space: nowrap;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .metric {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px 12px;
-    }
-    .metric span {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      margin-bottom: 4px;
-    }
-    .metric b {
-      font-size: 17px;
-      font-weight: 700;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-    }
-    .toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 8px;
-    }
-    .cursor {
-      color: var(--muted);
-      font-size: 13px;
-    }
-    button {
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      border-radius: 6px;
-      padding: 6px 10px;
-      cursor: pointer;
-    }
-    button:hover { border-color: #9aa7bb; }
-    canvas {
-      width: 100%;
-      height: 560px;
-      display: block;
-      cursor: grab;
-    }
-    canvas:active { cursor: grabbing; }
-    @media (max-width: 760px) {
-      .wrap { width: calc(100vw - 20px); margin-top: 12px; }
-      header { display: block; }
-      .hint { margin-top: 4px; white-space: normal; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      canvas { height: 420px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <header>
-      <h1>Equity Curve</h1>
-      <div class="hint">滚轮缩放，拖动平移，双击重置</div>
-    </header>
-    <section class="metrics" id="metrics"></section>
-    <section class="panel">
-      <div class="toolbar">
-        <div class="cursor" id="cursorInfo">-</div>
-        <button id="resetBtn">Reset</button>
-      </div>
-      <canvas id="chart"></canvas>
-    </section>
-  </div>
-  <script>
-    const payload = __PAYLOAD__;
-    const equity = payload.equity || [];
-    const MAX_RENDER_POINTS = 4000;
-    let fullStart = equity.length ? equity[0].ts : 0;
-    let fullEnd = equity.length ? equity[equity.length - 1].ts : 1;
-    if (fullEnd <= fullStart) fullEnd = fullStart + 1;
-    let viewStart = fullStart;
-    let viewEnd = fullEnd;
-    let dragging = false;
-    let dragX = 0;
-    let dragStart = viewStart;
-    let dragEnd = viewEnd;
-    let hoverTs = null;
-
-    const canvas = document.getElementById("chart");
-    const cursorInfo = document.getElementById("cursorInfo");
-
-    function init() {
-      renderMetrics();
-      canvas.addEventListener("wheel", onWheel, { passive: false });
-      canvas.addEventListener("mousedown", onMouseDown);
-      canvas.addEventListener("mousemove", onMouseMove);
-      canvas.addEventListener("mouseleave", () => { hoverTs = null; draw(); });
-      canvas.addEventListener("dblclick", resetView);
-      window.addEventListener("mouseup", () => { dragging = false; });
-      window.addEventListener("resize", draw);
-      document.getElementById("resetBtn").addEventListener("click", resetView);
-      draw();
-    }
-
-    function renderMetrics() {
-      const root = document.getElementById("metrics");
-      root.innerHTML = "";
-      for (const item of payload.metrics || []) {
-        const div = document.createElement("div");
-        div.className = "metric";
-        div.innerHTML = `<span>${item.label}</span><b>${formatValue(item.value, item.kind)}</b>`;
-        root.appendChild(div);
-      }
-    }
-
-    function draw() {
-      const dpr = window.devicePixelRatio || 1;
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
-      const ctx = canvas.getContext("2d");
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, rect.width, rect.height);
-      const area = { x: 62, y: 18, w: rect.width - 112, h: rect.height - 58 };
-      drawFrame(ctx, area);
-      const data = visible();
-      if (data.length < 2) {
-        cursorInfo.textContent = "No equity data";
-        return;
-      }
-      const scale = yScale(data, 0.08);
-      drawYGrid(ctx, area, scale, formatMoney);
-      drawXGrid(ctx, area);
-      drawLine(ctx, area, data, d => d.equity, scale, "#2563eb", false);
-      drawHover(ctx, area, scale);
-    }
-
-    function visible() {
-      const startIdx = lowerBound(viewStart);
-      const endIdx = upperBound(viewEnd);
-      const count = Math.max(0, endIdx - startIdx);
-      if (count <= 0) return [];
-      if (count <= MAX_RENDER_POINTS) {
-        return equity.slice(startIdx, endIdx);
-      }
-      const step = Math.ceil(count / MAX_RENDER_POINTS);
-      const result = [];
-      for (let i = startIdx; i < endIdx; i += step) {
-        result.push(equity[i]);
-      }
-      const tail = equity[endIdx - 1];
-      if (tail && result[result.length - 1]?.ts !== tail.ts) {
-        result.push(tail);
-      }
-      return result;
-    }
-
-    function drawFrame(ctx, area) {
-      ctx.strokeStyle = "#d7dde8";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(area.x, area.y, area.w, area.h);
-    }
-
-    function drawYGrid(ctx, area, scale, formatter) {
-      ctx.save();
-      ctx.strokeStyle = "#e7ebf2";
-      ctx.fillStyle = "#667085";
-      ctx.font = "12px Inter, Segoe UI, Arial";
-      for (let i = 0; i <= 5; i++) {
-        const value = scale.min + (scale.max - scale.min) * i / 5;
-        const y = yPos(value, area, scale);
-        ctx.beginPath();
-        ctx.moveTo(area.x, y);
-        ctx.lineTo(area.x + area.w, y);
-        ctx.stroke();
-        ctx.fillText(formatter(value), 8, y + 4);
-      }
-      ctx.restore();
-    }
-
-    function drawXGrid(ctx, area) {
-      ctx.save();
-      ctx.strokeStyle = "#eef1f6";
-      ctx.fillStyle = "#667085";
-      ctx.font = "12px Inter, Segoe UI, Arial";
-      for (let i = 0; i <= 6; i++) {
-        const ts = viewStart + (viewEnd - viewStart) * i / 6;
-        const x = xPos(ts, area);
-        ctx.beginPath();
-        ctx.moveTo(x, area.y);
-        ctx.lineTo(x, area.y + area.h);
-        ctx.stroke();
-        ctx.fillText(formatDate(ts), Math.min(x - 34, area.x + area.w - 72), area.y + area.h + 26);
-      }
-      ctx.restore();
-    }
-
-    function drawLine(ctx, area, data, valueAccessor, scale, color, dashed) {
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = dashed ? 1.2 : 2;
-      if (dashed) ctx.setLineDash([5, 4]);
-      ctx.beginPath();
-      data.forEach((d, i) => {
-        const x = xPos(d.ts, area);
-        const y = yPos(valueAccessor(d), area, scale);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    function drawHover(ctx, area, scale) {
-      const point = nearest(equity, hoverTs || (viewStart + viewEnd) / 2);
-      if (!point) return;
-      const x = xPos(point.ts, area);
-      const y = yPos(point.equity, area, scale);
-      ctx.save();
-      ctx.strokeStyle = "#111827";
-      ctx.globalAlpha = 0.22;
-      ctx.beginPath();
-      ctx.moveTo(x, area.y);
-      ctx.lineTo(x, area.y + area.h);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = "#2563eb";
-      ctx.beginPath();
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      const dd = point.peak ? point.equity / point.peak - 1 : 0;
-      cursorInfo.textContent = `${formatDateTime(point.ts)}  Equity ${formatMoney(point.equity)}  Drawdown ${formatPercent(dd)}`;
-    }
-
-    function yScale(points, pad) {
-      let min = Infinity;
-      let max = -Infinity;
-      for (const point of points || []) {
-        const values = [point.equity, point.peak];
-        for (const value of values) {
-          if (!Number.isFinite(value)) continue;
-          if (value < min) min = value;
-          if (value > max) max = value;
-        }
-      }
-      if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
-      const span = Math.max(1e-9, max - min);
-      return { min: min - span * pad, max: max + span * pad };
-    }
-
-    function xPos(ts, area) {
-      return area.x + ((ts - viewStart) / Math.max(1, viewEnd - viewStart)) * area.w;
-    }
-
-    function yPos(value, area, scale) {
-      return area.y + area.h - ((value - scale.min) / Math.max(1e-12, scale.max - scale.min)) * area.h;
-    }
-
-    function onWheel(event) {
-      event.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      const ratio = clamp((event.clientX - rect.left - 62) / Math.max(1, rect.width - 112), 0, 1);
-      const anchor = viewStart + (viewEnd - viewStart) * ratio;
-      const factor = event.deltaY > 0 ? 1.22 : 0.82;
-      const left = (anchor - viewStart) * factor;
-      const right = (viewEnd - anchor) * factor;
-      setView(anchor - left, anchor + right);
-    }
-
-    function onMouseDown(event) {
-      dragging = true;
-      dragX = event.clientX;
-      dragStart = viewStart;
-      dragEnd = viewEnd;
-    }
-
-    function onMouseMove(event) {
-      const rect = canvas.getBoundingClientRect();
-      const ratio = clamp((event.clientX - rect.left - 62) / Math.max(1, rect.width - 112), 0, 1);
-      hoverTs = viewStart + (viewEnd - viewStart) * ratio;
-      if (dragging) {
-        const dx = event.clientX - dragX;
-        const shift = -dx / Math.max(1, rect.width - 112) * (dragEnd - dragStart);
-        setView(dragStart + shift, dragEnd + shift, false);
-      }
-      draw();
-    }
-
-    function setView(start, end, redraw = true) {
-      const span = Math.max(60000, end - start);
-      if (span >= fullEnd - fullStart) {
-        viewStart = fullStart;
-        viewEnd = fullEnd;
-      } else {
-        viewStart = clamp(start, fullStart, fullEnd - span);
-        viewEnd = viewStart + span;
-      }
-      if (redraw) draw();
-    }
-
-    function resetView() {
-      setView(fullStart, fullEnd);
-    }
-
-    function nearest(data, ts) {
-      if (!data.length || !Number.isFinite(ts)) return null;
-      let lo = 0, hi = data.length - 1;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (data[mid].ts < ts) lo = mid + 1;
-        else hi = mid;
-      }
-      const a = data[lo];
-      const b = data[Math.max(0, lo - 1)];
-      if (!b) return a;
-      return Math.abs(a.ts - ts) < Math.abs(b.ts - ts) ? a : b;
-    }
-
-    function lowerBound(ts) {
-      let lo = 0, hi = equity.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (equity[mid].ts < ts) lo = mid + 1;
-        else hi = mid;
-      }
-      return lo;
-    }
-
-    function upperBound(ts) {
-      let lo = 0, hi = equity.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (equity[mid].ts <= ts) lo = mid + 1;
-        else hi = mid;
-      }
-      return lo;
-    }
-
-    function clamp(value, min, max) {
-      return Math.max(min, Math.min(max, value));
-    }
-
-    function formatValue(value, kind) {
-      if (kind === "money") return formatMoney(value);
-      if (kind === "percent") return formatPercent(value);
-      if (kind === "integer") return Math.round(value).toLocaleString();
-      return Number(value).toFixed(3);
-    }
-
-    function formatMoney(value) {
-      return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
-    }
-
-    function formatPercent(value) {
-      return `${(Number(value) * 100).toFixed(2)}%`;
-    }
-
-    function formatDate(ts) {
-      return new Date(ts).toLocaleDateString();
-    }
-
-    function formatDateTime(ts) {
-      return new Date(ts).toLocaleString();
-    }
-
-    init();
-  </script>
-</body>
-</html>
-"""
+if __name__ == "__main__":
+    main()

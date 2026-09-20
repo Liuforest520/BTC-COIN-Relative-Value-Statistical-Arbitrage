@@ -21,8 +21,6 @@ MODEL_ORDER = [
     "dols",
     "ewls",
     "huber",
-    "age_weighted",
-    "fast_slow_slow",
 ]
 
 
@@ -410,7 +408,7 @@ def _write_report(ranking: pd.DataFrame, detail: pd.DataFrame) -> None:
 
 ## 二、参评模型
 
-本次评估包含 Rolling OLS、TLS、DOLS、EWLS、Huber、Age Weighted 和 Fast-Slow-Slow。
+本次评估包含 Rolling OLS、TLS、DOLS、EWLS 和 Huber。
 
 ## 三、公共参数与试验分组
 
@@ -513,7 +511,7 @@ z_i = (u_i - mean(u)) / std(u)
 
 以下统计使用每个模型在各公共参数组中的实际指标值，不使用T-score。每个公共参数组权重相同；同一模型在同一公共参数组中存在多个专属参数版本时，先在组内等权平均，再进行跨组统计。
 
-“最小值–最大值”表示全部有效公共参数组的完整取值范围；“P10–P90”表示去除两端各10%极端结果后的中间80%取值范围。缺失组不按0处理。原五个价格模型和 Age Weighted 覆盖24组，Fast-Slow-Slow因仅覆盖20D、30D、60D窗口而覆盖18组。
+“最小值–最大值”表示全部有效公共参数组的完整取值范围；“P10–P90”表示去除两端各10%极端结果后的中间80%取值范围。缺失组不按0处理。
 
 {_markdown_metric_distributions(detail)}
 

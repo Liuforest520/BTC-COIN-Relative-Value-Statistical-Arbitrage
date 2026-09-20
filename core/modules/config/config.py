@@ -13,6 +13,7 @@ class SetupConfig:
     strategy_type: str
     pairs: list[dict]
     pipeline: dict
+    rebalance: dict = None
 
 
 @dataclass
@@ -45,7 +46,6 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
     end_ts = _parse_optional_timestamp(end_time)
     if start_ts is not None and end_ts is not None and end_ts < start_ts:
         raise ValueError("backtest end_time must be greater than or equal to start_time")
-
     return Config(
         symbols=raw["data"]["symbols"],
         benchmarks=raw["data"].get("benchmarks", {}),
@@ -83,6 +83,7 @@ def _build_setup_config(raw: dict, setup_name: str) -> SetupConfig:
         strategy_type=setup.get("strategy", setup.get("strategy_type", "auto")),
         pairs=list(pairs),
         pipeline=dict(pipeline),
+        rebalance=dict(setup.get("rebalance", {})),
     )
 
 

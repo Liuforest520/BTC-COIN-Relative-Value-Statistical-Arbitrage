@@ -1,13 +1,15 @@
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
+import gc
 from math import isfinite
 from pathlib import Path
 import json
 import shutil
+import time
 
 import polars as pl
 
-from core.modules.reporting.equity_summary import export_equity_summary_html
+from core.modules.reporting.equity_summary import export_equity_summary_image
 from core.modules.logger import logger
 from core.modules.reporting.pair_summary import (
     build_pair_summary,
@@ -15,6 +17,7 @@ from core.modules.reporting.pair_summary import (
     pair_defs_from_config,
     write_compact_pair_summary_csv,
 )
+from core.modules.reporting.utils import reporting_frame
 
 
 KEY_METRIC_ROWS = [
@@ -41,12 +44,16 @@ def export_backtest_report(
     include_trade_review=True,
     review_max_points=2000,
     review_max_pairs=20,
+    include_curve_charts=True,
 ):
     config_path = Path(config_path)
     run_name = run_name or _run_name(result)
     output_dir = Path(output_root) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    logger.info("报告生成开始: {}", output_dir)
 
+    logger.info("报告步骤 1/4：写入回测 CSV/JSON 产物")
     config_output = output_dir / "config.yaml"
     if config_path.exists():
         shutil.copyfile(config_path, config_output)
@@ -77,18 +84,50 @@ def export_backtest_report(
     _write_csv(output_dir / "return_attribution.csv", return_attribution)
     _write_csv(output_dir / "risk_attribution.csv", risk_attribution)
 
-    export_equity_summary_html(result, output_dir / "portfolio_summary.html")
+    export_equity_summary_image(result, output_dir / "portfolio_summary.png")
+
+    if include_curve_charts:
+        charts_started = time.perf_counter()
+        logger.info("报告步骤 2/4：导出资金曲线图（组合 + 每个有成交的 Pair）")
+        try:
+            _export_curve_charts(result, config_output, output_dir)
+            logger.info(
+                "报告步骤 2/4：资金曲线图完成，耗时 {:.1f} 秒",
+                time.perf_counter() - charts_started,
+            )
+        except Exception as exc:
+            logger.exception("curve chart export failed for {}: {}", output_dir, exc)
+            (output_dir / "curve_charts_error.txt").write_text(
+                f"Curve chart generation failed: {type(exc).__name__}: {exc}\n",
+                encoding="utf-8",
+            )
 
     _write_markdown_summary(output_dir / "summary.md", result, config_output, return_attribution, risk_attribution)
+    _release_minute_curve_memory(result)
+    logger.info(
+        "报告步骤 2/4：基础产物完成，耗时 {:.1f} 秒",
+        time.perf_counter() - started,
+    )
     if include_trade_review:
+        review_started = time.perf_counter()
+        logger.info("报告步骤 3/4：开始生成 Trade Review（Pair 较多时此步耗时最长）")
         try:
             _export_trade_review(output_dir, review_max_points, review_max_pairs)
+            logger.info(
+                "报告步骤 3/4：Trade Review 完成，耗时 {:.1f} 分钟",
+                (time.perf_counter() - review_started) / 60.0,
+            )
         except Exception as exc:
             logger.exception("trade review export failed for {}: {}", output_dir, exc)
             (output_dir / "trade_review_error.txt").write_text(
                 f"Trade review generation failed: {type(exc).__name__}: {exc}\n",
                 encoding="utf-8",
             )
+    logger.info(
+        "报告步骤 4/4：全部完成，总耗时 {:.1f} 分钟，目录={}",
+        (time.perf_counter() - started) / 60.0,
+        output_dir,
+    )
     return output_dir
 
 
@@ -101,6 +140,17 @@ def _export_trade_review(output_dir, max_points, max_pairs):
         output_dir,
         max_points=max_points,
         max_pairs=max_pairs,
+    )
+
+
+def _export_curve_charts(result, config_output, output_dir):
+    from core.modules.reporting.curve_charts import export_curve_charts
+
+    return export_curve_charts(
+        result,
+        config_path=config_output,
+        output_dir=output_dir,
+        initial_equity=(result.metrics or {}).get("initial_equity"),
     )
 
 
@@ -170,7 +220,9 @@ def _write_markdown_summary(path, result, config_path, return_attribution, risk_
             "",
             "## 图表文件",
             "",
-            "- `portfolio_summary.html`: 总资金曲线交互网页",
+            "- `portfolio_summary.png`: 总资金曲线与核心指标图片",
+            "- `curve_charts/portfolio_curve.png`: 组合资金曲线 + 回撤 + 组合指标",
+            "- `curve_charts/pairs/<pair_id>_curve.png`: 每个有成交的 Pair 的资金曲线 + 该 Pair 指标（夏普/卡玛/交易数/胜率/最大回撤等）",
             "- `trade_review.html`: 组合交易复盘与单 Pair 分析入口",
             "",
             "## 明细文件",
@@ -192,9 +244,16 @@ def _write_markdown_summary(path, result, config_path, return_attribution, risk_
 
 def _per_pair_metrics(result, config_path: Path) -> list[dict]:
     """Compute per-pair PnL/win-rate summary from filled trades."""
+    position_curve = getattr(result, "position_curve", None)
+    # Compact detailed backtests intentionally keep only portfolio exposure in
+    # this curve. Pair contribution paths are reconstructed later from fills
+    # and prices, so materializing the full minute buffer here adds memory but
+    # no per-pair information.
+    if hasattr(position_curve, "write_csv"):
+        position_curve = None
     return build_pair_summary(
         trades=getattr(result, "trades", None),
-        position_curve=getattr(result, "position_curve", None),
+        position_curve=position_curve,
         funding_payments=getattr(result, "funding_payments", None),
         pair_defs=pair_defs_from_config(Path(config_path)),
         initial_equity=(getattr(result, "metrics", {}) or {}).get("initial_equity"),
@@ -210,15 +269,30 @@ def _run_name(result):
 
 
 def _write_csv(path, rows):
+    if hasattr(rows, "write_csv"):
+        rows.write_csv(path)
+        return
     rows = list(rows or [])
-    # Polars can union keys from sparse row dictionaries directly.  Avoid
-    # expanding every minute-level compact signal row into a wide Python dict,
-    # which otherwise multiplies report-export memory usage.
-    frame = pl.from_dicts(rows, infer_schema_length=None) if rows else pl.DataFrame()
+    # Keep sparse order/trade metadata schema-stable.  In particular, exit
+    # reason fields are null for most opens and become strings only on a
+    # protective close; letting Polars infer that column can create a Null
+    # builder and fail when the later string is appended.
+    frame = reporting_frame(rows)
     if frame.is_empty():
         path.write_text("", encoding="utf-8")
         return
     frame.write_csv(path)
+
+
+def _release_minute_curve_memory(result) -> None:
+    """Release large in-memory curves after their files and PNG are complete."""
+    for name in ("equity_curve", "position_curve", "signal_curve", "pair_curve"):
+        value = getattr(result, name, None)
+        clear = getattr(value, "clear", None)
+        if callable(clear):
+            clear()
+        setattr(result, name, [])
+    gc.collect()
 
 
 def _write_json(path, data):
@@ -233,7 +307,14 @@ def _object_rows(items):
     rows = []
     for item in items:
         if is_dataclass(item):
-            rows.append(_json_safe(asdict(item)))
+            value = _json_safe(asdict(item))
+            # Internal strategy metadata is carried from signal to fill so a
+            # protective boundary can be built from the frozen model.  It is
+            # not a tabular report column and nested dicts are unsupported by
+            # the CSV writer, so keep it in memory only.
+            if isinstance(value, dict):
+                value.pop("para", None)
+            rows.append(value)
         elif isinstance(item, dict):
             rows.append(_json_safe(item))
         else:

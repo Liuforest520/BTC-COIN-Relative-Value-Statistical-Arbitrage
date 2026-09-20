@@ -1,18 +1,12 @@
 """PairPipeline: estimator -> signal -> sizing for one pair. Lives in strategy because it orchestrates the steps."""
 from __future__ import annotations
 
-from math import isfinite, log
-
 from core.modules.models.pipeline_types import (
     PairPipelineResult,
     PairRuntimeState,
     RawPairTarget,
 )
 from core.modules.data.rolling_window import tail_values
-from core.modules.signals.position_exit_zscore import (
-    PositionExitZScoreTracker,
-    ReturnObservation,
-)
 from core.modules.strategy.config import EstimatorConfig, ExecutionConfig, PairDefinition, SignalConfig, SizingConfig
 
 
@@ -50,25 +44,6 @@ class PairPipeline:
         else:
             self.signal = None
 
-        exit_zscore_method = getattr(signal_cfg, "position_exit_zscore_method", "standard")
-        if exit_zscore_method != "standard":
-            supported_estimators = {
-                "age_weighted_wls",
-                "residual_weighted_wls",
-                "tls",
-                "huber",
-            }
-            if estimator_cfg.method not in supported_estimators:
-                raise ValueError(
-                    "non-standard position exit z-score is supported only for "
-                    "age_weighted_wls, residual_weighted_wls, tls, and huber"
-                )
-            if estimator_cfg.regression_method not in {"log_return", "log_returns"}:
-                raise ValueError(
-                    "non-standard position exit z-score requires log_return regression"
-                )
-        self.position_exit_zscore = PositionExitZScoreTracker(exit_zscore_method)
-
         if sizing_ctor and sizing_cfg:
             siz_kwargs = _dataclass_to_dict(sizing_cfg)
             siz_kwargs["pair_id"] = pair_def.pair_id
@@ -83,7 +58,6 @@ class PairPipeline:
         self._last_block_reason = ""
         self._last_result = None
         self._last_zscore = None
-        self._last_position_exit_zscore = None
         self._last_action = None
         self.collect_diagnostics = True
 
@@ -91,22 +65,6 @@ class PairPipeline:
         """Process one bar for this pair."""
         x_close = bundle.x_bar.close if bundle.x_bar else 0.0
         y_close = bundle.y_bar.close if bundle.y_bar else 0.0
-        estimator_state = self.state.estimator_state
-        return_base_x_close = return_base_y_close = None
-        if (
-            self.position_exit_zscore.method != "standard"
-            and not hasattr(self.estimator, "latest_return_values")
-        ):
-            return_interval_bars = max(
-                1, int(getattr(self.estimator, "return_interval_bars", 1))
-            )
-            if len(estimator_state.x_close_history) >= return_interval_bars:
-                return_base_x_close = float(
-                    estimator_state.x_close_history[-return_interval_bars]
-                )
-                return_base_y_close = float(
-                    estimator_state.y_close_history[-return_interval_bars]
-                )
         sizing_state = self.state.sizing_state
         has_position = (
             sizing_state.position_side is not None
@@ -134,24 +92,6 @@ class PairPipeline:
             para=runtime_para,
         )
 
-        if self.position_exit_zscore.method == "standard":
-            position_exit_zscore = None
-        else:
-            return_observation = self._return_observation(
-                est_out,
-                bundle.bar_index,
-                getattr(self.estimator, "latest_return_values", None),
-                return_base_x_close,
-                return_base_y_close,
-                x_close,
-                y_close,
-            )
-            position_exit_zscore = self.position_exit_zscore.on_bar(
-                return_observation,
-                has_position,
-            )
-        self._last_position_exit_zscore = position_exit_zscore
-
         result_para = (
             _merge_para(runtime_para, getattr(est_out, "para", {}))
             if self.collect_diagnostics else {}
@@ -170,14 +110,11 @@ class PairPipeline:
         position_para = {
             "has_position": has_position,
             "side": sizing_state.position_side,
-            "exit_zscore": position_exit_zscore,
-            "exit_zscore_method": self.position_exit_zscore.method,
         }
-        if self.collect_diagnostics:
-            position_para["exit_zscore_details"] = self.position_exit_zscore.details
-            signal_para = _merge_para(result_para, {"position": position_para})
-        else:
-            signal_para = {"position": position_para}
+        signal_para = (
+            _merge_para(result_para, {"position": position_para})
+            if self.collect_diagnostics else {"position": position_para}
+        )
         if self.collect_diagnostics:
             result_para = signal_para
         sig_out = self.signal.evaluate(
@@ -225,64 +162,6 @@ class PairPipeline:
         )
         self._last_result = result
         return result
-
-    def on_position_opened(self) -> None:
-        self.position_exit_zscore.on_position_opened()
-
-    def on_position_closed(self) -> None:
-        self.position_exit_zscore.on_position_closed()
-
-    def _return_observation(
-        self,
-        estimator,
-        bar_index,
-        transformed_returns,
-        return_base_x_close,
-        return_base_y_close,
-        x_close,
-        y_close,
-    ):
-        if self.position_exit_zscore.method == "standard" or not estimator.ready:
-            return None
-        if transformed_returns is not None:
-            x_return, y_return = transformed_returns
-        elif return_base_x_close is not None and return_base_y_close is not None:
-            base_x = float(return_base_x_close)
-            base_y = float(return_base_y_close)
-            current_x = float(x_close)
-            current_y = float(y_close)
-            if min(base_x, base_y, current_x, current_y) <= 0:
-                return None
-            x_return = log(current_x / base_x)
-            y_return = log(current_y / base_y)
-        else:
-            return None
-        values = (
-            x_return,
-            y_return,
-            estimator.alpha,
-            estimator.spread_beta,
-            estimator.spread_mean,
-            estimator.spread_std,
-        )
-        if any(value is None for value in values):
-            return None
-        numeric_values = tuple(float(value) for value in values)
-        if not all(isfinite(value) for value in numeric_values):
-            return None
-        x_return, y_return, alpha, beta, mean, std = numeric_values
-        if std <= 0:
-            return None
-        return ReturnObservation(
-            bar_index=int(bar_index),
-            x_return=x_return,
-            y_return=y_return,
-            alpha=alpha,
-            beta=beta,
-            residual_mean=mean,
-            residual_std=std,
-        )
-
 
 def _dataclass_to_dict(dc) -> dict:
     import dataclasses

@@ -1,6 +1,142 @@
 from core.modules.models.pipeline_types import SignalState
 from core.modules.models.pipeline_types import EstimatorOutput
-from core.modules.signals.zscore_reversion import ZScoreReversionSignal
+from core.modules.signals.zscore import SimpleZScoreSignal
+from core.modules.signals.zscore_reversion import (
+    MAReversionSignal,
+    TwoStageReversionSignal,
+    ZScoreReversionSignal,
+)
+
+
+def test_simple_zscore_enters_as_soon_as_entry_z_is_hit():
+    signal = SimpleZScoreSignal(pair_id="p", entry_z=3.0, exit_z=0.5)
+    state = SignalState(entry_z_upper=3.0, entry_z_lower=-3.0)
+    estimator = EstimatorOutput(
+        pair_id="p", ready=True, spread_mean=0.0, spread_std=1.0, latest_spread=3.05
+    )
+
+    out = signal.evaluate(state, estimator, bar_index=1, para={"position": {"has_position": False}})
+
+    assert out.action == "open"
+    assert out.side == "long_x"
+
+
+def test_two_stage_signal_forces_its_own_flags():
+    signal = TwoStageReversionSignal(
+        pair_id="p",
+        entry_z=3.0,
+        exit_z=0.5,
+        two_stage_trigger_z=3.0,
+        two_stage_entry_z=2.75,
+        two_stage_entry_window_z=0.5,
+        # Contradicting config values must not win.
+        two_stage_enabled=False,
+        reversion_filter_enabled=True,
+    )
+
+    assert signal.two_stage_enabled is True
+    assert signal.reversion_filter_enabled is False
+
+
+def test_two_stage_signal_requires_a_trigger():
+    import pytest
+
+    with pytest.raises(ValueError, match="two_stage_trigger_z"):
+        TwoStageReversionSignal(pair_id="p", entry_z=3.0, exit_z=0.5)
+
+
+def test_two_stage_signal_arms_then_fires_inside_the_window():
+    signal = TwoStageReversionSignal(
+        pair_id="p",
+        entry_z=3.0,
+        exit_z=0.5,
+        two_stage_trigger_z=3.0,
+        two_stage_entry_z=2.75,
+        two_stage_entry_window_z=0.5,
+    )
+    state = SignalState(entry_z_upper=3.0, entry_z_lower=-3.0)
+    estimator = EstimatorOutput(
+        pair_id="p", ready=True, spread_mean=0.0, spread_std=1.0, latest_spread=3.4
+    )
+
+    armed = signal.evaluate(state, estimator, bar_index=1, para={"position": {"has_position": False}})
+    assert armed.action == "none"
+    assert state.armed_side == "long_x"
+
+    estimator.latest_spread = 2.6
+    fired = signal.evaluate(state, estimator, bar_index=2, para={"position": {"has_position": False}})
+    assert fired.action == "open"
+    assert fired.side == "long_x"
+
+
+def test_two_stage_signal_discards_an_overshot_pullback():
+    signal = TwoStageReversionSignal(
+        pair_id="p",
+        entry_z=3.0,
+        exit_z=0.5,
+        two_stage_trigger_z=3.0,
+        two_stage_entry_z=2.75,
+        two_stage_entry_window_z=0.5,
+    )
+    state = SignalState(entry_z_upper=3.0, entry_z_lower=-3.0)
+    estimator = EstimatorOutput(
+        pair_id="p", ready=True, spread_mean=0.0, spread_std=1.0, latest_spread=3.4
+    )
+    signal.evaluate(state, estimator, bar_index=1, para={"position": {"has_position": False}})
+
+    estimator.latest_spread = 1.9  # jumped straight through the [2.25, 2.75] window
+    out = signal.evaluate(state, estimator, bar_index=2, para={"position": {"has_position": False}})
+
+    assert out.action == "none"
+    assert "missed entry window" in out.reason
+    assert state.armed_side is None
+
+
+def test_ma_signal_forces_its_own_flags_and_blocks_until_the_ma_turns():
+    signal = MAReversionSignal(
+        pair_id="p",
+        entry_z=3.0,
+        exit_z=0.5,
+        reversion_ma_lookback_bars=20,
+        reversion_min_samples=20,
+        # Contradicting config values must not win.
+        two_stage_enabled=True,
+        reversion_filter_enabled=False,
+    )
+    assert signal.two_stage_enabled is False
+    assert signal.reversion_filter_enabled is True
+
+    state = SignalState(entry_z_upper=3.0, entry_z_lower=-3.0)
+    estimator = EstimatorOutput(
+        pair_id="p", ready=True, spread_mean=0.0, spread_std=1.0, latest_spread=4.0
+    )
+    # High and flat, then a modest pullback that still clears entry_z: the short
+    # MA ends up below the long MA, so long_x passes the confirmation.
+    for index, zscore in enumerate([4.0] * 15 + [3.05] * 10):
+        estimator.latest_spread = zscore
+        out = signal.evaluate(
+            state, estimator, bar_index=index, para={"position": {"has_position": False}}
+        )
+    assert out.action == "open"
+    assert out.side == "long_x"
+    assert "reversion MA gap" not in out.reason
+
+    # Rising z-scores (no reversion yet) must keep the pair out.
+    blocked_signal = MAReversionSignal(
+        pair_id="p2", entry_z=3.0, exit_z=0.5, reversion_ma_lookback_bars=20
+    )
+    blocked_state = SignalState(entry_z_upper=3.0, entry_z_lower=-3.0)
+    estimator2 = EstimatorOutput(
+        pair_id="p2", ready=True, spread_mean=0.0, spread_std=1.0, latest_spread=3.2
+    )
+    for index in range(25):
+        estimator2.latest_spread = 3.2 + 0.05 * index
+        blocked = blocked_signal.evaluate(
+            blocked_state, estimator2, bar_index=index,
+            para={"position": {"has_position": False}},
+        )
+    assert blocked.action == "none"
+    assert "reversion MA gap" in blocked.reason
 
 
 def test_two_stage_resets_when_reversion_crosses_zero():

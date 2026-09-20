@@ -137,7 +137,18 @@ tbody tr.active-row { background: #eff6ff; }
 .scenario-table tbody tr { cursor:default; }
 .scenario-table tbody tr:hover { background:#f8fafc; }
 .scenario-actual { margin-top:6px; padding:7px 8px; background:#f8fafc; border:1px solid var(--line); border-radius:5px; }
+.scenario-summary { margin:6px 0; padding:7px 8px; background:#f8fafc; border:1px solid var(--line); border-radius:5px; }
+.scenario-summary-grid { display:grid; grid-template-columns:1fr 1fr; gap:3px 10px; }
+.scenario-summary-grid span { color:var(--muted); }
 .scenario-unavailable { color:var(--muted); font-size:11.5px; }
+.chart-wrap { position:relative; min-width:0; }
+.chart-tooltip {
+  position:absolute; display:none; pointer-events:none; z-index:5;
+  max-width:310px; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px;
+  background:rgba(255,255,255,.97); box-shadow:0 4px 14px rgba(15,23,42,.14);
+  color:var(--ink); font-size:11.5px; line-height:1.55; white-space:nowrap;
+}
+.trade-path-empty { color:var(--muted); font-size:12px; padding:8px 0 0; }
 .hint { color: var(--muted); font-size: 12px; margin: 4px 0; }
 #loadError {
   display: none;
@@ -157,7 +168,7 @@ tbody tr.active-row { background: #eff6ff; }
 
 
 # ---------------------------------------------------------------------------
-# JS：共享核心库 + 两个页面的初始化入口
+# JS（图表绘制 + 通用工具）
 # ---------------------------------------------------------------------------
 REVIEW_JS = r"""
 "use strict";
@@ -286,7 +297,13 @@ function drawLineChart(canvasId, data, series, options = {}) {
   }
   if (yMin === yMax) { yMin -= 1; yMax += 1; }
   const yPad = (yMax - yMin) * 0.08;
-  yMin -= yPad; yMax += yPad;
+  if (options.zeroBase) {
+    // 占比类图表从 0 起画：填充面积才有“占了多少”的直观含义
+    yMin = Math.min(0, yMin);
+    yMax += yPad;
+  } else {
+    yMin -= yPad; yMax += yPad;
+  }
   const x = ts => pad.left + (ts - options.viewStart) / (options.viewEnd - options.viewStart) * plotW;
   const y = value => pad.top + (yMax - value) / (yMax - yMin) * plotH;
 
@@ -337,6 +354,33 @@ function drawLineChart(canvasId, data, series, options = {}) {
       ctx.fillText(label, pad.left + plotW - ctx.measureText(label).width - 6, clamp(yy - 9, pad.top + 12, pad.top + plotH - 6));
     }
     ctx.setLineDash([]);
+  }
+
+  // 面积填充：仅对带 fill 颜色的系列生效，画在折线之下（先填后描，避免盖住网格）
+  for (const s of series) {
+    if (!s.fill) continue;
+    const base = clamp(
+      y(options.fillBase !== undefined ? options.fillBase : 0),
+      pad.top,
+      pad.top + plotH
+    );
+    let firstX = null, lastX = null;
+    ctx.beginPath();
+    for (const p of data) {
+      const v = p[s.key];
+      if (v === null || v === undefined || Number.isNaN(v)) continue;
+      const xx = x(p.ts), yy = y(v);
+      if (firstX === null) { ctx.moveTo(xx, yy); firstX = xx; }
+      else ctx.lineTo(xx, yy);
+      lastX = xx;
+    }
+    if (firstX !== null) {
+      ctx.lineTo(lastX, base);
+      ctx.lineTo(firstX, base);
+      ctx.closePath();
+      ctx.fillStyle = s.fill;
+      ctx.fill();
+    }
   }
 
   for (const s of series) {
@@ -833,6 +877,245 @@ function drawHoldingDistribution(bins, hintEl) {
   }
 }
 
+function drawTradeReturnZChart(canvasId, data, markers, options = {}) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const pad = { left: 62, right: 64, top: 20, bottom: 34 };
+  const plotW = w - pad.left - pad.right;
+  const plotH = h - pad.top - pad.bottom;
+  const valid = value => value !== null && value !== undefined && Number.isFinite(Number(value));
+  if (!data.length) {
+    ctx.fillStyle = "#667085";
+    ctx.font = "13px Microsoft YaHei, Arial";
+    ctx.fillText(options.emptyText || "点击右侧交易卡片查看该笔交易", pad.left, pad.top + 20);
+    return;
+  }
+  const pnlValues = [];
+  const zValues = [];
+  for (const point of data) {
+    if (valid(point.gross_return)) pnlValues.push(Number(point.gross_return));
+    if (valid(point.net_return)) pnlValues.push(Number(point.net_return));
+    if (valid(point.zscore)) zValues.push(Number(point.zscore));
+  }
+  if (!pnlValues.length || !zValues.length) {
+    ctx.fillStyle = "#667085";
+    ctx.font = "13px Microsoft YaHei, Arial";
+    ctx.fillText("该笔交易缺少价格或 Z-score 数据", pad.left, pad.top + 20);
+    return;
+  }
+  pnlValues.push(0);
+  if (valid(options.exitZ)) zValues.push(Number(options.exitZ));
+  let [pnlMin, pnlMax] = minMax(pnlValues);
+  let [zMin, zMax] = minMax(zValues);
+  if (pnlMin === pnlMax) { pnlMin -= 0.001; pnlMax += 0.001; }
+  if (zMin === zMax) { zMin -= 0.5; zMax += 0.5; }
+  const pnlPad = (pnlMax - pnlMin) * 0.10;
+  const zPad = (zMax - zMin) * 0.10;
+  pnlMin -= pnlPad; pnlMax += pnlPad;
+  zMin -= zPad; zMax += zPad;
+  const startTs = data[0].ts;
+  const endTs = Math.max(startTs + 1, data[data.length - 1].ts);
+  const x = ts => pad.left + (ts - startTs) / (endTs - startTs) * plotW;
+  const yPnl = value => pad.top + (pnlMax - value) / (pnlMax - pnlMin) * plotH;
+  const yZ = value => pad.top + (zMax - value) / (zMax - zMin) * plotH;
+
+  ctx.strokeStyle = "#d7dde8";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(pad.left, pad.top, plotW, plotH);
+  ctx.font = "11px Microsoft YaHei, Arial";
+  for (let i = 0; i <= 4; i++) {
+    const pnlValue = pnlMin + (pnlMax - pnlMin) * i / 4;
+    const zValue = zMin + (zMax - zMin) * i / 4;
+    const yy = yPnl(pnlValue);
+    ctx.strokeStyle = "#eef1f6";
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(pad.left + plotW, yy); ctx.stroke();
+    ctx.fillStyle = "#667085";
+    ctx.textAlign = "right";
+    ctx.fillText(pct(pnlValue), pad.left - 6, yy + 4);
+    ctx.textAlign = "left";
+    ctx.fillText(zValue.toFixed(2), pad.left + plotW + 6, yZ(zValue) + 4);
+  }
+  ctx.textAlign = "left";
+  for (const tick of [startTs, (startTs + endTs) / 2, endTs]) {
+    ctx.fillStyle = "#667085";
+    ctx.fillText(dt(tick).slice(5), clamp(x(tick) - 38, pad.left, pad.left + plotW - 76), pad.top + plotH + 22);
+  }
+  const zeroY = yPnl(0);
+  ctx.setLineDash([3, 4]);
+  ctx.strokeStyle = "#94a3b8";
+  ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(pad.left + plotW, zeroY); ctx.stroke();
+  if (valid(options.exitZ)) {
+    const exitY = yZ(Number(options.exitZ));
+    ctx.strokeStyle = "#a78bfa";
+    ctx.beginPath(); ctx.moveTo(pad.left, exitY); ctx.lineTo(pad.left + plotW, exitY); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  const drawSeries = (key, color, yFn, dashed) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.1;
+    ctx.setLineDash(dashed ? [6, 4] : []);
+    ctx.beginPath();
+    let started = false;
+    for (const point of data) {
+      const value = point[key];
+      if (!valid(value)) { started = false; continue; }
+      const xx = x(point.ts), yy = yFn(Number(value));
+      if (!started) { ctx.moveTo(xx, yy); started = true; } else ctx.lineTo(xx, yy);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  drawSeries("gross_return", "#2563eb", yPnl, false);
+  drawSeries("net_return", "#f97316", yPnl, false);
+  drawSeries("zscore", "#7c3aed", yZ, true);
+
+  const markerRows = markers || [];
+  ctx.font = "11px Microsoft YaHei, Arial";
+  for (const marker of markerRows) {
+    const point = nearestPoint(data, marker.ts);
+    if (!point) continue;
+    const useZ = marker.axis === "z";
+    const value = useZ ? point.zscore : point[marker.valueKey || "net_return"];
+    if (!valid(value)) continue;
+    const xx = x(point.ts);
+    const yy = useZ ? yZ(Number(value)) : yPnl(Number(value));
+    ctx.fillStyle = marker.color || "#0f172a";
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (marker.shape === "diamond") {
+      ctx.moveTo(xx, yy - 5); ctx.lineTo(xx + 5, yy); ctx.lineTo(xx, yy + 5); ctx.lineTo(xx - 5, yy);
+    } else if (marker.shape === "square") {
+      ctx.rect(xx - 4, yy - 4, 8, 8);
+    } else {
+      ctx.arc(xx, yy, 4.5, 0, Math.PI * 2);
+    }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    const label = marker.label || "";
+    if (label) {
+      const textW = ctx.measureText(label).width;
+      const labelX = clamp(xx + 6, pad.left + 2, pad.left + plotW - textW - 4);
+      const labelY = marker.labelLane === null || marker.labelLane === undefined
+        ? clamp(yy + Number(marker.labelDy ?? -7), pad.top + 11, pad.top + plotH - 3)
+        : pad.top + 12 + Number(marker.labelLane) * 16;
+      ctx.fillStyle = marker.color || "#0f172a";
+      ctx.fillText(label, labelX, labelY);
+    }
+  }
+  ctx.textAlign = "left";
+}
+
+function drawPairScenarioChart(canvasId, pairRows, tooltipId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const rows = (pairRows || [])
+    .filter(row => row.scenario_space && row.scenario_space.zero_x && row.scenario_space.zero_x.median !== null)
+    .sort((a, b) => Number(b.scenario_space.actual_net.median ?? -Infinity) - Number(a.scenario_space.actual_net.median ?? -Infinity));
+  canvas.style.height = Math.max(280, 74 + rows.length * 34) + "px";
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const tooltip = document.getElementById(tooltipId);
+  if (!rows.length) {
+    ctx.fillStyle = "#667085";
+    ctx.font = "13px Microsoft YaHei, Arial";
+    ctx.fillText("当前配置没有可用的交易收益情景", 90, 34);
+    if (tooltip) tooltip.style.display = "none";
+    return;
+  }
+  const pad = { left: 112, right: 194, top: 34, bottom: 36 };
+  const plotW = Math.max(100, w - pad.left - pad.right);
+  const plotH = h - pad.top - pad.bottom;
+  const values = [0];
+  for (const row of rows) {
+    const s = row.scenario_space;
+    for (const value of [s.range_min.median, s.range_max.median, s.zero_x.median, s.actual_net.median]) {
+      if (value !== null && value !== undefined && Number.isFinite(Number(value))) values.push(Number(value));
+    }
+  }
+  let [xMin, xMax] = minMax(values);
+  if (xMin === xMax) { xMin -= 0.01; xMax += 0.01; }
+  const xPad = (xMax - xMin) * 0.10;
+  xMin -= xPad; xMax += xPad;
+  const x = value => pad.left + (value - xMin) / (xMax - xMin) * plotW;
+  const rowH = plotH / rows.length;
+  ctx.font = "11px Microsoft YaHei, Arial";
+  ctx.textAlign = "center";
+  for (let i = 0; i <= 4; i++) {
+    const value = xMin + (xMax - xMin) * i / 4;
+    const xx = x(value);
+    ctx.strokeStyle = "#eef1f6";
+    ctx.beginPath(); ctx.moveTo(xx, pad.top); ctx.lineTo(xx, pad.top + plotH); ctx.stroke();
+    ctx.fillStyle = "#667085";
+    ctx.fillText(pct(value), xx, h - 12);
+  }
+  if (xMin < 0 && xMax > 0) {
+    ctx.strokeStyle = "#94a3b8";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x(0), pad.top); ctx.lineTo(x(0), pad.top + plotH); ctx.stroke();
+  }
+  ctx.fillStyle = "#667085";
+  ctx.textAlign = "left";
+  ctx.fillText("理论正收益", pad.left + plotW + 20, 20);
+  ctx.fillText("实际净盈利", pad.left + plotW + 100, 20);
+  const hits = [];
+  rows.forEach((row, index) => {
+    const s = row.scenario_space;
+    const cy = pad.top + rowH * (index + 0.5);
+    const low = Number(s.range_min.median);
+    const high = Number(s.range_max.median);
+    const zero = Number(s.zero_x.median);
+    const net = s.actual_net.median;
+    ctx.fillStyle = "#334155";
+    ctx.textAlign = "right";
+    ctx.fillText(row.pair_id, pad.left - 8, cy + 4);
+    ctx.strokeStyle = "#94a3b8";
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x(low), cy); ctx.lineTo(x(high), cy); ctx.stroke();
+    ctx.fillStyle = "#2563eb";
+    ctx.beginPath(); ctx.arc(x(zero), cy, 4.5, 0, Math.PI * 2); ctx.fill();
+    if (net !== null && net !== undefined) {
+      ctx.fillStyle = "#f97316";
+      ctx.fillRect(x(Number(net)) - 4, cy - 4, 8, 8);
+    }
+    ctx.fillStyle = "#475569";
+    ctx.textAlign = "center";
+    ctx.fillText(pct(s.theoretical_positive_rate), pad.left + plotW + 48, cy + 4);
+    ctx.fillText(pct(s.cost_coverage_rate), pad.left + plotW + 128, cy + 4);
+    hits.push({ top: cy - rowH / 2, bottom: cy + rowH / 2, row });
+  });
+  canvas._pairScenarioHits = hits;
+  canvas._pairScenarioLayout = { pad, plotW };
+  if (!canvas._pairScenarioBound) {
+    canvas.addEventListener("mousemove", event => {
+      const rect = canvas.getBoundingClientRect();
+      const mouseY = event.clientY - rect.top;
+      const hit = (canvas._pairScenarioHits || []).find(item => mouseY >= item.top && mouseY <= item.bottom);
+      if (!tooltip || !hit) {
+        if (tooltip) tooltip.style.display = "none";
+        return;
+      }
+      const s = hit.row.scenario_space;
+      const dist = item => `${pct(item.p10)} / ${pct(item.median)} / ${pct(item.p90)}`;
+      tooltip.innerHTML = `<b>${String(hit.row.pair_id).replace(/[&<>"']/g, "")}</b><br>` +
+        `情景交易数：${num(s.scenario_count, 0)}，已平仓：${num(s.closed_count, 0)}<br>` +
+        `X不变理论 P10/P50/P90：${dist(s.zero_x)}<br>` +
+        `实际毛收益 P10/P50/P90：${dist(s.actual_gross)}<br>` +
+        `实际净收益 P10/P50/P90：${dist(s.actual_net)}<br>` +
+        `理论正收益比例：${pct(s.theoretical_positive_rate)}<br>` +
+        `实际成本覆盖率：${pct(s.cost_coverage_rate)}`;
+      tooltip.style.display = "block";
+      tooltip.style.left = clamp(event.clientX - rect.left + 12, 4, rect.width - tooltip.offsetWidth - 4) + "px";
+      tooltip.style.top = clamp(mouseY + 12, 4, rect.height - tooltip.offsetHeight - 4) + "px";
+    });
+    canvas.addEventListener("mouseleave", () => { if (tooltip) tooltip.style.display = "none"; });
+    canvas._pairScenarioBound = true;
+  }
+  ctx.textAlign = "left";
+}
+
 // ---------- 时间窗口控件（滑块） ----------
 function initRangeControls(opts) {
   const leftInput = document.getElementById("windowLeft");
@@ -949,8 +1232,8 @@ OVERVIEW_TEMPLATE = r"""<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>__TITLE__ - 组合总览</title>
-  <link rel="stylesheet" href="trade_review_assets/review.css?v=20260831-2" />
-  <script src="trade_review_assets/review.js?v=20260831-2"></script>
+  <link rel="stylesheet" href="trade_review_assets/review.css?v=20260918-1" />
+  <script src="trade_review_assets/review.js?v=20260918-1"></script>
 </head>
 <body>
   <div id="loadError"></div>
@@ -988,9 +1271,30 @@ OVERVIEW_TEMPLATE = r"""<!doctype html>
         <canvas class="chart tall" id="equityChart"></canvas>
       </div>
       <div class="panel">
+        <h2>持仓资金占比</h2>
+        <div class="legend">
+          <span><i class="dot" style="background: var(--blue)"></i>持仓资金占比（持仓名义市值 ÷ 当前权益）</span>
+        </div>
+        <canvas class="chart" id="exposureChart"></canvas>
+        <div class="hint" id="exposureHint"></div>
+      </div>
+      <div class="panel">
         <h2>持仓时间分布</h2>
         <canvas class="chart" id="holdingChart"></canvas>
         <div class="hint" id="holdingHint"></div>
+      </div>
+      <div class="panel">
+        <h2>Pair 收益空间对比</h2>
+        <div class="legend">
+          <span><i class="dot" style="background:#94a3b8;border-radius:2px;width:18px;"></i>±20%条件收益中位区间</span>
+          <span><i class="dot" style="background:var(--blue)"></i>X不变理论收益中位数</span>
+          <span><i class="dot" style="background:var(--orange);border-radius:1px"></i>实际净收益中位数</span>
+        </div>
+        <div class="hint">每行只汇总当前配置中该 Pair 的交易；最高、最低值均以残差回到目标 Z 为条件。</div>
+        <div class="chart-wrap">
+          <canvas class="chart" id="pairScenarioChart"></canvas>
+          <div class="chart-tooltip" id="pairScenarioTooltip"></div>
+        </div>
       </div>
       <div class="panel">
         <h2>Pair 汇总表</h2>
@@ -1019,7 +1323,10 @@ OVERVIEW_TEMPLATE = r"""<!doctype html>
   </main>
   <script>
     const payload = __PAYLOAD__;
-    const points = unpackSeries(payload.points, ["equity", "gross_exposure_ratio", "net_exposure_ratio", "peak"]);
+    const points = unpackSeries(payload.points, [
+      "equity", "gross_exposure_ratio", "margin_deficit",
+      "forced_deleveraging_triggered", "peak"
+    ]);
     const state = initRangeControls({
       tsMin: payload.range.start,
       tsMax: payload.range.end,
@@ -1102,8 +1409,45 @@ OVERVIEW_TEMPLATE = r"""<!doctype html>
         trades: [],
         valueKey: "equity"
       });
-      drawHoldingDistribution(holdingDist ? holdingDist.bins : null, document.getElementById("holdingHint"));
-      renderPairSummaryTable();
+      renderExposureChart(data);
+       drawHoldingDistribution(holdingDist ? holdingDist.bins : null, document.getElementById("holdingHint"));
+       drawPairScenarioChart("pairScenarioChart", pairRows, "pairScenarioTooltip");
+       renderPairSummaryTable();
+     }
+
+    // 每个时点的持仓资金占比：与上面的资金曲线共用同一时间轴和缩放窗口
+    function renderExposureChart(data) {
+      const hintEl = document.getElementById("exposureHint");
+      const values = data
+        .map(p => p.gross_exposure_ratio)
+        .filter(v => v !== null && v !== undefined && !Number.isNaN(v));
+      if (hintEl) {
+        if (values.length) {
+          const [mn, mx] = minMax(values);
+          const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
+          const forcedPoints = data.filter(p => Number(p.forced_deleveraging_triggered || 0) > 0.5);
+          const maxDeficit = data.reduce(
+            (best, p) => Math.max(best, Number(p.margin_deficit || 0)), 0
+          );
+           hintEl.textContent =
+             "本窗口 " + num(values.length, 0) + " 个时点：平均 " + pct(avg) +
+             "，最高 " + pct(mx) + "，最低 " + pct(mn) +
+             "；占比 = 持仓占用资金 ÷（持仓占用资金 + 账户未使用资金），100% 即没有剩余可用资金" +
+             (forcedPoints.length
+               ? "；发生强制减仓 " + num(forcedPoints.length, 0) + " 个时点，减仓前最大资金缺口 " + num(maxDeficit, 2)
+               : "；本窗口未触发强制减仓");
+        } else {
+          hintEl.textContent = "本窗口没有持仓占比数据";
+        }
+      }
+      drawLineChart("exposureChart", data, [
+        { key: "gross_exposure_ratio", color: "#2563eb", fill: "rgba(37, 99, 235, 0.20)" }
+      ], {
+        viewStart: state.viewStart,
+        viewEnd: state.viewEnd,
+        yFormat: v => (v * 100).toFixed(1) + "%",
+        zeroBase: true
+      });
     }
 
     function renderPairSummaryTable() {
@@ -1176,8 +1520,8 @@ PAIR_TEMPLATE = r"""<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>__PAIR_ID__ 独立复盘 - __TITLE__</title>
-  <link rel="stylesheet" href="../trade_review_assets/review.css?v=20260831-2" />
-  <script src="../trade_review_assets/review.js?v=20260901-1"></script>
+  <link rel="stylesheet" href="../trade_review_assets/review.css?v=20260918-1" />
+  <script src="../trade_review_assets/review.js?v=20260918-1"></script>
 </head>
 <body class="pair-review">
   <div id="loadError"></div>
@@ -1246,9 +1590,20 @@ PAIR_TEMPLATE = r"""<!doctype html>
         <canvas class="chart" id="theoreticalYChart"></canvas>
       </div>
       <div class="panel">
+        <h2>选中交易收益路径与 Z-score</h2>
+        <div class="legend">
+          <span><i class="dot" style="background:var(--blue)"></i>不计成本浮动收益率（左轴）</span>
+          <span><i class="dot" style="background:var(--orange)"></i>扣除已发生成本后收益率（左轴）</span>
+          <span><i class="dot" style="background:var(--purple)"></i>Z-score（右轴）</span>
+        </div>
+        <div class="hint">收益路径只展示开仓至平仓；净收益只扣除截至当分钟已经发生的手续费、滑点和资金费率。</div>
+        <canvas class="chart tall" id="tradeReturnChart"></canvas>
+        <div class="trade-path-empty" id="tradeReturnHint">点击右侧交易卡片查看该笔交易。</div>
+      </div>
+      <div class="panel">
         <h2>每分钟 Z-score 与交易阈值</h2>
         <div class="legend">
-          <span><i class="dot" style="background: var(--purple)"></i>Z-score</span>
+          <span><i class="dot" style="background: var(--purple)"></i>标准 Z-score</span>
           <span><i class="dot" style="background: var(--green)"></i>开仓</span>
           <span><i class="dot" style="background: var(--red)"></i>平仓</span>
         </div>
@@ -1282,7 +1637,8 @@ PAIR_TEMPLATE = r"""<!doctype html>
     const monthCache = {};
     let allPoints = [];
     let summary = config.summary || {};
-    let selectedTradeId = null;
+    const deepLink = new URLSearchParams(window.location.search);
+    let selectedTradeId = deepLink.get("trade");
 
     function monthKeys(startTs, endTs) {
       const keys = [];
@@ -1321,7 +1677,10 @@ PAIR_TEMPLATE = r"""<!doctype html>
     function unpackMonths(months) {
       const out = [];
       for (const m of months) {
-        out.push(...unpackSeries(m, ["x_close", "y_close", "y_theoretical", "zscore", "pnl", "cum_funding", "peak"]));
+        out.push(...unpackSeries(m, [
+          "x_close", "y_close", "y_theoretical", "zscore",
+          "pnl", "cum_funding", "peak"
+        ]));
       }
       for (const p of out) {
         p.contrib_equity = config.initial_equity + (p.pnl === null || p.pnl === undefined ? 0 : p.pnl);
@@ -1392,8 +1751,110 @@ PAIR_TEMPLATE = r"""<!doctype html>
       } else if (config.regression_method === "price") {
         hint.textContent = "Price 理论价格：Alpha + Beta × X。参数使用当分钟已生效值。";
       } else {
-        hint.textContent = "当前模型基于收益率，无法从单点 Alpha、Beta 直接得到理论 Y 价格。";
+        hint.textContent = "当前回归类型不支持理论 Y 价格。";
       }
+    }
+    function tradeKey(t) {
+      return t.trade_id || `${t.pair_id || pairId}:${t.open_ts || t.ts}`;
+    }
+    function selectedTrade() {
+      return (config.trades || []).find(t => tradeKey(t) === selectedTradeId) || null;
+    }
+    function selectedTradeEvents(trade) {
+      if (!trade) return [];
+      return (config.events || []).filter(event => {
+        if (event.trade_id) return event.trade_id === tradeKey(trade);
+        if (trade.position_id && event.position_id) return event.position_id === trade.position_id;
+        return event.group_id === trade.group_id;
+      }).sort((a, b) => a.ts - b.ts);
+    }
+    function buildSelectedTradePath() {
+      const trade = selectedTrade();
+      if (!trade) return { trade: null, points: [], markers: [], targetZ: null };
+      const openTs = Number(trade.open_ts ?? trade.ts);
+      const closeTs = trade.close_ts !== null && trade.close_ts !== undefined
+        ? Number(trade.close_ts)
+        : Number(config.range.end);
+      const startIndex = lowerBound(allPoints, openTs);
+      const endIndex = upperBound(allPoints, closeTs);
+      const source = allPoints.slice(startIndex, endIndex);
+      if (!source.length) return { trade, points: [], markers: [], targetZ: null };
+      const fundingIndex = upperBound(allPoints, openTs) - 1;
+      const fundingBase = fundingIndex >= 0 ? Number(allPoints[fundingIndex].cum_funding || 0) : 0;
+      const events = selectedTradeEvents(trade);
+      let eventIndex = 0;
+      let qx = 0, qy = 0, referenceCashflow = 0, realizedCosts = 0, investedNotional = 0;
+      let lastX = null, lastY = null;
+      const path = [];
+      for (const point of source) {
+        if (point.x_close !== null && point.x_close !== undefined) lastX = Number(point.x_close);
+        if (point.y_close !== null && point.y_close !== undefined) lastY = Number(point.y_close);
+        while (eventIndex < events.length && Number(events[eventIndex].ts) <= point.ts) {
+          const event = events[eventIndex];
+          if (event.action === "open" || event.action === "add") {
+            investedNotional += Number(event.gross_notional || 0);
+          }
+          for (const leg of (event.leg_details || [])) {
+            const quantity = Number(leg.quantity || 0);
+            const signed = String(leg.side || "").toLowerCase() === "buy" ? quantity : -quantity;
+            const reference = Number(leg.reference_price ?? leg.price);
+            if (leg.symbol === summary.x_symbol) {
+              qx += signed;
+              if (lastX === null && Number.isFinite(reference)) lastX = reference;
+            } else if (leg.symbol === summary.y_symbol) {
+              qy += signed;
+              if (lastY === null && Number.isFinite(reference)) lastY = reference;
+            }
+            if (Number.isFinite(reference)) referenceCashflow -= signed * reference;
+          }
+          realizedCosts += Number(event.fee || 0) + Number(event.slippage || 0);
+          eventIndex += 1;
+        }
+        const denominator = investedNotional > 0
+          ? investedNotional
+          : Number(trade.open_notional || 0);
+        const canValue = lastX !== null && lastY !== null && denominator > 0;
+        let grossPnl = canValue ? referenceCashflow + qx * lastX + qy * lastY : null;
+        const fundingToDate = Number(point.cum_funding || 0) - fundingBase;
+        let netPnl = grossPnl === null ? null : grossPnl - realizedCosts - fundingToDate;
+        if (trade.close_ts !== null && trade.close_ts !== undefined && point.ts === Number(trade.close_ts)) {
+          if (trade.gross_pnl !== null && trade.gross_pnl !== undefined) grossPnl = Number(trade.gross_pnl);
+          if (trade.net_pnl !== null && trade.net_pnl !== undefined) netPnl = Number(trade.net_pnl);
+        }
+        path.push({
+          ts: point.ts,
+          gross_pnl: grossPnl,
+          net_pnl: netPnl,
+          gross_return: grossPnl === null || denominator <= 0 ? null : grossPnl / denominator,
+          net_return: netPnl === null || denominator <= 0 ? null : netPnl / denominator,
+          zscore: point.zscore,
+          realized_costs: realizedCosts,
+          funding_to_date: fundingToDate,
+        });
+      }
+      const validNet = path.filter(point => Number.isFinite(Number(point.net_return)));
+      const maxPoint = validNet.reduce((best, point) => !best || point.net_return > best.net_return ? point : best, null);
+      const minPoint = validNet.reduce((best, point) => !best || point.net_return < best.net_return ? point : best, null);
+      const entryZ = Number(trade.open_zscore ?? trade.open_fill_zscore ?? path[0].zscore);
+      const entrySign = entryZ < 0 ? -1 : 1;
+      const targetZ = trade.scenario_analysis && trade.scenario_analysis.target_z !== undefined
+        ? Number(trade.scenario_analysis.target_z)
+        : entrySign * Number(config.exit_z ?? 0.5);
+      const exitHit = path.find(point =>
+        point.ts > openTs
+        && Number.isFinite(Number(point.zscore))
+        && entrySign * Number(point.zscore) <= Number(config.exit_z ?? 0.5)
+      );
+      const markers = [
+        { ts: openTs, label: "开仓", color: "#16a34a", shape: "square", valueKey: "net_return", labelDy: -10 },
+      ];
+      if (trade.close_ts !== null && trade.close_ts !== undefined) {
+        markers.push({ ts: Number(trade.close_ts), label: "平仓", color: "#dc2626", shape: "square", valueKey: "net_return", labelDy: 18 });
+      }
+      if (maxPoint) markers.push({ ts: maxPoint.ts, label: "最大浮盈", color: "#0284c7", valueKey: "net_return", labelLane: 1 });
+      if (minPoint) markers.push({ ts: minPoint.ts, label: "最大浮亏", color: "#b91c1c", valueKey: "net_return", labelDy: 18 });
+      if (exitHit) markers.push({ ts: exitHit.ts, label: "首次到平仓阈值", color: "#7c3aed", shape: "diamond", axis: "z", labelLane: 0 });
+      return { trade, points: path, markers, targetZ };
     }
     function renderAll() {
       const data = computeWindowDerived(visiblePoints());
@@ -1419,9 +1880,22 @@ PAIR_TEMPLATE = r"""<!doctype html>
         { key: "y_close", color: "#f97316", label: "真实价格" },
         { key: "y_theoretical", color: "#2563eb", label: "理论价格", dash: true }
       ], { ...markers, valueKey: "y_close", yFormat: v => num(v, 6) });
-      drawLineChart("zscoreChart", data, [
-        { key: "zscore", color: "#7c3aed", label: "Z-score" }
-      ], { ...markers, thresholds: config.thresholds || [], valueKey: "zscore", yFormat: v => num(v, 2) });
+      const tradePath = buildSelectedTradePath();
+      drawTradeReturnZChart("tradeReturnChart", tradePath.points, tradePath.markers, {
+        exitZ: tradePath.targetZ,
+        emptyText: "点击右侧交易卡片查看该笔交易"
+      });
+      const tradeHint = document.getElementById("tradeReturnHint");
+      if (!tradePath.trade) {
+        tradeHint.textContent = "点击右侧交易卡片查看该笔交易。";
+      } else if (!tradePath.points.length) {
+        tradeHint.textContent = "选中交易的分钟价格数据尚未加载。";
+      } else {
+        tradeHint.textContent = "当前交易：" + (tradePath.trade.open_time || "-") + " 至 " + (tradePath.trade.close_time || "回测结束") + "；图中最大浮盈/浮亏按扣除已发生成本后的收益率标记。";
+      }
+      const zSeries = [{ key: "zscore", color: "#7c3aed", label: "Z-score" }];
+      drawLineChart("zscoreChart", data, zSeries,
+        { ...markers, thresholds: config.thresholds || [], valueKey: "zscore", yFormat: v => num(v, 2) });
       renderWindowSummary(data);
       renderTradeList();
     }
@@ -1449,6 +1923,29 @@ PAIR_TEMPLATE = r"""<!doctype html>
           <td title="${num(row.y_target_price, 10)}">${num(row.y_target_price, 6)}</td>
           <td class="${signedClass(row.gross_return)}">${pct(row.gross_return)}</td>
         </tr>`).join("");
+      const invalidMoves = (analysis.invalid_x_moves || []).map(pct);
+      const invalidHtml = invalidMoves.length
+        ? `<div class="scenario-unavailable">未展示理论Y价格无效的情景：${invalidMoves.join("、")}</div>`
+        : "";
+      const scenarioSummary = analysis.summary || {};
+      const zeroX = scenarioSummary.zero_x || null;
+      const rangeMin = scenarioSummary.range_min || null;
+      const rangeMax = scenarioSummary.range_max || null;
+      const breakEven = scenarioSummary.break_even_x_move;
+      const allProfitableText = scenarioSummary.all_profitable === null || scenarioSummary.all_profitable === undefined
+        ? "无法完整判断（部分理论Y无效）"
+        : (scenarioSummary.all_profitable ? "是" : "否");
+      const summaryHtml = `
+        <div class="scenario-summary">
+          <div><b>${esc(analysis.assumption || "假设回到目标Z")}</b></div>
+          <div class="scenario-summary-grid">
+            <span>X不变时理论收益</span><b class="${signedClass(zeroX && zeroX.gross_return)}">${zeroX ? pct(zeroX.gross_return) : "-"}</b>
+            <span>±20%条件最低收益</span><b class="${signedClass(rangeMin && rangeMin.gross_return)}">${rangeMin ? pct(rangeMin.gross_return) + "（X " + pct(rangeMin.x_move) + "）" : "-"}</b>
+            <span>±20%条件最高收益</span><b class="${signedClass(rangeMax && rangeMax.gross_return)}">${rangeMax ? pct(rangeMax.gross_return) + "（X " + pct(rangeMax.x_move) + "）" : "-"}</b>
+            <span>±20%范围是否全部盈利</span><b>${allProfitableText}</b>
+            <span>最接近0%的理论盈亏平衡点</span><b>${breakEven === null || breakEven === undefined ? "区间内无" : "X " + pct(Math.abs(breakEven) < 0.00005 ? 0 : breakEven)}</b>
+          </div>
+        </div>`;
       const actual = analysis.actual;
       let actualHtml = "";
       if (actual) {
@@ -1474,6 +1971,8 @@ PAIR_TEMPLATE = r"""<!doctype html>
             <b>开仓收益情景</b>
             <span>假设回到 Z=${num(analysis.target_z, 2)}；不计成本</span>
           </div>
+          ${summaryHtml}
+          ${invalidHtml}
           <div class="table-wrap"><table class="scenario-table">
             <thead><tr><th>X变动</th><th>X平仓价</th><th>理论Y价</th><th>组合收益</th></tr></thead>
             <tbody>${rows}</tbody>
@@ -1502,10 +2001,22 @@ PAIR_TEMPLATE = r"""<!doctype html>
             残差均值 ${num(t.open_spread_mean, 6)}，标准差 ${num(t.open_spread_std, 6)}<br>
             原始价格 ${esc(summary.x_symbol || "X")} ${num(t.open_x_price, 8)} / ${esc(summary.y_symbol || "Y")} ${num(t.open_y_price, 8)}<br>
             原始价差（Y-X） ${num(t.open_raw_spread, 8)}<br>
+             ${t.protection_stop_reason ? (
+               "保护目标残差 " + num(t.protection_target_residual, 8) +
+               "，止损状态 " + esc(t.protection_stop_reason) + "；" +
+               (t.protection_stop_x_price !== null && t.protection_stop_x_price !== undefined
+                 ? "理论止损 X 价格 " + num(t.protection_stop_x_price, 8)
+                 : "无有效止损根") +
+               "，止盈线 " + pct(t.protection_take_profit_return) +
+               (t.protection_max_holding_bars !== null && t.protection_max_holding_bars !== undefined
+                 ? "，最大持仓 " + esc(String(t.protection_max_holding_bars)) + " bars"
+                 : "") + "<br>"
+             ) : ""}
             两腿：${esc(t.open_legs || "-")}
           </div>
           ${renderTradeScenario(t)}
           <div class="trade-block"><b class="close">平仓</b> ${esc(t.close_time || "未平仓")}<br>
+            ${t.exit_reason || t.exit_class ? `退出分类 ${esc(t.exit_class || "-")}；${t.exit_reason ? `退出原因 ${esc(t.exit_reason)}${t.protection_trigger ? `（${esc(t.protection_trigger)}）` : ""}` : ""}${t.reopen_lock_pending === true ? "；等待下一次模型更新解锁" : ""}<br>` : ""}
             信号 Z-score ${num(t.close_zscore, 2)}，成交分钟 Z-score ${num(t.close_fill_zscore, 2)}<br>
             Alpha ${num(t.close_alpha, 6)}，Beta ${num(t.close_beta, 4)}<br>
             原始价格 ${esc(summary.x_symbol || "X")} ${num(t.close_x_price, 8)} / ${esc(summary.y_symbol || "Y")} ${num(t.close_y_price, 8)}<br>
@@ -1521,11 +2032,11 @@ PAIR_TEMPLATE = r"""<!doctype html>
       }).join("");
       el.querySelectorAll(".trade-card").forEach(card => {
         card.addEventListener("click", () => {
-          selectedTradeId = card.dataset.tradeId;
-          renderTradeList();
-          const trade = (config.trades || []).find(item => (item.trade_id || `${item.pair_id || pairId}:${item.open_ts || item.ts}`) === selectedTradeId);
-          if (!trade) return;
-          const contextMs = Math.max(0, Number(config.model_lookback_bars || 0)) * 60 * 1000;
+           selectedTradeId = card.dataset.tradeId;
+           renderTradeList();
+           const trade = (config.trades || []).find(item => (item.trade_id || `${item.pair_id || pairId}:${item.open_ts || item.ts}`) === selectedTradeId);
+           if (!trade) return;
+           const contextMs = Math.max(0, Number(config.model_lookback_bars || 0)) * 60 * 1000;
           const openTs = Number(trade.open_ts ?? trade.ts);
           const closeTs = trade.close_ts !== null && trade.close_ts !== undefined
             ? Number(trade.close_ts)
@@ -1555,7 +2066,16 @@ PAIR_TEMPLATE = r"""<!doctype html>
     }
     renderMetrics();
     document.getElementById("showTradeMarkers").addEventListener("change", scheduleRender);
-    ensureMonthsLoaded(state.viewStart, state.viewEnd).then(scheduleRender);
+    const initialTrade = (config.trades || []).find(t => tradeKey(t) === selectedTradeId);
+    if (initialTrade) {
+      const contextMs = Math.max(0, Number(config.model_lookback_bars || 0)) * 60 * 1000;
+      const openTs = Number(initialTrade.open_ts ?? initialTrade.ts);
+      const closeTs = initialTrade.close_ts !== null && initialTrade.close_ts !== undefined
+        ? Number(initialTrade.close_ts) : Number(config.range.end);
+      setPairView(openTs - contextMs, closeTs);
+    } else {
+      ensureMonthsLoaded(state.viewStart, state.viewEnd).then(scheduleRender);
+    }
   </script>
 </body>
 </html>

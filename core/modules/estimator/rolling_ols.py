@@ -33,6 +33,8 @@ class RollingOLSEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.model_lookback_bars = max(10, int(model_lookback_bars))
         self.model_update_interval_bars = max(1, int(model_update_interval_bars))
         if position_update_policy not in {"update", "freeze"}:
@@ -57,6 +59,10 @@ class RollingOLSEstimator:
             1, int(hedge_model_update_interval_bars or self.model_update_interval_bars)
         )
         self.hedge_regression_method = hedge_regression_method or regression_method
+        if self.hedge_regression_method not in {"log_price", "price"}:
+            raise ValueError(
+                f"unsupported hedge_regression_method: {self.hedge_regression_method}"
+            )
         signal_history_bars = self._price_bars_for(self.regression_method, self.model_lookback_bars)
         hedge_history_bars = self._price_bars_for(
             self.hedge_regression_method, self.hedge_model_lookback_bars
@@ -88,7 +94,7 @@ class RollingOLSEstimator:
         ready = self._model_ready(state)
         latest_spread = None
         if ready:
-            x_t, y_t = self._transform(state, x_close, y_close)
+            x_t, y_t = self._transform(x_close, y_close)
             latest_spread = float(y_t - (float(state.alpha or 0.0) + float(state.spread_beta) * x_t))
         result = self._output(state, bar_index, ready, latest_spread, has_position)
 
@@ -277,30 +283,20 @@ class RollingOLSEstimator:
         if method == "log_price":
             x_arr = np.log(np.clip(x_arr, 1e-12, None))
             y_arr = np.log(np.clip(y_arr, 1e-12, None))
-        elif method in {"log_return", "log_returns"}:
-            x_arr = np.diff(np.log(np.clip(x_arr, 1e-12, None)))
-            y_arr = np.diff(np.log(np.clip(y_arr, 1e-12, None)))
-        elif method not in {"price", "raw_price"}:
+        elif method != "price":
             raise ValueError(f"unsupported regression_method: {method}")
         mask = np.isfinite(x_arr) & np.isfinite(y_arr)
         x_arr, y_arr = x_arr[mask], y_arr[mask]
         return (x_arr, y_arr) if len(x_arr) >= 10 else (None, None)
 
-    def _transform(self, state, x_close, y_close):
+    def _transform(self, x_close, y_close):
         if self.regression_method == "log_price":
             return log(max(float(x_close), 1e-12)), log(max(float(y_close), 1e-12))
-        if self.regression_method in {"log_return", "log_returns"}:
-            if not state.x_close_history or not state.y_close_history:
-                raise ValueError("log_return requires a previous close")
-            return (
-                log(max(float(x_close), 1e-12) / max(float(state.x_close_history[-1]), 1e-12)),
-                log(max(float(y_close), 1e-12) / max(float(state.y_close_history[-1]), 1e-12)),
-            )
         return float(x_close), float(y_close)
 
     @staticmethod
     def _price_bars_for(method, observations):
-        return int(observations) + 1 if method in {"log_return", "log_returns"} else int(observations)
+        return int(observations)
 
     @staticmethod
     def _ols(x_arr, y_arr):

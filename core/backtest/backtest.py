@@ -4,6 +4,7 @@ from pathlib import Path
 
 import polars as pl
 
+from core.backtest.curve_buffer import ColumnarRowBuffer, NumericCurveBuffer, PAIR_STATE_SCHEMA
 from core.modules.config import Config, load_config
 from core.modules.data import build_funding_map, iter_csv_bars, load_csv_data, load_funding_data
 from core.modules.exchange import ExchangeManager
@@ -29,7 +30,16 @@ class BacktestResult:
 
 
 class Backtest:
-    def __init__(self, config: Config, strategy=None, risk_manager=None, exchange_manager=None, show_progress: bool = True):
+    def __init__(
+        self,
+        config: Config,
+        strategy=None,
+        risk_manager=None,
+        exchange_manager=None,
+        show_progress: bool = True,
+        progress_callback=None,
+        progress_interval_bars: int = 100_000,
+    ):
         self.config = config
         self.strategy = strategy or self._build_strategy()
         # Backtest market iterators already normalize and validate every bar.
@@ -43,11 +53,13 @@ class Backtest:
         # becomes quadratic on trade-heavy runs.
         self.exchange_manager.include_trade_history_on_bar = False
         self.show_progress = show_progress
+        self.progress_callback = progress_callback
+        self.progress_interval_bars = max(1, int(progress_interval_bars))
         self.orders = []
         self.trades = []
-        self.position_curve = []
-        self.signal_curve = []
-        self.pair_curve = []
+        self.position_curve = NumericCurveBuffer()
+        self.signal_curve = NumericCurveBuffer()
+        self.pair_curve = ColumnarRowBuffer(PAIR_STATE_SCHEMA)
         self.diagnostic_sample_interval_bars = int(
             (self.config.risk or {}).get("diagnostic_sample_interval_bars", 60)
         )
@@ -62,6 +74,7 @@ class Backtest:
         previous_ts = None
         last_bars = None
 
+        processed_bars = 0
         for bars in tqdm(
             self._iter_market_bars(market_data),
             total=self._market_progress_total(market_data),
@@ -71,6 +84,12 @@ class Backtest:
             mininterval=1.0,
             disable=not self.show_progress,
         ):
+            processed_bars += 1
+            if (
+                self.progress_callback
+                and processed_bars % self.progress_interval_bars == 0
+            ):
+                self.progress_callback(processed_bars)
             last_bars = bars
             ts = self._bars_ts(bars)
             if self.config.funding_enabled:
@@ -95,7 +114,13 @@ class Backtest:
             self.position_curve.append(self._position_snapshot(ts, bars, exchange_result))
             new_trades = exchange_result["new_trades"]
             rejected_orders = exchange_result["rejected_orders"]
+            forced_deleveraging_orders = exchange_result.get("forced_deleveraging_orders", [])
+            if forced_deleveraging_orders:
+                self.orders.extend(forced_deleveraging_orders)
             self.strategy.on_funding_rates(funding_rates)
+            funding_callback = getattr(self.strategy, "on_funding_payments", None)
+            if callable(funding_callback):
+                funding_callback(exchange_result.get("funding_payments", []))
             previous_ts = ts
 
             if new_trades:
@@ -110,13 +135,14 @@ class Backtest:
             self.strategy.set_portfolio_context(
                 cash=portfolio_snapshot.get("cash", 0),
                 equity=portfolio_snapshot.get("equity", 0),
+                available_balance=portfolio_snapshot.get("available_balance", 0),
             )
             orders = self.strategy(bars)
             should_record_diagnostics = self._should_record_diagnostics(orders, new_trades, rejected_orders)
             # Z-score is part of the minute-level trade path and must never be
-            # sampled.  The heavier diagnostic fields are still recorded only
-            # on events and at the configured diagnostic interval.
-            self._record_signal_state(ts, detailed=should_record_diagnostics)
+            # sampled.  Model parameters are stored in the sparse pair-state
+            # curve below, avoiding a hundreds-of-columns minute-level table.
+            self._record_signal_state(ts)
             self._record_pair_state(ts, should_record_diagnostics)
             if not orders:
                 continue
@@ -145,6 +171,7 @@ class Backtest:
             benchmark_returns=self._benchmark_returns(market_data),
             hedge_ratio_tolerance=float(self.config.risk.get("order_hedge_ratio_tolerance", 0.02)),
         )
+        metrics.update(self._account_audit_metrics())
 
         return BacktestResult(
             metrics=metrics,
@@ -160,7 +187,12 @@ class Backtest:
         )
 
     def _build_strategy(self):
-        return build_strategy(self.config.strategy, self.config.symbols)
+        return build_strategy(
+            self.config.strategy,
+            self.config.symbols,
+            fee_rate=self.config.fee_rate,
+            slippage_bps=self.config.slippage_bps,
+        )
 
     def _build_exchange_manager(self):
         exchange_names = []
@@ -176,11 +208,13 @@ class Backtest:
             fee_rate=self.config.fee_rate,
             slippage_bps=self.config.slippage_bps,
             max_leverage=self._max_leverage(),
+            pending_timeout_bars=int((self.config.strategy.pipeline.get("execution", {}) or {}).get("pending_timeout_bars", 0)),
         )
 
     def _max_leverage(self):
-        if self._risk_pass_through_enabled():
-            return float("inf")
+        # Exchange margin is an account invariant, not an optional RiskManager
+        # filter.  ``risk.enabled: false`` and ``mode: pass_through`` may skip
+        # strategy-level checks but must never create unlimited buying power.
         raw_value = self.config.risk.get("max_leverage", 1.0)
         if raw_value is None:
             return 1.0
@@ -188,15 +222,6 @@ class Backtest:
         if max_leverage <= 0:
             raise ValueError("risk.max_leverage must be positive")
         return max_leverage
-
-    def _risk_pass_through_enabled(self):
-        risk_config = self.config.risk or {}
-        mode = str(risk_config.get("mode", "")).strip().lower()
-        if mode in {"pass_through", "passthrough", "disabled", "off", "none"}:
-            return True
-        if "enabled" in risk_config:
-            return not self._as_bool(risk_config.get("enabled"))
-        return False
 
     def _as_bool(self, value):
         if isinstance(value, bool):
@@ -475,14 +500,20 @@ class Backtest:
             }
 
         total_cash = 0.0
-        total_position_value = 0.0
+        total_unrealized_pnl = 0.0
+        total_used_margin = 0.0
+        total_available_balance = 0.0
         total_long_value = 0.0
         total_short_value = 0.0
         positions = {}
 
         for exchange_name, exchange in self.exchange_manager.exchanges.items():
             exchange_positions = {}
-            total_cash += exchange.cash
+            exchange._update_account(exchange.last_bars, price_field="close")
+            total_cash += exchange.wallet_balance
+            total_unrealized_pnl += exchange.unrealized_pnl
+            total_used_margin += exchange.used_margin
+            total_available_balance += exchange.available_balance
 
             for symbol, quantity in exchange.positions.items():
                 price = self._close_price(bars, exchange_name, symbol)
@@ -492,7 +523,6 @@ class Backtest:
                 quantity = float(quantity)
                 value = quantity * price
                 abs_value = abs(value)
-                total_position_value += value
                 if value > 0:
                     total_long_value += abs_value
                 elif value < 0:
@@ -507,11 +537,16 @@ class Backtest:
 
             positions[exchange_name] = exchange_positions
 
-        equity = total_cash + total_position_value
+        equity = total_cash + total_unrealized_pnl
         return {
             "ts": self._bars_ts(bars),
             "cash": total_cash,
-            "position_value": total_position_value,
+            # Kept for report compatibility; futures positions contribute
+            # unrealized PnL rather than their signed notional value.
+            "position_value": total_unrealized_pnl,
+            "unrealized_pnl": total_unrealized_pnl,
+            "used_margin": total_used_margin,
+            "available_balance": total_available_balance,
             "long_value": total_long_value,
             "short_value": total_short_value,
             "gross_exposure": total_long_value + total_short_value,
@@ -521,33 +556,79 @@ class Backtest:
         }
 
     def _position_snapshot(self, ts, bars, exchange_result):
+        """Record only portfolio-level exposure needed by reports.
+
+        Per-symbol minute values made a 97-Pair run exceed a gigabyte on disk
+        and tens of gigabytes in Python objects.  Pair pages reconstruct their
+        own position paths exactly from fills and raw prices, so duplicating
+        every symbol here is unnecessary.
+        """
         equity = float(exchange_result["equity"])
         snapshot = {
             "ts": ts,
             "equity": equity,
             "cash": float(exchange_result["cash"]),
+            "wallet_balance": float(exchange_result.get("wallet_balance", exchange_result["cash"])),
+            "unrealized_pnl": float(exchange_result.get("unrealized_pnl", 0.0)),
+            "used_margin": float(exchange_result.get("used_margin", 0.0)),
+            "available_balance": float(exchange_result.get("available_balance", 0.0)),
+            "open_pair_count": float(exchange_result.get("open_pair_count", 0)),
+            "pending_open_pair_count": float(exchange_result.get("pending_open_pair_count", 0)),
+            "margin_deficit": float(exchange_result.get("margin_deficit", 0.0)),
+            "forced_deleveraging_triggered": bool(
+                exchange_result.get("forced_deleveraging_triggered", False)
+            ),
+            "forced_deleveraging_scale": float(
+                exchange_result.get("forced_deleveraging_scale", 0.0)
+            ),
             "gross_exposure": 0.0,
             "net_exposure": 0.0,
         }
-        for symbol in self._active_symbols():
-            snapshot[f"{symbol}_position_value"] = 0.0
-            snapshot[f"{symbol}_position_ratio"] = 0.0
 
-        for exchange_name, positions in exchange_result["positions"].items():
-            for symbol, quantity in positions.items():
-                price = self._close_price(bars, exchange_name, symbol)
-                if price is None:
-                    continue
+        net_exposure = float(exchange_result.get("net_exposure", 0.0))
+        gross_exposure = float(exchange_result.get("gross_exposure", 0.0))
+        snapshot["gross_exposure"] = gross_exposure
+        snapshot["net_exposure"] = net_exposure
 
-                value = float(quantity) * price
-                snapshot[f"{symbol}_position_value"] = value
-                snapshot[f"{symbol}_position_ratio"] = value / equity if equity else None
-                snapshot["gross_exposure"] += abs(value)
-                snapshot["net_exposure"] += value
-
-        snapshot["gross_exposure_ratio"] = snapshot["gross_exposure"] / equity if equity else None
+        free_cash = max(0.0, snapshot["available_balance"])
+        occupied_capital = max(0.0, snapshot["used_margin"])
+        allocatable_capital = occupied_capital + free_cash
+        snapshot["free_cash"] = free_cash
+        snapshot["raw_gross_exposure_ratio"] = (
+            snapshot["gross_exposure"] / equity if equity else None
+        )
+        snapshot["gross_exposure_ratio"] = (
+            occupied_capital / allocatable_capital
+            if allocatable_capital > 0 else 0.0
+        )
         snapshot["net_exposure_ratio"] = snapshot["net_exposure"] / equity if equity else None
+        snapshot["margin_utilization"] = snapshot["gross_exposure_ratio"]
         return snapshot
+
+    def _account_audit_metrics(self):
+        peak_open_pairs = 0
+        max_pending_pairs = 0
+        max_margin_utilization = 0.0
+        min_available_balance = None
+        for row in self.position_curve:
+            peak_open_pairs = max(peak_open_pairs, int(row.get("open_pair_count") or 0))
+            max_pending_pairs = max(max_pending_pairs, int(row.get("pending_open_pair_count") or 0))
+            utilization = row.get("margin_utilization")
+            if utilization is not None:
+                max_margin_utilization = max(max_margin_utilization, float(utilization))
+            available = row.get("available_balance")
+            if available is not None:
+                available = float(available)
+                min_available_balance = (
+                    available if min_available_balance is None
+                    else min(min_available_balance, available)
+                )
+        return {
+            "peak_open_pair_count": peak_open_pairs,
+            "max_pending_open_pair_count": max_pending_pairs,
+            "max_margin_utilization": max_margin_utilization,
+            "min_available_balance": min_available_balance,
+        }
 
     def _close_price(self, bars, exchange_name, symbol):
         bar = bars.get(exchange_name, {}).get(symbol)
@@ -601,6 +682,8 @@ class Backtest:
                 "cointegration_stat": st.estimator_state.cointegration_stat,
                 "cointegration_block_open": st.estimator_state.cointegration_block_open,
                 "cointegration_reason": st.estimator_state.cointegration_reason,
+                "last_model_update_index": st.estimator_state.last_model_update_index,
+                "last_hedge_model_update_index": st.estimator_state.last_hedge_model_update_index,
                 "next_model_update_index": st.estimator_state.next_model_update_index,
                 "next_hedge_model_update_index": st.estimator_state.next_hedge_model_update_index,
                 "last_model_update_skip_index": st.estimator_state.last_model_update_skip_index,
@@ -641,7 +724,17 @@ class Backtest:
         return frame.join(benchmark, on="ts", how="left")
 
 
-def run_backtest(config_path: str | Path = "config/config.yaml", show_progress: bool = True) -> BacktestResult:
+def run_backtest(
+    config_path: str | Path = "config/config.yaml",
+    show_progress: bool = True,
+    progress_callback=None,
+    progress_interval_bars: int = 100_000,
+) -> BacktestResult:
     config = load_config(config_path)
-    backtest = Backtest(config, show_progress=show_progress)
+    backtest = Backtest(
+        config,
+        show_progress=show_progress,
+        progress_callback=progress_callback,
+        progress_interval_bars=progress_interval_bars,
+    )
     return backtest.run()

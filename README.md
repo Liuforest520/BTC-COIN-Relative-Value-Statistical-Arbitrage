@@ -8,7 +8,7 @@
 
 - 按分钟流式读取多个标的的 K 线，避免一次性载入全部行情；
 - 对每个 Pair 独立估计 Alpha、Beta、残差及残差 ADF 指标；
-- 支持 Price、Log Price、Log Return 三类回归输入；
+- 支持 Price、Log Price 两类回归输入；
 - 支持 11 类滚动或在线 Beta 估计器；
 - 通过残差 Z-score、两阶段入场和均值回归过滤生成信号；
 - 支持固定名义、Beta-neutral 和 Volatility-neutral 仓位计算；
@@ -108,7 +108,7 @@ data:
   symbols: {}
 
 backtest:
-  initial_cash: 100000
+  initial_cash: 3000000
   start_time: "2025-01-01"
 
 active_setup: multi_pair_beta
@@ -122,6 +122,7 @@ setups:
       sizing: {}
       portfolio: {}
       execution: {}
+      rebalance: {}
 
 cost:
   fee_rate: 0.0005
@@ -133,22 +134,23 @@ risk:
   mode: pass_through
 ```
 
-当前默认配置包含 15 个 Pair，其中 10 个加密资产 Pair、5 个 TradFi 相关 Pair。默认核心参数为：
+当前默认配置使用配置文件中启用的 Pair 及其逐 Pair 目标资金，回测区间 2024-01-01 至 2025-06-30。默认核心参数为：
 
 | 配置项 | 当前值 |
 | --- | --- |
-| Estimator | `rolling_ols` |
+| Estimator | `tls` |
 | Regression | `log_price` |
-| Model lookback | `28800` 分钟，即 20 天 |
-| Model update | `1440` 分钟，即 1 天 |
-| Signal | `zscore_reversion` |
-| Entry / Exit Z-score | `1.75 / 0.5` |
-| Sizing | `beta_neutral` |
-| Portfolio | `equal_weight` + `equal_cap` |
+| Model lookback | `2880` 分钟，即 2 天 |
+| Model update | `240` 分钟，即 4 小时（持仓期 `freeze`） |
+| Signal | `zscore_reversion_ma`（短均线 30、长均线 120） |
+| Entry / Exit Z-score | `3.0 / 0.5` |
+| Sizing | `beta_neutral`（收益 β 窗口 1440） |
+| Portfolio | `pair_target_capital`；每个 Pair 在 `pairs[].target_capital` 中配置目标毛资金，不设置并发 Pair 数或单币种上限；账户可用保证金不足时按比例缩放 |
 | Fee rate | `0.0005` |
 | Slippage | `1 bps` |
-| Funding | 默认关闭 |
-| Risk | 默认 `pass_through` |
+| Funding | `funding_enabled: true` |
+| Protection | 理论 X 止损、Pair 净亏损止损、止盈和最长持仓均可独立配置 |
+| Risk | `pass_through` 只跳过可选的下单前风控；Exchange 始终执行 `max_leverage: 1.0`、保证金和可用余额检查 |
 
 修改配置时，`pairs` 中使用的标的必须已经存在于 `data.symbols`。回测只加载当前启用 Pair 所需的数据，不会无条件读取配置中的全部标的。
 
@@ -162,21 +164,26 @@ risk:
 - `dols`
 - `ewls`
 - `huber`
-- `age_weighted_wls`
-- `residual_weighted_wls`
 - `winsorized_ols`
 - `rls`
 - `kalman`
 
 ### Signal
 
-- `zscore`：固定阈值、分位数或自适应阈值；
-- `zscore_reversion`：支持两阶段触发、均值回归过滤和多种持仓退出 Z-score 算法。
+三选一（`signal.method`），互斥，配置里只写用得到的参数：
+
+- `simple_zscore`：打到 `±entry_z` 立刻开仓，无确认层（旧名 `zscore` 等价）；
+- `zscore_reversion_two_stage`：先武装（`two_stage_trigger_z`），z 回落到 `two_stage_entry_z ± two_stage_entry_window_z` 才开仓，超时 / 穿零 / 反向破带作废（`two_stage_max_wait_bars`）；
+- `zscore_reversion_ma`：打到 `±entry_z` 后还要求 z 的短均线相对长均线朝均值方向走（`reversion_ma_lookback_bars`）。
+
+`entry_rule_method`（`fixed_z` / `percentile`）对三者都适用。旧名 `zscore_reversion` 是历史合并类（同时受 `two_stage_enabled` 与 `reversion_filter_enabled` 控制），仅用于复现旧配置，会在日志里提示迁移。
 
 ### Sizing 与 Portfolio
 
 - Sizing：`fixed_notional`、`beta_neutral`、`volatility_neutral`；
-- Portfolio：`equal_weight`、`risk_parity`、`min_variance`、`constrained_qp`、`max_sharpe`。
+- Portfolio：当前使用 `pair_target_capital`。每个 Pair 在 `pairs[].target_capital` 中声明完整两腿的目标资金，分配器按交易所实际可用保证金顺序分配；资金不足时，只有达到 `minimum_entry_capital_ratio` 的候选才进入开仓计划。旧的 `equity_slot`、`equal_weight`、`risk_parity`、`min_variance`、`constrained_qp`、`max_sharpe` 名称仅保留配置兼容，不再执行旧的槽位或风险权重逻辑。
+
+开多和开空都会占用保证金，开空不会增加可用资金；在 1 倍杠杆下，保证金占用等于所有持仓腿绝对名义金额之和。订单在下一根可成交 K 线开盘按实际价格重新检查资金，资金不足时 Pair 两腿按同一比例部分成交，以保持原资金配比。资金不足且启用调仓时，系统会在同一根策略 Bar 一次性选择需要释放的最差浮动净收益 Pair，先提交平仓，待下一根可成交 K 线平仓完成后再执行替换开仓。
 
 ## 单次回测
 
@@ -212,7 +219,7 @@ results/backtests/<run_name>/
 - `final_position_valuation.json`：结束时未平仓仓位估值；
 - `pair_metrics.csv`、`return_attribution.csv`、`risk_attribution.csv`：Pair 指标与归因；
 - `summary.md`：本次回测的 Markdown 摘要；
-- `portfolio_summary.html`：组合资金曲线总览；
+- `portfolio_summary.png`：组合资金曲线与核心指标图片；
 - `trade_review.html`：组合与单 Pair 交易复盘入口。
 
 ## 参数 Sweep
@@ -231,7 +238,7 @@ python scripts/run_config_sweep.py <sweep配置.yaml> --workers 8
 
 Sweep 支持多进程并行、快速汇总模式、结果排序，以及对排名靠前的配置补跑完整报告。已完成的 Sweep 定义保存在 `config/sweeps/archive/`，自动展开的配置保存在其 `generated/` 子目录，但不会纳入版本控制。
 
-`config/tls_huber_selected_24/` 保存 24 个手工筛选的 TLS/Huber 单次回测配置，这些配置应逐个传给 `scripts/run_backtest.py`，不通过 Sweep 展开。
+`config/tls_huber_selected_12/` 保存 12 个仅使用 Price/Log Price 的 TLS/Huber 单次回测配置，这些配置应逐个传给 `scripts/run_backtest.py`，不通过 Sweep 展开。
 
 ## 查看 HTML 报告
 
@@ -276,7 +283,7 @@ maintenance/                历史迁移和数据检查工具
 research/scripts/           阶段性模型研究脚本
 config/archive/             历史主配置
 config/sweeps/archive/      已完成的 Sweep 定义
-config/tls_huber_selected_24/ 手工精选的单次回测配置
+config/tls_huber_selected_12/ 手工精选的 Price/Log Price 单次回测配置
 data/                       本地行情数据，不上传
 results/                    回测和 Sweep 结果，不上传
 documents/                  本地研究资料，不上传

@@ -31,11 +31,11 @@ class DOLSEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.model_lookback_bars = max(10, int(model_lookback_bars))
         self.model_update_interval_bars = max(1, int(model_update_interval_bars))
-        self.price_history_bars = self.model_lookback_bars + (
-            1 if regression_method in {"log_return", "log_returns"} else 0
-        )
+        self.price_history_bars = self.model_lookback_bars
         self.warmup_bars = self.price_history_bars
         if position_update_policy not in {"update", "freeze"}:
             raise ValueError("position_update_policy must be 'update' or 'freeze'")
@@ -55,7 +55,7 @@ class DOLSEstimator:
         ready = self._model_ready(state)
         latest_spread = None
         if ready:
-            x_t, y_t = self._transform(state, x_close, y_close)
+            x_t, y_t = self._transform(x_close, y_close)
             latest_spread = float(y_t - (float(state.alpha or 0.0) + float(state.spread_beta) * x_t))
         output = self._output(state, bar_index, ready, latest_spread, has_position)
 
@@ -210,23 +210,15 @@ class DOLSEstimator:
             return None, None
         if self.regression_method == "log_price":
             x_arr, y_arr = np.log(np.clip(x_arr, 1e-12, None)), np.log(np.clip(y_arr, 1e-12, None))
-        elif self.regression_method in {"log_return", "log_returns"}:
-            x_arr = np.diff(np.log(np.clip(x_arr, 1e-12, None)))
-            y_arr = np.diff(np.log(np.clip(y_arr, 1e-12, None)))
-        elif self.regression_method not in {"price", "raw_price"}:
+        elif self.regression_method != "price":
             raise ValueError(f"unsupported regression_method: {self.regression_method}")
         mask = np.isfinite(x_arr) & np.isfinite(y_arr)
         x_arr, y_arr = x_arr[mask], y_arr[mask]
         return (x_arr, y_arr) if len(x_arr) >= 10 else (None, None)
 
-    def _transform(self, state, x_close, y_close):
+    def _transform(self, x_close, y_close):
         if self.regression_method == "log_price":
             return log(max(float(x_close), 1e-12)), log(max(float(y_close), 1e-12))
-        if self.regression_method in {"log_return", "log_returns"}:
-            return (
-                log(max(float(x_close), 1e-12) / max(float(state.x_close_history[-1]), 1e-12)),
-                log(max(float(y_close), 1e-12) / max(float(state.y_close_history[-1]), 1e-12)),
-            )
         return float(x_close), float(y_close)
 
     def _update_due(self, state, bar_index):

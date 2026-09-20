@@ -210,6 +210,50 @@ class SizingState:
     target_hedge_ratio: float | None = None
 
 
+@dataclass
+class PositionProtectionState:
+    """Frozen model and accounting basis for one pair position."""
+
+    active: bool = False
+    pending_exit: bool = False
+    side: str | None = None
+    position_id: str | None = None
+    entry_bar_index: int | None = None
+    entry_ts: int | None = None
+    entry_x_price: float | None = None
+    entry_y_price: float | None = None
+    entry_x_quantity: float = 0.0
+    entry_y_quantity: float = 0.0
+    entry_gross_notional: float = 0.0
+    entry_fee: float = 0.0
+    entry_slippage: float = 0.0
+    funding_cost: float = 0.0
+    alpha: float | None = None
+    beta: float | None = None
+    spread_mean: float | None = None
+    spread_std: float | None = None
+    exit_z: float | None = None
+    stop_loss_x_price: float | None = None
+    stop_loss_direction: str | None = None
+    stop_loss_net_pnl: float | None = None
+    stop_loss_reason: str | None = None
+    take_profit_return: float | None = None
+    pair_loss_stop_return: float | None = None
+    pair_loss_stop_freeze_bars: int = 0
+    pair_loss_stop_freeze_until_bar: int | None = None
+    protection_rule: str | None = None
+    freeze_rule: str | None = None
+    freeze_bars: int = 0
+    freeze_until_bar: int | None = None
+    max_holding_bars: int | None = None
+    max_holding_deadline_bar: int | None = None
+    close_bar_index: int | None = None
+    reopen_lock_pending: bool = False
+    last_trigger: str | None = None
+    last_exit_reason: str | None = None
+    last_exit_class: str | None = None
+
+
 # ---- Portfolio ----
 
 @dataclass
@@ -221,11 +265,19 @@ class PortfolioState:
     pair_return_history: dict[str, list[float]] = field(default_factory=dict)
     covariance_matrix: Any = None
 
+    # Diagnostics for currently occupied Pair capital.  These fields are no
+    # longer a concurrency limit; Pair target capital and exchange margin are
+    # the authoritative constraints.
+    open_pair_count: int = 0
+    open_pair_ids: list[str] = field(default_factory=list)
+
     portfolio_gross_exposure: float = 0.0
     portfolio_net_exposure: float = 0.0
     symbol_exposure_map: dict[str, float] = field(default_factory=dict)
     selected_pair_ids: list[str] = field(default_factory=list)
     last_allocation_reason: str = ""
+    equity: float = 0.0
+    available_balance: float = 0.0
 
 
 # ---- Aggregate pair state ----
@@ -241,6 +293,7 @@ class PairRuntimeState:
     estimator_state: EstimatorState = field(default_factory=EstimatorState)
     signal_state: SignalState = field(default_factory=SignalState)
     sizing_state: SizingState = field(default_factory=SizingState)
+    protection_state: PositionProtectionState = field(default_factory=PositionProtectionState)
     portfolio_state: PortfolioState = field(default_factory=PortfolioState)
 
     last_block_reason: str = ""
@@ -267,6 +320,7 @@ class RawPairTarget:
     long_vol: float | None = None
     short_vol: float | None = None
     gross_notional: float = 0.0
+    target_capital: float | None = None
     signal_strength: float = 0.0
     reason: str = ""
     para: dict = field(default_factory=dict)

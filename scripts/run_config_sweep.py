@@ -13,10 +13,12 @@ for _thread_env in (
 from pathlib import Path
 import argparse
 import csv
+import json
 import subprocess
 import sys
 import time
 import traceback
+import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import yaml
@@ -31,6 +33,7 @@ from core.backtest import run_backtest
 from core.backtest.sweep_backtest import run_sweep_backtest
 from core.modules.logger import logger
 from core.modules.reporting import export_backtest_report
+from core.modules.reporting.equity_summary import export_equity_summary_image
 
 
 def main():
@@ -56,6 +59,10 @@ def main():
     top_backtest_result_path = resolve_path(
         sweep.get("top_backtest_result_path", result_path.with_name(f"{result_path.stem}_top5.csv"))
     )
+    export_each_equity_curve = _as_bool(sweep.get("export_each_equity_curve", False))
+    equity_curve_output_dir = resolve_path(
+        sweep.get("equity_curve_output_dir", result_path.parent / "equity_curves")
+    )
 
     rows = read_manifest(manifest_path)
     result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +74,7 @@ def main():
         fast_summary=fast_summary,
         workers=workers,
         progress_interval_bars=progress_interval_bars,
+        equity_curve_output_dir=equity_curve_output_dir if export_each_equity_curve else None,
     )
 
     results = sort_results(results, sort_by)
@@ -80,6 +88,8 @@ def main():
     logger.info("top backtest count: {}", len(top_results))
     logger.info("top backtest results: {}", top_backtest_result_path)
     logger.info("top backtest reports: {}", top_backtest_output_dir)
+    if export_each_equity_curve:
+        logger.info("equity curves: {}", equity_curve_output_dir)
 
 
 def run_sweep_batch(batch_path, batch, cli_workers=None):
@@ -141,8 +151,8 @@ def read_manifest(path):
         return list(csv.DictReader(f))
 
 
-def run_sweep_rows(rows, fast_summary=True, workers=4, progress_interval_bars=100_000):
-    tasks = [(row, fast_summary, progress_interval_bars) for row in rows]
+def run_sweep_rows(rows, fast_summary=True, workers=4, progress_interval_bars=100_000, equity_curve_output_dir=None):
+    tasks = [(row, fast_summary, progress_interval_bars, equity_curve_output_dir) for row in rows]
     if workers <= 1 or len(tasks) <= 1:
         return [
             run_sweep_row(task)
@@ -172,8 +182,12 @@ def run_sweep_row(task):
     if len(task) == 2:
         row, fast_summary = task
         progress_interval_bars = 100_000
-    else:
+        equity_curve_output_dir = None
+    elif len(task) == 3:
         row, fast_summary, progress_interval_bars = task
+        equity_curve_output_dir = None
+    else:
+        row, fast_summary, progress_interval_bars, equity_curve_output_dir = task
     result_row = dict(row)
     config_path = resolve_path(row["config_path"])
     config_id = row.get("config_id", config_path.stem)
@@ -200,12 +214,57 @@ def run_sweep_row(task):
         result_row["orders"] = len(result.orders)
         result_row["trades"] = len(result.trades)
         result_row["risk_checks"] = len(result.risk_history)
+        if equity_curve_output_dir is not None:
+            try:
+                report_dir = export_sweep_equity_curve(
+                    result=result,
+                    config_path=config_path,
+                    row=row,
+                    output_root=equity_curve_output_dir,
+                )
+                result_row["equity_curve_dir"] = display_path(report_dir)
+                result_row["equity_curve_csv"] = display_path(report_dir / "equity_curve.csv")
+                result_row["equity_curve_png"] = display_path(report_dir / "portfolio_summary.png")
+                result_row["equity_curve_error"] = ""
+            except Exception as exc:
+                result_row["equity_curve_error"] = f"{type(exc).__name__}: {exc}"
+                logger.exception("equity curve export failed for {}: {}", config_id, exc)
         result_row["error"] = ""
     except Exception as exc:
         result_row["error"] = str(exc)
         result_row["traceback"] = traceback.format_exc()
 
     return result_row
+
+
+def export_sweep_equity_curve(result, config_path, row, output_root):
+    """Export the compact sweep equity curve without rerunning a detailed report."""
+    config_id = safe_name(row.get("config_id") or Path(config_path).stem)
+    experiment_name = safe_name(row.get("experiment_name") or Path(config_path).stem)
+    report_dir = Path(output_root) / f"{config_id}_{experiment_name}"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    equity_curve = result.equity_curve
+    if isinstance(equity_curve, dict):
+        timestamps = list(equity_curve.get("ts", []))
+        equities = list(equity_curve.get("equity", []))
+    else:
+        timestamps = [item.get("ts") for item in equity_curve]
+        equities = [item.get("equity") for item in equity_curve]
+    if len(timestamps) != len(equities):
+        raise ValueError("equity curve timestamps and values have different lengths")
+
+    with (report_dir / "equity_curve.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["ts", "equity"])
+        writer.writeheader()
+        writer.writerows({"ts": ts, "equity": equity} for ts, equity in zip(timestamps, equities))
+    (report_dir / "metrics.json").write_text(
+        json.dumps(result.metrics, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    shutil.copyfile(config_path, report_dir / "config.yaml")
+    export_equity_summary_image(result, report_dir / "portfolio_summary.png")
+    return report_dir
 
 
 def _initialize_worker():
@@ -271,6 +330,9 @@ def run_top_backtests(rows, count, output_dir):
                 config_path,
                 output_root=output_dir,
                 run_name=top_run_name(rank, row),
+                # Sweeps rank many configs; the per-pair chart set is only
+                # wanted for the full single-run report.
+                include_curve_charts=False,
             )
             result_row.update(result.metrics)
             result_row["orders"] = len(result.orders)

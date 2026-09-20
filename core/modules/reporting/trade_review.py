@@ -6,6 +6,7 @@ from html import escape
 from math import exp, isfinite, log
 from json import dumps, loads
 from pathlib import Path
+from time import perf_counter
 
 import polars as pl
 import yaml
@@ -15,7 +16,6 @@ from core.modules.reporting.pair_summary import (
     build_pair_summary,
     required_position_columns,
 )
-
 from core.modules.logger import logger
 from core.modules.reporting.review_assets import (
     OVERVIEW_TEMPLATE,
@@ -23,12 +23,15 @@ from core.modules.reporting.review_assets import (
     REVIEW_CSS,
     REVIEW_JS,
 )
+from core.modules.reporting.utils import (
+    REPORT_BOOL_COLUMNS,
+    REPORT_INT_COLUMNS,
+    REPORT_STRING_COLUMNS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT = ROOT / "results" / "review" / "trade_review.html"
-
-
 def latest_backtest_dir() -> Path:
     backtest_root = ROOT / "results" / "backtests"
     runs = [path for path in backtest_root.iterdir() if path.is_dir()]
@@ -41,12 +44,37 @@ def read_frame(path: Path, columns: list[str] | None = None) -> pl.DataFrame:
     if not path.exists():
         return _empty_frame(columns)
     try:
+        requested = columns or []
+        schema_overrides = {
+            column: pl.Utf8
+            for column in requested
+            if column in REPORT_STRING_COLUMNS
+        }
+        schema_overrides.update(
+            {
+                column: pl.Boolean
+                for column in requested
+                if column in REPORT_BOOL_COLUMNS
+            }
+        )
+        schema_overrides.update(
+            {
+                column: pl.Int64
+                for column in requested
+                if column in REPORT_INT_COLUMNS
+            }
+        )
         if columns is None:
             frame = pl.read_csv(path, infer_schema_length=10000)
         else:
             available = set(pl.scan_csv(path).collect_schema().names())
             selected = [column for column in columns if column in available]
-            frame = pl.read_csv(path, columns=selected, infer_schema_length=10000)
+            frame = pl.read_csv(
+                path,
+                columns=selected,
+                schema_overrides=schema_overrides or None,
+                infer_schema_length=10000,
+            )
     except Exception:
         return _empty_frame(columns)
     if columns is None:
@@ -155,7 +183,14 @@ def empty_window(name: str) -> dict:
 def trade_rows(trades: pl.DataFrame, signal: pl.DataFrame | None = None) -> list[dict]:
     if trades.is_empty():
         return []
-    for column in ("target_hedge_ratio", "funding_fee"):
+    for column in (
+        "target_hedge_ratio", "funding_fee", "exit_reason", "protection_trigger",
+        "exit_class", "reopen_lock_pending",
+        "protection_stop_x_price", "protection_take_profit_return",
+        "protection_target_residual", "protection_stop_reason",
+        "protection_max_holding_bars", "protection_max_holding_deadline_bar",
+        "protection_rule", "protection_freeze_bars", "protection_freeze_until_bar",
+    ):
         if column not in trades.columns:
             trades = trades.with_columns(pl.lit(None).alias(column))
     group_columns = ["group_id", "action", "ts", "position_id"]
@@ -172,6 +207,19 @@ def trade_rows(trades: pl.DataFrame, signal: pl.DataFrame | None = None) -> list
         pl.col("slippage").sum().alias("slippage"),
         pl.col("funding_fee").sum().alias("funding_fee"),
         pl.col("target_hedge_ratio").drop_nulls().first().alias("target_hedge_ratio"),
+        pl.col("exit_reason").drop_nulls().first().alias("exit_reason"),
+        pl.col("protection_trigger").drop_nulls().first().alias("protection_trigger"),
+        pl.col("exit_class").drop_nulls().first().alias("exit_class"),
+        pl.col("reopen_lock_pending").drop_nulls().first().alias("reopen_lock_pending"),
+        pl.col("protection_stop_x_price").drop_nulls().first().alias("protection_stop_x_price"),
+        pl.col("protection_take_profit_return").drop_nulls().first().alias("protection_take_profit_return"),
+        pl.col("protection_target_residual").drop_nulls().first().alias("protection_target_residual"),
+        pl.col("protection_stop_reason").drop_nulls().first().alias("protection_stop_reason"),
+        pl.col("protection_max_holding_bars").drop_nulls().first().alias("protection_max_holding_bars"),
+        pl.col("protection_max_holding_deadline_bar").drop_nulls().first().alias("protection_max_holding_deadline_bar"),
+        pl.col("protection_rule").drop_nulls().first().alias("protection_rule"),
+        pl.col("protection_freeze_bars").drop_nulls().first().alias("protection_freeze_bars"),
+        pl.col("protection_freeze_until_bar").drop_nulls().first().alias("protection_freeze_until_bar"),
     ).sort("ts")
 
     rows = []
@@ -210,6 +258,19 @@ def trade_rows(trades: pl.DataFrame, signal: pl.DataFrame | None = None) -> list
                 "slippage": float(row["slippage"] or 0),
                 "funding_fee": float(row["funding_fee"] or 0),
                 "target_hedge_ratio": float(row["target_hedge_ratio"]) if row["target_hedge_ratio"] is not None else None,
+                "exit_reason": row.get("exit_reason"),
+                "protection_trigger": row.get("protection_trigger"),
+                "exit_class": row.get("exit_class"),
+                "reopen_lock_pending": row.get("reopen_lock_pending"),
+                "protection_stop_x_price": _float(row.get("protection_stop_x_price")),
+                "protection_take_profit_return": _float(row.get("protection_take_profit_return")),
+                "protection_target_residual": _float(row.get("protection_target_residual")),
+                "protection_stop_reason": row.get("protection_stop_reason"),
+                "protection_max_holding_bars": _int(row.get("protection_max_holding_bars")),
+                "protection_max_holding_deadline_bar": _int(row.get("protection_max_holding_deadline_bar")),
+                "protection_rule": row.get("protection_rule"),
+                "protection_freeze_bars": _int(row.get("protection_freeze_bars")),
+                "protection_freeze_until_bar": _int(row.get("protection_freeze_until_bar")),
             }
         )
     return _attach_trade_signal_context(rows, signal)
@@ -279,8 +340,24 @@ def _complete_trade_rows(
         )
         # For a closed position, costs are deducted explicitly from the no-cost PnL.
         net_pnl = gross_pnl - fee - slippage - trade_funding if close_ts is not None else None
-        open_state = _state_at(state_lookup, item.get("pair_id"), open_ts)
-        close_state = _state_at(state_lookup, item.get("pair_id"), close_ts) if close_ts is not None else None
+        # Orders execute on the following tradable bar.  Scenario parameters
+        # must therefore come from the signal timestamp, not a model update
+        # that may happen on the fill bar itself.
+        open_signal_ts = _first_value(opens, "signal_ts")
+        close_signal_ts = _last_value(closes, "signal_ts")
+        open_state = _state_at(
+            state_lookup,
+            item.get("pair_id"),
+            int(open_signal_ts) if open_signal_ts is not None else open_ts,
+        )
+        close_state = (
+            _state_at(
+                state_lookup,
+                item.get("pair_id"),
+                int(close_signal_ts) if close_signal_ts is not None else close_ts,
+            )
+            if close_ts is not None else None
+        )
 
         result.append(
             {
@@ -300,6 +377,19 @@ def _complete_trade_rows(
                 "close_legs": _join_event_legs(closes) if closes else None,
                 "open_zscore": _first_value(opens, "signal_zscore"),
                 "close_zscore": _last_value(closes, "signal_zscore"),
+                "exit_reason": _last_value(closes, "exit_reason"),
+                "protection_trigger": _last_value(closes, "protection_trigger"),
+                "exit_class": _last_value(closes, "exit_class"),
+                "reopen_lock_pending": _last_value(closes, "reopen_lock_pending"),
+                "protection_stop_x_price": _last_value(opens, "protection_stop_x_price"),
+                "protection_take_profit_return": _last_value(opens, "protection_take_profit_return"),
+                "protection_target_residual": _last_value(opens, "protection_target_residual"),
+                "protection_stop_reason": _last_value(opens, "protection_stop_reason"),
+                "protection_max_holding_bars": _int(_first_value(opens, "protection_max_holding_bars")),
+                "protection_max_holding_deadline_bar": _int(_first_value(opens, "protection_max_holding_deadline_bar")),
+                "protection_rule": _last_value(closes, "protection_rule"),
+                "protection_freeze_bars": _int(_last_value(closes, "protection_freeze_bars")),
+                "protection_freeze_until_bar": _int(_last_value(closes, "protection_freeze_until_bar")),
                 "open_fill_zscore": _first_value(opens, "fill_zscore"),
                 "close_fill_zscore": _last_value(closes, "fill_zscore"),
                 "open_notional": open_notional,
@@ -467,6 +557,8 @@ def _attach_trade_signal_context(rows: list[dict], signal: pl.DataFrame | None) 
     from bisect import bisect_left
 
     signal = signal.sort("ts")
+    ts_values = [int(value) for value in signal["ts"].to_list()]
+    available_columns = set(signal.columns)
     pair_ids = sorted({row.get("pair_id") for row in rows if row.get("pair_id")})
     signal_by_pair = {}
     for pair_id in pair_ids:
@@ -474,37 +566,52 @@ def _attach_trade_signal_context(rows: list[dict], signal: pl.DataFrame | None) 
         wanted = [
             "zscore", "action", "side", "alpha", "beta", "spread_beta",
             "spread_mean", "spread_std", "latest_spread",
+            "last_model_update_index",
         ]
-        columns = ["ts"] + [f"{prefix}{name}" for name in wanted if f"{prefix}{name}" in signal.columns]
-        if len(columns) == 1:
+        series = {
+            name: signal[f"{prefix}{name}"]
+            for name in wanted
+            if f"{prefix}{name}" in available_columns
+        }
+        if not series:
             continue
-        pair_rows = signal.select(columns).to_dicts()
-        ts_values = [int(row["ts"]) for row in pair_rows]
-        signal_by_pair[pair_id] = (ts_values, pair_rows, prefix)
+        signal_by_pair[pair_id] = series
 
     for row in rows:
         pair_id = row.get("pair_id")
         if pair_id not in signal_by_pair:
             continue
 
-        ts_values, pair_rows, prefix = signal_by_pair[pair_id]
+        series = signal_by_pair[pair_id]
         trade_ts = int(row["ts"])
         prev_idx = bisect_left(ts_values, trade_ts) - 1
         fill_idx = bisect_left(ts_values, trade_ts)
 
         if prev_idx >= 0:
-            prev = pair_rows[prev_idx]
-            row["signal_ts"] = int(prev["ts"])
-            row["signal_time"] = fmt_time(prev["ts"])
-            row["signal_zscore"] = _float(prev.get(f"{prefix}zscore"))
-            row["signal_action"] = prev.get(f"{prefix}action")
-            row["signal_side"] = prev.get(f"{prefix}side")
-            for name in ["alpha", "beta", "spread_beta", "spread_mean", "spread_std", "latest_spread"]:
-                row[f"signal_{name}"] = _float(prev.get(f"{prefix}{name}"))
+            signal_ts = ts_values[prev_idx]
+            row["signal_ts"] = signal_ts
+            row["signal_time"] = fmt_time(signal_ts)
+            row["signal_zscore"] = _float(
+                series["zscore"][prev_idx] if "zscore" in series else None
+            )
+            row["signal_action"] = (
+                series["action"][prev_idx] if "action" in series else None
+            )
+            row["signal_side"] = (
+                series["side"][prev_idx] if "side" in series else None
+            )
+            for name in [
+                "alpha", "beta", "spread_beta", "spread_mean", "spread_std",
+                "latest_spread", "last_model_update_index",
+            ]:
+                row[f"signal_{name}"] = _float(
+                    series[name][prev_idx] if name in series else None
+                )
 
-        if fill_idx < len(pair_rows) and ts_values[fill_idx] == trade_ts:
-            fill = pair_rows[fill_idx]
-            row["fill_zscore"] = _float(fill.get(f"{prefix}zscore"))
+        if fill_idx < len(ts_values) and ts_values[fill_idx] == trade_ts:
+            row["fill_zscore"] = _float(
+                series["zscore"][fill_idx] if "zscore" in series else None
+            )
 
     return rows
 
@@ -530,14 +637,25 @@ def threshold_rows(run_dir: Path) -> list[dict]:
         entry_z = float(signal.get("entry_z", default_entry_z))
         exit_z = float(signal.get("exit_z", default_exit_z))
         entry_rule_method = signal.get("entry_rule_method", "fixed_z")
+        signal_method = str(signal.get("method", "simple_zscore"))
         two_stage_levels = signal.get("two_stage_levels")
-        two_stage_trigger_z = signal.get("two_stage_trigger_z")
-        two_stage_entry_z = signal.get("two_stage_entry_z", entry_z)
+        if _signal_uses_two_stage(signal_method, signal.get("two_stage_enabled")):
+            two_stage_trigger_z = signal.get("two_stage_trigger_z")
+            two_stage_entry_z = signal.get("two_stage_entry_z", entry_z)
 
-    rows = [
-        {"value": exit_z, "label": f"平仓 +{exit_z:.2f}", "kind": "exit"},
-        {"value": -exit_z, "label": f"平仓 -{exit_z:.2f}", "kind": "exit"},
-    ]
+    if exit_z > 0.0:
+        rows = [
+            {"value": exit_z, "label": f"平仓 +{exit_z:.2f}", "kind": "exit"},
+            {"value": -exit_z, "label": f"平仓 -{exit_z:.2f}", "kind": "exit"},
+        ]
+    elif exit_z == 0.0:
+        rows = [{"value": 0.0, "label": "反转平仓 0.00", "kind": "exit"}]
+    else:
+        reversal = abs(exit_z)
+        rows = [
+            {"value": reversal, "label": f"反向平仓 +{reversal:.2f}", "kind": "exit"},
+            {"value": -reversal, "label": f"反向平仓 -{reversal:.2f}", "kind": "exit"},
+        ]
     if two_stage_levels:
         for trigger_z, entry_level_z in _threshold_two_stage_levels(two_stage_levels):
             rows.extend(
@@ -569,6 +687,20 @@ def threshold_rows(run_dir: Path) -> list[dict]:
             ]
         )
     return rows
+
+
+def _signal_uses_two_stage(signal_method: str, two_stage_enabled) -> bool:
+    """True only when the configured signal really runs the two-stage machine.
+
+    Legacy configs carry ``two_stage_trigger_z`` even with the two-stage switch
+    off; drawing those thresholds would put phantom lines on the z-score chart.
+    """
+    method = str(signal_method or "").strip().lower()
+    if method == "zscore_reversion_two_stage":
+        return True
+    if method == "simple_zscore":
+        return False
+    return bool(two_stage_enabled)
 
 
 def _threshold_two_stage_levels(levels) -> list[tuple[float, float]]:
@@ -700,7 +832,10 @@ def _portfolio_points(equity: pl.DataFrame, position: pl.DataFrame, trades: pl.D
                 "time": fmt_time(row["ts"]),
                 "equity": equity,
                 "gross_exposure_ratio": _float(row.get("gross_exposure_ratio")),
-                "net_exposure_ratio": _float(row.get("net_exposure_ratio")),
+                "margin_deficit": _float(row.get("margin_deficit")),
+                "forced_deleveraging_triggered": _float(
+                    row.get("forced_deleveraging_triggered")
+                ),
                 "peak": peak,
             }
         )
@@ -788,7 +923,7 @@ def _estimator_review_parameters(run_dir: Path) -> dict:
         "model_lookback_bars": _float(estimator.get("model_lookback_bars")),
         "model_update_interval_bars": _float(estimator.get("model_update_interval_bars")),
         "regression_method": estimator.get("regression_method"),
-        "exit_z": _float(signal.get("exit_z")) or 0.5,
+        "exit_z": _coalesce(_float(signal.get("exit_z")), 0.5),
     }
 
 
@@ -843,12 +978,11 @@ def _trade_scenario_analysis(
     result = {
         "available": False,
         "regression_method": method or None,
-        "exit_z": abs(float(exit_z)),
-        "x_moves_are_simple_returns": True,
+        "exit_z": float(exit_z),
         "scenarios": [],
     }
-    if method not in {"price", "raw_price", "log_price"}:
-        result["reason"] = "Return模型依赖退出时刻的滚动收益率基准，不能使用静态价格情景。"
+    if method not in {"price", "log_price"}:
+        result["reason"] = "当前回归类型不支持价格变动情景。"
         return result
 
     alpha = _float(trade.get("open_alpha"))
@@ -866,7 +1000,6 @@ def _trade_scenario_analysis(
     if abs(qx) <= 1e-15 or abs(qy) <= 1e-15:
         result["reason"] = "开仓两腿成交数量不完整，无法计算情景。"
         return result
-
     entry_z = _coalesce(trade.get("open_zscore"), trade.get("open_fill_zscore"))
     entry_z = _float(entry_z)
     if entry_z is not None and abs(entry_z) > 1e-12:
@@ -874,12 +1007,13 @@ def _trade_scenario_analysis(
     else:
         # Positive residual positions normally buy X and sell Y.
         residual_sign = 1.0 if qx > 0 else -1.0
-    target_z = residual_sign * abs(float(exit_z))
-    target_residual = spread_mean + target_z * spread_std
+    target_z = 0.0 if float(exit_z) == 0.0 else residual_sign * float(exit_z)
     entry_gross_notional = abs(qx * entry_x) + abs(qy * entry_y)
     if entry_gross_notional <= 1e-12:
         result["reason"] = "开仓总名义金额为零，无法计算收益率。"
         return result
+
+    target_residual = spread_mean + target_z * spread_std
 
     def scenario_at(x_move: float) -> dict | None:
         x_price = entry_x * (1.0 + float(x_move))
@@ -903,9 +1037,48 @@ def _trade_scenario_analysis(
             "gross_return": gross_pnl / entry_gross_notional,
         }
 
-    scenarios = [row for move in SCENARIO_X_MOVES if (row := scenario_at(move)) is not None]
-    if len(scenarios) != len(SCENARIO_X_MOVES):
-        result["reason"] = "部分价格情景产生无效理论Y价格，未展示情景表。"
+    def scenario_payload() -> dict | None:
+        scenarios = []
+        invalid_x_moves = []
+        for move in SCENARIO_X_MOVES:
+            row = scenario_at(move)
+            if row is None:
+                invalid_x_moves.append(float(move))
+            else:
+                scenarios.append(row)
+        if not scenarios:
+            return None
+
+        dense_scenarios = []
+        for index in range(401):
+            row = scenario_at(-0.20 + index * 0.001)
+            if row is not None:
+                dense_scenarios.append(row)
+        if not dense_scenarios:
+            return None
+
+        range_min = min(dense_scenarios, key=lambda row: row["gross_return"])
+        range_max = max(dense_scenarios, key=lambda row: row["gross_return"])
+        return {
+            "target_residual": target_residual,
+            "scenarios": scenarios,
+            "invalid_x_moves": invalid_x_moves,
+            "summary": {
+                "zero_x": scenario_at(0.0),
+                "range_min": range_min,
+                "range_max": range_max,
+                "range_fully_valid": len(dense_scenarios) == 401,
+                "all_profitable": (
+                    all(row["gross_return"] > 0.0 for row in dense_scenarios)
+                    if len(dense_scenarios) == 401 else None
+                ),
+                "break_even_x_move": _scenario_break_even(dense_scenarios),
+            },
+        }
+
+    first_payload = scenario_payload()
+    if first_payload is None:
+        result["reason"] = "所有价格情景均产生无效理论Y价格，无法计算情景表。"
         return result
 
     result.update({
@@ -917,7 +1090,10 @@ def _trade_scenario_analysis(
         "x_quantity": qx,
         "y_quantity": qy,
         "entry_gross_notional": entry_gross_notional,
-        "scenarios": scenarios,
+        "scenarios": first_payload["scenarios"],
+        "invalid_x_moves": first_payload["invalid_x_moves"],
+        "assumption": "假设价格关系回到目标Z",
+        "summary": first_payload["summary"],
     })
 
     close_x = _float(trade.get("close_x_price"))
@@ -925,7 +1101,9 @@ def _trade_scenario_analysis(
     if close_x is not None and close_x > 0:
         actual_move = close_x / entry_x - 1.0
         exact = scenario_at(actual_move)
-        lower, upper, band = _scenario_neighbors(scenarios, actual_move)
+        lower, upper, band = _scenario_neighbors(
+            first_payload["scenarios"], actual_move
+        )
         result["actual"] = {
             "x_move": actual_move,
             "x_price": close_x,
@@ -975,6 +1153,95 @@ def _scenario_neighbors(
     return None, None, "-"
 
 
+def _scenario_break_even(scenarios: list[dict]) -> float | None:
+    """Return the zero-PnL X move closest to zero within the scenario range."""
+    roots: list[float] = []
+    ordered = sorted(scenarios, key=lambda row: row["x_move"])
+    for row in ordered:
+        if abs(float(row["gross_return"])) <= 1e-12:
+            roots.append(float(row["x_move"]))
+    for left, right in zip(ordered, ordered[1:]):
+        left_value = float(left["gross_return"])
+        right_value = float(right["gross_return"])
+        if left_value == 0.0 or right_value == 0.0 or left_value * right_value > 0.0:
+            continue
+        span = right_value - left_value
+        if abs(span) <= 1e-15:
+            continue
+        weight = -left_value / span
+        roots.append(float(left["x_move"]) + weight * (float(right["x_move"]) - float(left["x_move"])))
+    return min(roots, key=abs) if roots else None
+
+
+def _percentile(values: list[float], probability: float) -> float | None:
+    finite = sorted(float(value) for value in values if value is not None and isfinite(float(value)))
+    if not finite:
+        return None
+    if len(finite) == 1:
+        return finite[0]
+    position = max(0.0, min(1.0, float(probability))) * (len(finite) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(finite) - 1)
+    fraction = position - lower
+    return finite[lower] * (1.0 - fraction) + finite[upper] * fraction
+
+
+def _distribution(values: list[float]) -> dict:
+    clean = [float(value) for value in values if value is not None and isfinite(float(value))]
+    return {
+        "count": len(clean),
+        "p10": _percentile(clean, 0.10),
+        "median": _percentile(clean, 0.50),
+        "p90": _percentile(clean, 0.90),
+    }
+
+
+def _pair_scenario_summary(trades: list[dict]) -> dict | None:
+    analyses = [
+        trade.get("scenario_analysis")
+        for trade in trades
+        if isinstance(trade.get("scenario_analysis"), dict)
+        and trade["scenario_analysis"].get("available")
+    ]
+    if not analyses:
+        return None
+    zero_returns = []
+    range_min_returns = []
+    range_max_returns = []
+    for analysis in analyses:
+        summary = analysis.get("summary") or {}
+        zero = summary.get("zero_x") or {}
+        minimum = summary.get("range_min") or {}
+        maximum = summary.get("range_max") or {}
+        if zero.get("gross_return") is not None:
+            zero_returns.append(float(zero["gross_return"]))
+        if minimum.get("gross_return") is not None:
+            range_min_returns.append(float(minimum["gross_return"]))
+        if maximum.get("gross_return") is not None:
+            range_max_returns.append(float(maximum["gross_return"]))
+
+    closed = [trade for trade in trades if trade.get("net_return") is not None]
+    actual_gross = [float(trade["gross_return"]) for trade in closed if trade.get("gross_return") is not None]
+    actual_net = [float(trade["net_return"]) for trade in closed if trade.get("net_return") is not None]
+    return {
+        "scenario_count": len(analyses),
+        "closed_count": len(closed),
+        "range_min": _distribution(range_min_returns),
+        "zero_x": _distribution(zero_returns),
+        "range_max": _distribution(range_max_returns),
+        "actual_gross": _distribution(actual_gross),
+        "actual_net": _distribution(actual_net),
+        "theoretical_positive_rate": (
+            sum(value > 0.0 for value in zero_returns) / len(zero_returns)
+            if zero_returns else None
+        ),
+        "cost_coverage_rate": (
+            sum(value > 0.0 for value in actual_net) / len(actual_net)
+            if actual_net else None
+        ),
+    }
+
+
 def _sample_timeline_with_trade_context(
     timeline: pl.DataFrame,
     trades: pl.DataFrame,
@@ -1014,11 +1281,17 @@ def _sample_timeline_with_trade_context(
 def _symbol_close_frame(run_dir: Path, symbol: str, output_name: str) -> pl.DataFrame:
     data_path = _symbol_data_path(run_dir, symbol)
     if data_path is None:
-        return pl.DataFrame({"ts": pl.Series("ts", [], dtype=pl.Int64), output_name: pl.Series(output_name, [], dtype=pl.Float64)})
+        return pl.DataFrame({
+            "ts": pl.Series("ts", [], dtype=pl.Int64),
+            output_name: pl.Series(output_name, [], dtype=pl.Float64),
+        })
     try:
         frame = load_csv_data(data_path)
     except Exception:
-        return pl.DataFrame({"ts": pl.Series("ts", [], dtype=pl.Int64), output_name: pl.Series(output_name, [], dtype=pl.Float64)})
+        return pl.DataFrame({
+            "ts": pl.Series("ts", [], dtype=pl.Int64),
+            output_name: pl.Series(output_name, [], dtype=pl.Float64),
+        })
     return frame.select(["ts", "close"]).rename({"close": output_name})
 
 
@@ -1058,6 +1331,15 @@ def _float(value) -> float | None:
         if not isfinite(value):
             return None
         return value
+    except (TypeError, ValueError):
+        return None
+
+
+def _int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -1102,13 +1384,12 @@ def export_trade_review_html(
         output = ROOT / output
     out_dir = output.parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    review_started = perf_counter()
+    logger.info("Trade Review：开始读取回测产物，run_dir={}", run_dir)
 
     # ---- 读取回测产物 ----
     pair_defs = _configured_pairs(run_dir)
-    signal_fields = [
-        "zscore", "action", "side", "alpha", "beta", "spread_beta",
-        "spread_mean", "spread_std", "latest_spread",
-    ]
+    signal_fields = ["zscore"]
     signal_columns = ["ts"] + [
         f"{pair['pair_id']}_{field}"
         for pair in pair_defs
@@ -1116,7 +1397,13 @@ def export_trade_review_html(
     ]
     equity = _sort_if_has_column(read_frame(run_dir / "equity_curve.csv", ["ts", "equity"]), "ts")
     position = _sort_if_has_column(
-        read_frame(run_dir / "position_curve.csv", ["ts", "gross_exposure_ratio", "net_exposure_ratio"]),
+        read_frame(
+            run_dir / "position_curve.csv",
+            [
+                "ts", "gross_exposure_ratio", "margin_deficit",
+                "forced_deleveraging_triggered",
+            ],
+        ),
         "ts",
     )
     signal = _sort_if_has_column(
@@ -1130,6 +1417,12 @@ def export_trade_review_html(
             [
                 "group_id", "symbol", "action", "side", "quantity", "price", "notional",
                 "fee", "slippage", "ts", "position_id", "target_hedge_ratio", "pair_id", "funding_fee",
+                "exit_reason", "protection_trigger", "protection_stop_x_price",
+                "exit_class", "reopen_lock_pending",
+                "protection_take_profit_return",
+                "protection_target_residual", "protection_stop_reason",
+                "protection_max_holding_bars", "protection_max_holding_deadline_bar",
+                "protection_rule", "protection_freeze_bars", "protection_freeze_until_bar",
             ],
         ),
         "ts",
@@ -1147,11 +1440,19 @@ def export_trade_review_html(
         metrics = {}
     if equity.is_empty() or "ts" not in equity.columns:
         raise ValueError(f"{run_dir} has no equity_curve.csv data")
+    logger.info(
+        "Trade Review：产物读取完成，pairs={} equity_rows={} signal_rows={} trades={}",
+        len(pair_defs),
+        equity.height,
+        signal.height,
+        trades.height,
+    )
 
     estimator_review_parameters = _estimator_review_parameters(run_dir)
     initial_equity = float(metrics.get("initial_equity") or 0.0)
 
     # ---- 组合总览数据（不包含任何 Pair 分钟明细） ----
+    logger.info("Trade Review：开始整理交易卡片与组合总览数据")
     event_trades = trade_rows(trades, signal)
     complete_trades = _complete_trade_rows(event_trades, pair_curve, funding)
     portfolio_points = _portfolio_points(equity, position, trades, max_points)
@@ -1160,12 +1461,23 @@ def export_trade_review_html(
         "run_dir": str(run_dir),
         "range": {"start": int(equity["ts"].min()), "end": int(equity["ts"].max())},
         "metrics": _overview_metrics(metrics, equity),
-        "points": _pack_series(portfolio_points, ["equity", "gross_exposure_ratio", "net_exposure_ratio", "peak"]),
+        "points": _pack_series(
+            portfolio_points,
+            [
+                "equity", "gross_exposure_ratio", "margin_deficit",
+                "forced_deleveraging_triggered", "peak",
+            ],
+        ),
         "holding_distribution": holding_time_distribution(trades),
         "windows": {"drawdown": drawdown_window(equity), "gain": best_gain_window(equity)},
         "pairs": [],
     }
     overview_payload["metrics"].update(_complete_trade_metric_overrides(complete_trades))
+    logger.info(
+        "Trade Review：交易卡片基础数据完成，events={} completed_trades={}",
+        len(event_trades),
+        len(complete_trades),
+    )
 
     # ---- Pair 汇总基础数据 ----
     pair_summary_base = {
@@ -1194,10 +1506,19 @@ def export_trade_review_html(
     backtest_min = int(equity["ts"].min())
     backtest_max = int(equity["ts"].max())
 
-    for pair_def in pair_defs:
+    total_pairs = len(pair_defs)
+    for pair_index, pair_def in enumerate(pair_defs, start=1):
         pair_id = pair_def["pair_id"]
         x_symbol = pair_def["x_symbol"]
         y_symbol = pair_def["y_symbol"]
+        logger.info(
+            "Trade Review Pair [{}/{}] 开始: {} ({} / {})",
+            pair_index,
+            total_pairs,
+            pair_id,
+            x_symbol,
+            y_symbol,
+        )
         x_frame = _symbol_close_frame(run_dir, x_symbol, "x_close")
         y_frame = _symbol_close_frame(run_dir, y_symbol, "y_close")
         # Pair 时间轴裁剪到回测窗口内，且从 X/Y 首次共同有效价格开始，
@@ -1215,7 +1536,7 @@ def export_trade_review_html(
         timeline_ts = [ts for ts in x_ts_list if first_common <= ts <= backtest_max]
         x_prices = dict(zip(x_frame["ts"].to_list(), x_frame["x_close"].to_list()))
         y_prices = dict(zip(y_frame["ts"].to_list(), y_frame["y_close"].to_list()))
-        z_rows = _zscore_forward_rows(signal, pair_id)
+        z_rows = _zscore_forward_rows(signal, pair_id, pair_curve)
         points = _pair_contribution_points(
             pair_id, x_symbol, y_symbol,
             trades_rows, funding_rows,
@@ -1334,6 +1655,7 @@ def export_trade_review_html(
             "total_fee": base.get("total_fee"),
             "total_slippage": base.get("total_slippage"),
             "funding_fee": final_funding,
+            "scenario_space": _pair_scenario_summary(pair_trades),
         }
         overview_payload["pairs"].append(summary)
 
@@ -1405,6 +1727,7 @@ def export_trade_review_html(
             "model_lookback_bars": estimator_review_parameters["model_lookback_bars"],
             "model_update_interval_bars": estimator_review_parameters["model_update_interval_bars"],
             "regression_method": estimator_review_parameters["regression_method"],
+            "exit_z": estimator_review_parameters["exit_z"],
         }
         pair_html = (
             PAIR_TEMPLATE
@@ -1449,10 +1772,11 @@ def export_trade_review_html(
     )
     output.write_text(overview_html, encoding="utf-8")
     logger.info(
-        "trade_review v2 generated overview={} pairs={} data_dir={}",
+        "trade_review v2 generated overview={} pairs={} data_dir={} elapsed_minutes={:.1f}",
         output,
         len(pair_defs),
         data_dir,
+        (perf_counter() - review_started) / 60.0,
     )
     return output
 
@@ -1527,35 +1851,49 @@ def _month_key(ts: int) -> str:
     return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m")
 
 
-def _zscore_forward_rows(signal: pl.DataFrame, pair_id: str) -> list[dict]:
+def _zscore_forward_rows(
+    signal: pl.DataFrame,
+    pair_id: str,
+    pair_curve: pl.DataFrame | None = None,
+) -> list[dict]:
     """取该 pair 的信号参数（按 ts 升序，用于分钟级前向填充）。"""
     prefix = f"{pair_id}_"
     column = f"{prefix}zscore"
     if signal.is_empty() or column not in signal.columns:
         return []
-    alpha_column = f"{prefix}alpha"
-    spread_beta_column = f"{prefix}spread_beta"
-    beta_column = f"{prefix}beta"
     selected_columns = ["ts", column]
-    selected_columns.extend(
-        name
-        for name in (alpha_column, spread_beta_column, beta_column)
-        if name in signal.columns
-    )
+    signal_rows = signal.select(selected_columns).sort("ts")
+    state_rows = pl.DataFrame()
+    if (
+        pair_curve is not None
+        and not pair_curve.is_empty()
+        and {"ts", "pair_id"}.issubset(pair_curve.columns)
+    ):
+        state_columns = [
+            name for name in ("ts", "alpha", "beta")
+            if name in pair_curve.columns
+        ]
+        if len(state_columns) > 1:
+            state_rows = (
+                pair_curve
+                .filter(pl.col("pair_id") == pair_id)
+                .select(state_columns)
+                .sort("ts")
+                .unique(subset=["ts"], keep="last")
+            )
+    if not state_rows.is_empty():
+        signal_rows = signal_rows.join_asof(state_rows, on="ts", strategy="backward")
     rows = []
     # signal_curve can contain hundreds of fields for all configured pairs.
     # Restrict conversion to the current pair to avoid copying the full frame
     # once per pair while generating the report.
-    for row in signal.select(selected_columns).sort("ts").to_dicts():
+    for row in signal_rows.to_dicts():
         value = _float(row.get(column))
-        spread_beta = _float(row.get(spread_beta_column))
-        if spread_beta is None:
-            spread_beta = _float(row.get(beta_column))
         rows.append({
             "ts": int(row["ts"]),
             "zscore": value,
-            "alpha": _float(row.get(alpha_column)),
-            "spread_beta": spread_beta,
+            "alpha": _float(row.get("alpha")),
+            "spread_beta": _float(row.get("beta")),
         })
     return rows
 
@@ -1584,6 +1922,7 @@ def _pair_contribution_points(
     - 结算顺序与回测引擎一致：同一分钟内先按上一分钟末的持仓结算资金费率，
       再应用本分钟的成交（exchange.__call__ 中先 _apply_funding 后撮合）。
     """
+    regression_method = str(regression_method or "").lower()
     pair_trades = sorted(
         (t for t in trades_rows if t.get("pair_id") == pair_id),
         key=lambda t: (t["ts"], t.get("group_id") or ""),
@@ -1676,9 +2015,11 @@ def _pair_contribution_points(
                     theoretical_y = exp(last_alpha + last_spread_beta * log(float(px)))
                 else:
                     theoretical_y = last_alpha + last_spread_beta * float(px)
-                if not isfinite(theoretical_y):
+                if theoretical_y is not None and (
+                    not isfinite(theoretical_y) or theoretical_y <= 0.0
+                ):
                     theoretical_y = None
-            except (OverflowError, ValueError):
+            except (OverflowError, TypeError, ValueError):
                 theoretical_y = None
         # 全局累计峰值（贡献权益口径），供前端回撤图使用：dd = equity / peak - 1
         equity_contrib = initial_equity + pnl

@@ -47,8 +47,8 @@
 !/config/sweeps/archive/
 !/config/sweeps/archive/*.yaml
 !/config/sweeps/archive/*.md
-!/config/tls_huber_selected_24/
-!/config/tls_huber_selected_24/*.yaml
+!/config/tls_huber_selected_12/
+!/config/tls_huber_selected_12/*.yaml
 
 # Credentials and machine-local configuration must never be committed.
 .env

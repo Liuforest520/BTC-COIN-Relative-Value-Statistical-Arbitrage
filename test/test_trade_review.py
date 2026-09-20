@@ -9,13 +9,19 @@ import pytest
 from core.modules.reporting import export as report_export
 from core.modules.reporting.review_assets import OVERVIEW_TEMPLATE, PAIR_TEMPLATE, REVIEW_JS
 from core.modules.reporting.pair_summary import build_pair_summary
+from core.modules.reporting.pair_summary import _to_frame
 from core.modules.reporting.trade_review import (
     _complete_trade_rows,
     _inject_report_center_link,
     _pair_contribution_points,
+    _pair_scenario_summary,
     _raw_pair_prices,
     _report_center_html,
     _resolved_run_dir,
+    _zscore_forward_rows,
+    export_trade_review_html,
+    _trade_scenario_analysis,
+    threshold_rows,
     discover_report_runs,
     trade_rows,
 )
@@ -42,6 +48,41 @@ def _trades_frame():
     )
 
 
+def test_report_rows_allow_late_protective_exit_strings(tmp_path):
+    """Sparse null exit metadata must not be inferred as a Null column."""
+    rows = [
+        {
+            "group_id": f"g-{index}",
+            "exit_reason": None,
+            "protection_trigger": None,
+            "exit_class": None,
+            "reopen_lock_pending": None,
+            "protection_max_holding_bars": None,
+        }
+        for index in range(101)
+    ]
+    rows.append(
+        {
+            "group_id": "g-close",
+            "exit_reason": "protective_max_holding_time",
+            "protection_trigger": "max_holding_time",
+            "exit_class": "stop_loss",
+            "reopen_lock_pending": True,
+            "protection_max_holding_bars": 5760,
+        }
+    )
+
+    frame = _to_frame(rows)
+    assert frame.schema["exit_reason"] == pl.Utf8
+    assert frame.schema["reopen_lock_pending"] == pl.Boolean
+    assert frame.tail(1)["exit_reason"].item() == "protective_max_holding_time"
+
+    output = tmp_path / "trades.csv"
+    report_export._write_csv(output, rows)
+    written = pl.read_csv(output, schema_overrides={"exit_reason": pl.Utf8})
+    assert written.tail(1)["exit_reason"].item() == "protective_max_holding_time"
+
+
 def test_trade_review_combines_open_and_close_into_one_position():
     events = trade_rows(_trades_frame())
     complete = _complete_trade_rows(events)
@@ -64,6 +105,26 @@ def test_trade_review_keeps_unclosed_position_without_realized_pnl():
     assert complete[0]["close_ts"] is None
     assert complete[0]["gross_pnl"] is None
     assert complete[0]["net_pnl"] is None
+
+
+def test_trade_signal_context_uses_previous_signal():
+    signal = pl.DataFrame({
+        "ts": [0, 1_000, 2_000],
+        "pair-1_zscore": [3.0, 0.4, 0.2],
+        "pair-1_action": ["open", "close", "none"],
+        "pair-1_side": ["long_x", None, None],
+        "pair-1_alpha": [0.1, 0.1, 0.1],
+        "pair-1_spread_beta": [1.5, 1.5, 1.5],
+        "pair-1_spread_mean": [0.0, 0.0, 0.0],
+        "pair-1_spread_std": [0.01, 0.01, 0.01],
+        "pair-1_last_model_update_index": [900, 900, 900],
+    })
+
+    enriched = trade_rows(_trades_frame(), signal)
+
+    assert enriched[0]["signal_ts"] == 0
+    assert enriched[0]["signal_last_model_update_index"] == pytest.approx(900)
+    assert enriched[1]["signal_ts"] == 1_000
 
 
 def test_review_shortcuts_share_the_minute_range_control():
@@ -198,7 +259,7 @@ def test_full_backtest_report_always_exports_trade_review(tmp_path, monkeypatch)
     calls = []
 
     monkeypatch.setattr(report_export, "_per_pair_metrics", lambda *_: [])
-    monkeypatch.setattr(report_export, "export_equity_summary_html", lambda *_: None)
+    monkeypatch.setattr(report_export, "export_equity_summary_image", lambda *_: None)
     monkeypatch.setattr(
         report_export,
         "_export_trade_review",
@@ -215,7 +276,10 @@ def test_full_backtest_report_always_exports_trade_review(tmp_path, monkeypatch)
     )
 
     assert calls == [(output_dir, 2000, 20)]
-    assert "trade_review.html" in (output_dir / "summary.md").read_text(encoding="utf-8")
+    summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+    assert "portfolio_summary.png" in summary
+    assert "portfolio_summary.html" not in summary
+    assert "trade_review.html" in summary
 
 
 def test_report_export_survives_trade_review_failure(tmp_path, monkeypatch):
@@ -227,7 +291,7 @@ def test_report_export_survives_trade_review_failure(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("active_setup: demo\nsetups: {demo: {}}\n", encoding="utf-8")
     monkeypatch.setattr(report_export, "_per_pair_metrics", lambda *_: [])
-    monkeypatch.setattr(report_export, "export_equity_summary_html", lambda *_: None)
+    monkeypatch.setattr(report_export, "export_equity_summary_image", lambda *_: None)
     monkeypatch.setattr(
         report_export, "_export_trade_review",
         lambda *_: (_ for _ in ()).throw(RuntimeError("broken html")),
@@ -296,12 +360,47 @@ def test_pair_contribution_builds_log_price_theoretical_y_from_active_parameters
     assert points[1]["y_theoretical"] == pytest.approx(24.2)
 
 
-def test_pair_contribution_does_not_invent_theoretical_price_for_return_model():
-    z_rows = [{"ts": 1, "zscore": 0.0, "alpha": 0.1, "spread_beta": 2.0}]
+def test_zscore_rows_forward_fill_model_parameters_from_sparse_pair_curve():
+    signal = pl.DataFrame({
+        "ts": [1, 2, 3],
+        "p_zscore": [None, 2.0, 1.0],
+    })
+    pair_curve = pl.DataFrame({
+        "ts": [1, 3],
+        "pair_id": ["p", "p"],
+        "alpha": [0.1, 0.2],
+        "beta": [1.5, 1.6],
+    })
 
+    rows = _zscore_forward_rows(signal, "p", pair_curve)
+
+    assert [row["alpha"] for row in rows] == [0.1, 0.1, 0.2]
+    assert [row["spread_beta"] for row in rows] == [1.5, 1.5, 1.6]
+
+
+def test_complete_trade_uses_signal_time_model_state_not_fill_time_update():
+    signal = pl.DataFrame({"ts": [0, 1_000], "pair-1_zscore": [3.2, 3.1]})
+    events = trade_rows(_trades_frame().filter(pl.col("action") == "open"), signal)
+    pair_curve = pl.DataFrame({
+        "ts": [0, 1_000],
+        "pair_id": ["pair-1", "pair-1"],
+        "alpha": [0.1, 9.9],
+        "beta": [1.5, 8.8],
+        "spread_mean": [0.0, 7.7],
+        "spread_std": [0.2, 6.6],
+    })
+
+    complete = _complete_trade_rows(events, pair_curve)
+
+    assert complete[0]["open_alpha"] == pytest.approx(0.1)
+    assert complete[0]["open_beta"] == pytest.approx(1.5)
+
+
+def test_pair_contribution_hides_nonpositive_price_target():
     points = _pair_contribution_points(
-        "p", "X", "Y", [], [], [1], {1: 10.0}, {1: 20.0}, z_rows,
-        regression_method="log_return",
+        "p", "X", "Y", [], [], [1], {1: 10.0}, {1: 20.0},
+        [{"ts": 1, "zscore": 0.0, "alpha": -30.0, "spread_beta": 1.0}],
+        regression_method="price",
     )
 
     assert points[0]["y_theoretical"] is None
@@ -321,3 +420,154 @@ def test_raw_trade_spread_prefers_same_event_reference_prices():
     )
 
     assert (x, y, spread) == (10.0, 20.0, 10.0)
+
+
+def test_trade_scenario_keeps_valid_rows_when_one_price_target_is_invalid():
+    trade = {
+        "open_alpha": -0.11368982592970345,
+        "open_beta": 5.075325520474826,
+        "open_spread_mean": -7.927814783249266e-17,
+        "open_spread_std": 0.02368658715682013,
+        "open_x_price": 0.02387,
+        "open_y_price": 0.092,
+        "open_zscore": 3.6420365611046552,
+        "close_x_price": 0.06672,
+        "close_y_price": 0.237,
+        "gross_return": -0.40237301548566695,
+        "net_return": -0.39460211257559846,
+        "gross_pnl": -3992.0949125634943,
+        "net_pnl": -3914.9968449014136,
+    }
+    open_events = [{
+        "leg_details": [
+            {"symbol": "BICOUSDT", "side": "buy", "quantity": 144714.32706297422},
+            {"symbol": "DYDXUSDT", "side": "sell", "quantity": 70297.26777387544},
+        ],
+    }]
+
+    analysis = _trade_scenario_analysis(
+        trade,
+        open_events,
+        "BICOUSDT",
+        "DYDXUSDT",
+        "price",
+        0.5,
+    )
+
+    assert analysis["available"] is True
+    assert analysis["invalid_x_moves"] == [-0.2]
+    assert [row["x_move"] for row in analysis["scenarios"]] == [-0.1, 0.0, 0.1, 0.2]
+    assert analysis["summary"]["range_fully_valid"] is False
+    assert analysis["summary"]["all_profitable"] is None
+    assert analysis["actual"]["theoretical_at_actual_x"]["gross_return"] == pytest.approx(
+        -0.400796283436749
+    )
+
+
+@pytest.mark.parametrize(
+    ("exit_z", "expected"),
+    [
+        (0.0, [(0.0, "反转平仓 0.00")]),
+        (-0.5, [(0.5, "反向平仓 +0.50"), (-0.5, "反向平仓 -0.50")]),
+    ],
+)
+def test_trade_review_thresholds_show_signed_exit_semantics(tmp_path, exit_z, expected):
+    (tmp_path / "config.yaml").write_text(
+        "\n".join([
+            "active_setup: demo",
+            "setups:",
+            "  demo:",
+            "    pipeline:",
+            "      signal:",
+            "        entry_z: 3.0",
+            f"        exit_z: {exit_z}",
+        ]),
+        encoding="utf-8",
+    )
+
+    exits = [row for row in threshold_rows(tmp_path) if row["kind"] == "exit"]
+
+    assert [(row["value"], row["label"]) for row in exits] == expected
+
+
+def test_trade_scenario_negative_exit_targets_opposite_z_side():
+    trade = {
+        "open_alpha": 0.0,
+        "open_beta": 1.0,
+        "open_spread_mean": 0.0,
+        "open_spread_std": 0.1,
+        "open_x_price": 10.0,
+        "open_y_price": 11.0,
+        "open_zscore": 3.0,
+    }
+    open_events = [{"leg_details": [
+        {"symbol": "X", "side": "buy", "quantity": 1.0},
+        {"symbol": "Y", "side": "sell", "quantity": 1.0},
+    ]}]
+
+    analysis = _trade_scenario_analysis(
+        trade, open_events, "X", "Y", "price", -0.5
+    )
+
+    assert analysis["available"] is True
+    assert analysis["target_z"] == -0.5
+    assert analysis["target_residual"] == pytest.approx(-0.05)
+
+
+def test_log_price_scenario_scans_internal_extremum():
+    trade = {
+        "open_alpha": log(0.005),
+        "open_beta": 2.0,
+        "open_spread_mean": 0.0,
+        "open_spread_std": 0.1,
+        "open_x_price": 100.0,
+        "open_y_price": 100.0,
+        "open_zscore": 3.0,
+    }
+    open_events = [{"leg_details": [
+        {"symbol": "X", "side": "buy", "quantity": 1.0},
+        {"symbol": "Y", "side": "sell", "quantity": 1.0},
+    ]}]
+
+    analysis = _trade_scenario_analysis(
+        trade, open_events, "X", "Y", "log_price", 0.0
+    )
+
+    assert analysis["summary"]["range_max"]["x_move"] == pytest.approx(0.0)
+    assert analysis["summary"]["range_max"]["gross_return"] == pytest.approx(0.25)
+    assert analysis["summary"]["range_min"]["gross_return"] == pytest.approx(0.24)
+
+
+def test_pair_scenario_summary_aggregates_distributions_and_rates():
+    def scenario(zero, low, high):
+        return {
+            "available": True,
+            "summary": {
+                "zero_x": {"gross_return": zero},
+                "range_min": {"gross_return": low},
+                "range_max": {"gross_return": high},
+            },
+        }
+
+    summary = _pair_scenario_summary([
+        {"scenario_analysis": scenario(0.10, 0.05, 0.20), "gross_return": 0.08, "net_return": 0.06},
+        {"scenario_analysis": scenario(-0.10, -0.20, 0.05), "gross_return": -0.02, "net_return": -0.03},
+    ])
+
+    assert summary["scenario_count"] == 2
+    assert summary["closed_count"] == 2
+    assert summary["zero_x"]["median"] == pytest.approx(0.0)
+    assert summary["range_min"]["median"] == pytest.approx(-0.075)
+    assert summary["range_max"]["median"] == pytest.approx(0.125)
+    assert summary["theoretical_positive_rate"] == pytest.approx(0.5)
+    assert summary["cost_coverage_rate"] == pytest.approx(0.5)
+
+
+def test_templates_include_trade_path_and_pair_scenario_charts():
+    assert 'id="tradeReturnChart"' in PAIR_TEMPLATE
+    assert "buildSelectedTradePath" in PAIR_TEMPLATE
+    assert "realizedCosts" in PAIR_TEMPLATE
+    assert "investedNotional" in PAIR_TEMPLATE
+    assert 'id="pairScenarioChart"' in OVERVIEW_TEMPLATE
+    assert "drawPairScenarioChart" in OVERVIEW_TEMPLATE
+    assert "X不变时理论收益" in PAIR_TEMPLATE

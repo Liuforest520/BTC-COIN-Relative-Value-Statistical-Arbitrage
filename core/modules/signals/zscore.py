@@ -1,5 +1,12 @@
 """
-Z-score based signal generator.
+Z-score based signal generator: simple threshold crossing.
+
+Selecting ``signal.method: simple_zscore`` means "hit ±entry_z and enter
+immediately", with no two-stage arming and no MA reversion confirmation.  The
+two confirmation variants live in their own modules:
+
+* ``zscore_reversion_two_stage`` -- arm at the trigger, enter on the pullback
+* ``zscore_reversion_ma``        -- require the z-score MA to turn first
 """
 from __future__ import annotations
 
@@ -10,20 +17,24 @@ from core.modules.models.pipeline_types import (
     register_signal,
 )
 from core.modules.data.rolling_window import ensure_deque, percentiles_from_tail
-from core.modules.signals.position_exit_zscore import (
-    resolve_position_exit_decision,
-    resolve_position_exit_zscore,
-)
+from core.modules.signals.exit_rules import resolve_position_exit_decision
 
 
-@register_signal("zscore")
-class ZScoreSignal:
+@register_signal("simple_zscore")
+@register_signal("zscore")  # legacy alias, identical behaviour
+class SimpleZScoreSignal:
     """Simple z-score threshold crossing signal.
 
-    Open (long X / short Y) when zscore > entry_z_upper.
-    Open (short X / long Y) when zscore < entry_z_lower.
-    Close inside the exit band or when Z reverses across zero while holding.
+    Open (long X / short Y) as soon as ``zscore >= entry_z_upper``.
+    Open (short X / long Y) as soon as ``zscore <= entry_z_lower``.
+    There is no confirmation layer: hitting the threshold *is* the entry.
+
+    Exit semantics: positive ``exit_z`` is a symmetric band, zero requires a
+    sign reversal, and negative ``exit_z`` requires a reversal beyond its
+    absolute value.
     """
+
+    signal_method = "simple_zscore"
 
     def __init__(
         self,
@@ -58,7 +69,7 @@ class ZScoreSignal:
         if not estimator.ready or estimator.spread_std is None:
             return SignalOutput(pair_id=self.pair_id, bar_index=bar_index,
                                ready=False, reason="estimator not ready",
-                               para={"signal": {"method": "zscore", "blocked_by": "estimator"}})
+                               para={"signal": {"method": self.signal_method, "blocked_by": "estimator"}})
 
         # Compute zscore from estimator output
         std = estimator.spread_std
@@ -88,26 +99,29 @@ class ZScoreSignal:
 
         # --- Decision ---
         exit_z = self.exit_z
-        close_zscore, close_zscore_method, _ = resolve_position_exit_zscore(para, zscore)
         side = None
         action = "none"
         reason = f"zscore={zscore:.4f}"
 
         should_close, close_reason = resolve_position_exit_decision(
-            para, close_zscore, exit_z
+            para, zscore, exit_z
         )
         if should_close:
             action = "close"
-            if close_reason == "direction_reversed":
+            if close_reason in {"direction_reversed", "reversal_threshold_reached"}:
                 position_side = ((para or {}).get("position") or {}).get("side")
-                reason = (
-                    f"{close_zscore_method} zscore direction reversed for "
-                    f"{position_side}: {close_zscore:.4f}"
-                )
+                if close_reason == "reversal_threshold_reached":
+                    reason = (
+                        f"zscore reached opposite exit {self.exit_z:.4f} "
+                        f"for {position_side}: {zscore:.4f}"
+                    )
+                else:
+                    reason = (
+                        f"zscore direction reversed for {position_side}: {zscore:.4f}"
+                    )
             else:
                 reason = (
-                    f"{close_zscore_method} zscore within exit band: "
-                    f"{close_zscore:.4f}"
+                    f"zscore within exit band: {zscore:.4f}"
                 )
         # z >= upper: Y overvalued relative to X, so buy X and sell Y.
         elif zscore >= state.entry_z_upper:
@@ -120,23 +134,19 @@ class ZScoreSignal:
             side = "short_x"
             reason = f"zscore {zscore:.4f} <= lower {state.entry_z_lower:.4f}"
 
-        output_zscore = close_zscore if action == "close" else zscore
         return SignalOutput(
             pair_id=self.pair_id, bar_index=bar_index, ready=True,
-            action=action, side=side, zscore=output_zscore,
+            action=action, side=side, zscore=zscore,
             entry_z_upper=state.entry_z_upper, entry_z_lower=state.entry_z_lower,
             exit_z=exit_z, signal_strength=abs(zscore),
             entry_thresholds_ready=state.entry_thresholds_ready,
             reason=reason,
             para={
                 "signal": {
-                    "method": "zscore",
+                    "method": self.signal_method,
                     "action": action,
                     "side": side,
-                    "zscore": output_zscore,
-                    "standard_zscore": zscore,
-                    "position_exit_zscore": close_zscore,
-                    "position_exit_zscore_method": close_zscore_method,
+                    "zscore": zscore,
                     "reason": reason,
                 }
             },
@@ -164,3 +174,9 @@ class ZScoreSignal:
         else:
             state.entry_z_upper = self.entry_z
             state.entry_z_lower = -self.entry_z
+
+
+# Backwards-compatible class name for imports written before the signal split.
+ZScoreSignal = SimpleZScoreSignal
+
+__all__ = ["SimpleZScoreSignal", "ZScoreSignal"]

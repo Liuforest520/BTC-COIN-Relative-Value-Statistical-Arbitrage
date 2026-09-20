@@ -946,9 +946,17 @@ class MySQLDataDownloader:
 
         if request.timeframe is not None:
             if spec.timeframe_column is None:
-                raise ValueError(f"dataset {spec.table_name} has no timeframe column, cannot filter by timeframe")
-            conditions.append(f"`{spec.timeframe_column}` = %s")
-            params.append(request.timeframe)
+                encoded_timeframe = _timeframe_from_dataset_name(spec.table_name)
+                if encoded_timeframe is None:
+                    encoded_timeframe = _timeframe_from_dataset_name(spec.dataset)
+                if encoded_timeframe is None or encoded_timeframe.casefold() != request.timeframe.casefold():
+                    raise ValueError(
+                        f"dataset {spec.table_name} has no timeframe column and its name does not "
+                        f"encode requested timeframe {request.timeframe!r}"
+                    )
+            else:
+                conditions.append(f"`{spec.timeframe_column}` = %s")
+                params.append(request.timeframe)
 
         selected_columns = ", ".join(f"`{column}`" for column in spec.columns)
         where_clause = " AND ".join(conditions)
@@ -1573,9 +1581,9 @@ def _dataset_file_label(dataset: str, timeframe: str | None = None) -> str:
     if timeframe:
         return timeframe
 
-    kline_match = re.search(r"_kline_([^_]+)(?:_|$)", dataset)
-    if kline_match:
-        return kline_match.group(1)
+    encoded_timeframe = _timeframe_from_dataset_name(dataset)
+    if encoded_timeframe:
+        return encoded_timeframe
 
     if "funding_rate_daily" in dataset:
         return "funding_rate_daily"
@@ -1583,6 +1591,11 @@ def _dataset_file_label(dataset: str, timeframe: str | None = None) -> str:
         return "funding"
 
     return dataset
+
+
+def _timeframe_from_dataset_name(dataset: str) -> str | None:
+    match = re.search(r"(?:^|_)kline_([^_]+)(?:_|$)", dataset, flags=re.IGNORECASE)
+    return match.group(1) if match else None
 
 
 def _manifest_path(output_dir: Path) -> Path:

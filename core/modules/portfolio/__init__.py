@@ -1,15 +1,11 @@
 from .allocator import (
-    ConstrainedQPAllocator,
-    EqualWeightAllocator,
-    MaxSharpeAllocator,
-    MinVarianceAllocator,
+    ConstrainedQPAllocator, EquitySlotAllocator, EqualWeightAllocator,
+    MaxSharpeAllocator, MinVarianceAllocator, PairTargetCapitalAllocator,
     RiskParityAllocator,
 )
 
 __all__ = [
-    "ConstrainedQPAllocator",
-    "EqualWeightAllocator",
+    "ConstrainedQPAllocator", "EquitySlotAllocator", "EqualWeightAllocator",
+    "MaxSharpeAllocator", "MinVarianceAllocator", "PairTargetCapitalAllocator",
     "RiskParityAllocator",
-    "MinVarianceAllocator",
-    "MaxSharpeAllocator",
 ]

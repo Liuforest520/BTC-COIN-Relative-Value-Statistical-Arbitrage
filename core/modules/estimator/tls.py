@@ -1,7 +1,6 @@
 """Scheduled rolling-window total least-squares estimator."""
 from __future__ import annotations
 
-from collections import deque
 from math import isfinite, log
 
 import numpy as np
@@ -20,8 +19,7 @@ class TLSEstimator:
     def __init__(
         self,
         pair_id: str = "",
-        regression_method: str = "log_return",
-        return_interval_bars: int = 1,
+        regression_method: str = "log_price",
         model_lookback_bars: int = 10080,
         model_update_interval_bars: int = 240,
         position_update_policy: str = "freeze",
@@ -32,28 +30,11 @@ class TLSEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
-        try:
-            self.return_interval_bars = int(return_interval_bars)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("return_interval_bars must be a positive integer") from exc
-        if (
-            isinstance(return_interval_bars, bool)
-            or self.return_interval_bars != return_interval_bars
-            or self.return_interval_bars <= 0
-        ):
-            raise ValueError("return_interval_bars must be a positive integer")
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.model_lookback_bars = max(10, int(model_lookback_bars))
-        if (
-            regression_method in {"log_return", "log_returns"}
-            and self.model_lookback_bars // self.return_interval_bars < 10
-        ):
-            raise ValueError(
-                "model_lookback_bars must contain at least 10 complete return intervals"
-            )
         self.model_update_interval_bars = max(1, int(model_update_interval_bars))
-        self.price_history_bars = self.model_lookback_bars + (
-            1 if regression_method in {"log_return", "log_returns"} else 0
-        )
+        self.price_history_bars = self.model_lookback_bars
         self.warmup_bars = self.price_history_bars
         if position_update_policy not in {"update", "freeze"}:
             raise ValueError("position_update_policy must be 'update' or 'freeze'")
@@ -63,32 +44,21 @@ class TLSEstimator:
             raise ValueError("residual_adf_max_pvalue must be between 0 and 1")
         self.residual_adf_maxlag = max(0, int(residual_adf_maxlag))
         self.residual_adf_regression = str(residual_adf_regression or "c")
-        self._return_lag_state = None
-        self._x_return_lag = deque(maxlen=self.return_interval_bars)
-        self._y_return_lag = deque(maxlen=self.return_interval_bars)
-        self.latest_return_values = None
         self.collect_diagnostics = True
 
     def update(self, state, x_close, y_close, bar_index, para=None):
         has_position = bool(((para or {}).get("position") or {}).get("has_position", False))
         state.x_close_history = ensure_deque(state.x_close_history, self.warmup_bars)
         state.y_close_history = ensure_deque(state.y_close_history, self.warmup_bars)
-        self._sync_return_lag(state)
-        self.latest_return_values = None
         ready = self._model_ready(state)
         latest_spread = None
         if ready:
-            x_t, y_t = self._transform(state, x_close, y_close)
-            if self.regression_method in {"log_return", "log_returns"}:
-                self.latest_return_values = (x_t, y_t)
+            x_t, y_t = self._transform(x_close, y_close)
             latest_spread = float(y_t - (float(state.alpha or 0.0) + float(state.spread_beta) * x_t))
         output = self._output(state, bar_index, ready, latest_spread, has_position)
 
         state.x_close_history.append(float(x_close))
         state.y_close_history.append(float(y_close))
-        if self.regression_method in {"log_return", "log_returns"}:
-            self._x_return_lag.append(float(x_close))
-            self._y_return_lag.append(float(y_close))
         if len(state.x_close_history) < self.warmup_bars:
             output.ready = False
             output.reason = f"warmup {len(state.x_close_history)}/{self.warmup_bars}"
@@ -232,54 +202,15 @@ class TLSEstimator:
             return None, None
         if self.regression_method == "log_price":
             x_arr, y_arr = np.log(np.clip(x_arr, 1e-12, None)), np.log(np.clip(y_arr, 1e-12, None))
-        elif self.regression_method in {"log_return", "log_returns"}:
-            x_arr = self._sample_log_returns(x_arr)
-            y_arr = self._sample_log_returns(y_arr)
-        elif self.regression_method not in {"price", "raw_price"}:
+        elif self.regression_method != "price":
             raise ValueError(f"unsupported regression_method: {self.regression_method}")
         mask = np.isfinite(x_arr) & np.isfinite(y_arr)
         x_arr, y_arr = x_arr[mask], y_arr[mask]
         return (x_arr, y_arr) if len(x_arr) >= 10 else (None, None)
 
-    def _sample_log_returns(self, prices):
-        prices = np.asarray(prices, dtype=float)
-        complete_intervals = (len(prices) - 1) // self.return_interval_bars
-        first_endpoint = len(prices) - 1 - complete_intervals * self.return_interval_bars
-        sampled_prices = prices[first_endpoint::self.return_interval_bars]
-        return np.diff(np.log(np.clip(sampled_prices, 1e-12, None)))
-
-    def _sync_return_lag(self, state):
-        if self.regression_method not in {"log_return", "log_returns"}:
-            return
-        if self._return_lag_state is state:
-            return
-        self._return_lag_state = state
-        self._x_return_lag = deque(
-            tail_values(state.x_close_history, self.return_interval_bars),
-            maxlen=self.return_interval_bars,
-        )
-        self._y_return_lag = deque(
-            tail_values(state.y_close_history, self.return_interval_bars),
-            maxlen=self.return_interval_bars,
-        )
-
-    def _transform(self, state, x_close, y_close):
+    def _transform(self, x_close, y_close):
         if self.regression_method == "log_price":
             return log(max(float(x_close), 1e-12)), log(max(float(y_close), 1e-12))
-        if self.regression_method in {"log_return", "log_returns"}:
-            if len(self._x_return_lag) >= self.return_interval_bars:
-                base_x = float(self._x_return_lag[0])
-                base_y = float(self._y_return_lag[0])
-            elif len(state.x_close_history) >= self.return_interval_bars:
-                # Direct calls outside update() retain the same behavior.
-                base_x = float(state.x_close_history[-self.return_interval_bars])
-                base_y = float(state.y_close_history[-self.return_interval_bars])
-            else:
-                raise ValueError("insufficient price history for return interval")
-            return (
-                log(max(float(x_close), 1e-12) / max(base_x, 1e-12)),
-                log(max(float(y_close), 1e-12) / max(base_y, 1e-12)),
-            )
         return float(x_close), float(y_close)
 
     def _update_due(self, state, bar_index):
@@ -298,7 +229,6 @@ class TLSEstimator:
             para = {"estimator": {
                 "method": self.method_name,
                 "regression_method": self.regression_method,
-                "return_interval_bars": self.return_interval_bars,
                 "position_update_policy": self.position_update_policy,
                 "model_updated_at": state.last_model_update_index,
                 "next_model_update_at": state.next_model_update_index,

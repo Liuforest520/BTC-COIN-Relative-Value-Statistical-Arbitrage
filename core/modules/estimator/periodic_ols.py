@@ -46,6 +46,8 @@ class PeriodicOLSEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.model_lookback_bars = int(model_lookback_bars)
         self.model_update_interval_bars = max(1, int(model_update_interval_bars))
         self.warmup_bars = self.model_lookback_bars
@@ -56,6 +58,10 @@ class PeriodicOLSEstimator:
             int(hedge_model_update_interval_bars or self.model_update_interval_bars),
         )
         self.hedge_regression_method = hedge_regression_method or regression_method
+        if self.hedge_regression_method not in {"log_price", "price"}:
+            raise ValueError(
+                f"unsupported hedge_regression_method: {self.hedge_regression_method}"
+            )
 
     def update(
         self,
@@ -250,11 +256,8 @@ class PeriodicOLSEstimator:
         if method == "log_price":
             x_arr = np.log(np.clip(x_arr, 1e-12, None))
             y_arr = np.log(np.clip(y_arr, 1e-12, None))
-        elif method in {"price", "raw_price"}:
+        elif method == "price":
             pass
-        elif method in {"returns", "log_returns", "deming_returns"}:
-            x_arr = np.diff(np.log(np.clip(x_arr, 1e-12, None)))
-            y_arr = np.diff(np.log(np.clip(y_arr, 1e-12, None)))
         else:
             raise ValueError(f"unsupported regression_method: {method}")
 

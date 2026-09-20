@@ -185,6 +185,76 @@ def test_grouped_market_orders_wait_until_all_legs_have_current_bars():
     assert exchange.orders == []
 
 
+def test_grouped_orders_across_exchanges_wait_for_both_legs():
+    binance = Exchange("binance", initial_cash=100000.0, fee_rate=0.0, slippage_bps=0.0, max_leverage=10.0)
+    other = Exchange("other", initial_cash=100000.0, fee_rate=0.0, slippage_bps=0.0, max_leverage=10.0)
+    manager = ExchangeManager({"binance": binance, "other": other})
+    orders = [
+        Order(
+            order_id="xo", group_id="cross", exchange="binance", symbol="X",
+            action=OrderAction.OPEN, side=OrderSide.BUY, order_type=OrderType.MARKET,
+            quantity=1.0, pair_id="p",
+        ),
+        Order(
+            order_id="yo", group_id="cross", exchange="other", symbol="Y",
+            action=OrderAction.OPEN, side=OrderSide.SELL, order_type=OrderType.MARKET,
+            quantity=1.0, pair_id="p",
+        ),
+    ]
+    manager.place_orders(orders)
+    first = manager.on_bar({"binance": {"X": [1, 10, 10, 10, 10, 1]}, "other": {}})
+    assert first["new_trades"] == []
+    assert len(binance.orders) == 1 and len(other.orders) == 1
+    second = manager.on_bar({
+        "binance": {"X": [2, 10, 10, 10, 10, 1]},
+        "other": {"Y": [2, 10, 10, 10, 10, 1]},
+    })
+    assert len(second["new_trades"]) == 2
+
+
+def test_grouped_orders_across_exchanges_scale_both_legs_when_margin_is_short():
+    """A cross-exchange Pair uses one common affordable fill scale."""
+    binance = Exchange(
+        "binance", initial_cash=100.0, fee_rate=0.0, slippage_bps=0.0,
+        max_leverage=1.0,
+    )
+    other = Exchange(
+        "other", initial_cash=100.0, fee_rate=0.0, slippage_bps=0.0,
+        max_leverage=1.0,
+    )
+    manager = ExchangeManager({"binance": binance, "other": other})
+    orders = [
+        Order(
+            order_id="xo", group_id="margin-cross", exchange="binance", symbol="X",
+            action=OrderAction.OPEN, side=OrderSide.BUY, order_type=OrderType.MARKET,
+            quantity=20.0, pair_id="p",
+        ),
+        Order(
+            order_id="yo", group_id="margin-cross", exchange="other", symbol="Y",
+            action=OrderAction.OPEN, side=OrderSide.SELL, order_type=OrderType.MARKET,
+            quantity=1.0, pair_id="p",
+        ),
+    ]
+    manager.place_orders(orders)
+
+    result = manager.on_bar({
+        "binance": {"X": [1, 10, 10, 10, 10, 1]},
+        "other": {"Y": [1, 10, 10, 10, 10, 1]},
+    })
+
+    assert result["rejected_orders"] == []
+    fills = {trade.symbol: trade for trade in result["new_trades"]}
+    assert fills["X"].quantity == 10.0
+    assert fills["Y"].quantity == 0.5
+    assert fills["X"].fill_scale == fills["Y"].fill_scale == 0.5
+    assert binance.orders == []
+    assert other.orders == []
+    assert {order.order_id for order in binance.order_history} == {"xo"}
+    assert {order.order_id for order in other.order_history} == {"yo"}
+    assert binance.used_margin == 100.0
+    assert other.used_margin == 5.0
+
+
 def test_backtest_start_time_filters_streamed_bars():
     config = _config()
     config.backtest_start_time = "1970-01-01T00:00:03Z"
@@ -209,14 +279,16 @@ def test_backtest_start_time_filters_streamed_bars():
 
 def test_final_position_valuation_marks_open_positions_at_last_prices():
     backtest = Backtest.__new__(Backtest)
+    exchange = Exchange("binance", initial_cash=900.0, fee_rate=0.0, slippage_bps=0.0)
+    exchange.positions = {"A": 2.0, "B": -3.0}
+    exchange.position_lots = {"p": {"A": 2.0, "B": -3.0}}
+    exchange.position_entry_prices = {"p": {"A": 9.0, "B": 5.0}}
+    exchange.last_bars = {
+        "A": {"ts": 10, "open": 9.0, "high": 11.0, "close": 10.0, "low": 8.0, "volume": 100.0},
+        "B": {"ts": 10, "open": 3.0, "high": 5.0, "close": 4.0, "low": 2.0, "volume": 100.0},
+    }
     backtest.exchange_manager = SimpleNamespace(
-        exchanges={
-            "binance": SimpleNamespace(
-                cash=900.0,
-                positions={"A": 2.0, "B": -3.0},
-                last_bars={},
-            )
-        }
+        exchanges={"binance": exchange}
     )
     bars = {
         "binance": {
@@ -229,9 +301,14 @@ def test_final_position_valuation_marks_open_positions_at_last_prices():
 
     assert valuation["ts"] == 10
     assert valuation["cash"] == 900.0
-    assert valuation["position_value"] == 8.0
+    assert valuation["position_value"] == 5.0
+    assert valuation["unrealized_pnl"] == 5.0
+    # Margin is locked from execution notional (2*9 + 3*5), while current
+    # gross exposure still follows the final marks (2*10 + 3*4).
+    assert valuation["used_margin"] == 33.0
+    assert valuation["available_balance"] == 867.0
     assert valuation["long_value"] == 20.0
     assert valuation["short_value"] == 12.0
     assert valuation["gross_exposure"] == 32.0
     assert valuation["net_exposure"] == 8.0
-    assert valuation["equity"] == 908.0
+    assert valuation["equity"] == 905.0

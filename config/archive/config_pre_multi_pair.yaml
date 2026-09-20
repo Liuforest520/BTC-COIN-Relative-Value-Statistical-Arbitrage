@@ -104,7 +104,7 @@ setups:
         model_update_interval_bars: 1440      # 每 1440 bar 重估一次
         hedge_model_lookback_bars: 28800      # hedge_model 窗口
         hedge_model_update_interval_bars: 1440
-        hedge_regression_method: returns      # hedge_model 用 returns 回归
+        hedge_regression_method: log_price    # 已统一为 Log Price 回归
         zscore_lookback_bars: 1440
       # ===== 旧版信号参数（等待回归后入场 + two-stage）=====
       signal:
@@ -136,7 +136,6 @@ setups:
       portfolio:
         method: equal_weight
         allocation_mode: equal_cap
-        max_open_pairs: 15
         max_entries_per_pair: 4        # 首仓 + 最多 3 次加仓（对应旧版 max_add_times 3）
         add_cooldown_bars: 720         # 加仓间隔 720 bar（对应旧版 add_interval_bars 720）
         min_hold_bars: 0

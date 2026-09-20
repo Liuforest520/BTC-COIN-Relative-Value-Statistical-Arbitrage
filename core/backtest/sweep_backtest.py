@@ -116,6 +116,9 @@ class SweepBacktest(Backtest):
             new_trades = exchange_result["new_trades"]
             rejected_orders = exchange_result["rejected_orders"]
             self.strategy.on_funding_rates(funding_rates)
+            funding_callback = getattr(self.strategy, "on_funding_payments", None)
+            if callable(funding_callback):
+                funding_callback(exchange_result.get("funding_payments", []))
             previous_ts = ts
 
             if new_trades:
@@ -130,6 +133,7 @@ class SweepBacktest(Backtest):
             self.strategy.set_portfolio_context(
                 cash=portfolio_snapshot.get("cash", 0),
                 equity=portfolio_snapshot.get("equity", 0),
+                available_balance=portfolio_snapshot.get("available_balance", 0),
             )
             orders = self.strategy(bars)
             if not orders:

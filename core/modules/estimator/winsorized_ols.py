@@ -25,11 +25,11 @@ class WinsorizedOLSEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.model_lookback_bars = max(10, int(model_lookback_bars))
         self.model_update_interval_bars = max(1, int(model_update_interval_bars))
-        self.price_history_bars = self.model_lookback_bars + (
-            1 if regression_method in {"log_return", "log_returns"} else 0
-        )
+        self.price_history_bars = self.model_lookback_bars
         self.warmup_bars = self.price_history_bars
         if position_update_policy not in {"update", "freeze"}:
             raise ValueError("position_update_policy must be 'update' or 'freeze'")
@@ -60,7 +60,7 @@ class WinsorizedOLSEstimator:
         ready = self._ready(state)
         spread = None
         if ready:
-            x_t, y_t = self._transform_current(state, x_close, y_close)
+            x_t, y_t = self._transform_current(x_close, y_close)
             spread = float(y_t - (float(state.alpha or 0) + float(state.spread_beta) * x_t))
         output = self._output(state, bar_index, ready, spread, has_position)
         state.x_close_history.append(float(x_close))
@@ -196,23 +196,15 @@ class WinsorizedOLSEstimator:
             return None, None
         if self.regression_method == "log_price":
             x, y = np.log(np.clip(x, 1e-12, None)), np.log(np.clip(y, 1e-12, None))
-        elif self.regression_method in {"log_return", "log_returns"}:
-            x = np.diff(np.log(np.clip(x, 1e-12, None)))
-            y = np.diff(np.log(np.clip(y, 1e-12, None)))
-        elif self.regression_method not in {"price", "raw_price"}:
+        elif self.regression_method != "price":
             raise ValueError(f"unsupported regression_method: {self.regression_method}")
         mask = np.isfinite(x) & np.isfinite(y)
         x, y = x[mask], y[mask]
         return (x, y) if len(x) >= self.model_lookback_bars else (None, None)
 
-    def _transform_current(self, state, x_close, y_close):
+    def _transform_current(self, x_close, y_close):
         if self.regression_method == "log_price":
             return log(max(float(x_close), 1e-12)), log(max(float(y_close), 1e-12))
-        if self.regression_method in {"log_return", "log_returns"}:
-            return (
-                log(max(float(x_close), 1e-12) / max(float(state.x_close_history[-1]), 1e-12)),
-                log(max(float(y_close), 1e-12) / max(float(state.y_close_history[-1]), 1e-12)),
-            )
         return float(x_close), float(y_close)
 
     def _due(self, state, bar_index):

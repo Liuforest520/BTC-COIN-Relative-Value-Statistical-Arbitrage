@@ -1,6 +1,8 @@
 """MultiPairStrategy: orchestrates PairPipelines + PortfolioAllocator + OrderPlanner."""
 from __future__ import annotations
 
+from math import ceil, isfinite
+from uuid import uuid4
 from dataclasses import replace
 from typing import Any
 
@@ -14,6 +16,12 @@ from core.modules.models.pipeline_types import (
     PortfolioState,
     RawPairTarget,
 )
+from core.modules.strategy.position_protection import (
+    mark_net_pnl,
+    solve_zero_net_x_price,
+    supported as protection_supported,
+)
+from core.modules.strategy.protection import ProtectionContext, ProtectionManager
 from core.modules.strategy.base import BaseStrategy
 from core.modules.strategy.config import (
     EstimatorConfig,
@@ -22,6 +30,8 @@ from core.modules.strategy.config import (
     PortfolioConfig,
     SignalConfig,
     SizingConfig,
+    ProtectionConfig,
+    RebalanceConfig,
 )
 from core.modules.strategy.pair_pipeline import PairPipeline, _dataclass_to_dict, _merge_para
 
@@ -41,6 +51,10 @@ class MultiPairStrategy(BaseStrategy):
         portfolio_ctor=None,
         portfolio_cfg: PortfolioConfig | None = None,
         execution_cfg: ExecutionConfig | None = None,
+        protection_cfg: ProtectionConfig | None = None,
+        rebalance_cfg: RebalanceConfig | None = None,
+        fee_rate: float = 0.0005,
+        slippage_bps: float = 1.0,
         name: str = "multi_pair",
     ):
         super().__init__()
@@ -50,6 +64,22 @@ class MultiPairStrategy(BaseStrategy):
         self.pipelines: dict[str, PairPipeline] = {}
         self.portfolio_state = PortfolioState()
         self.order_planner = OrderPlanner(execution_cfg)
+        self.estimator_cfg = estimator_cfg
+        self.signal_cfg = signal_cfg or SignalConfig()
+        self.sizing_cfg = sizing_cfg
+        self.portfolio_cfg = portfolio_cfg or PortfolioConfig()
+        self.protection_cfg = protection_cfg or ProtectionConfig()
+        self.rebalance_cfg = rebalance_cfg or RebalanceConfig()
+        self.protection_manager = ProtectionManager(self.protection_cfg)
+        self.fee_rate = max(0.0, float(fee_rate))
+        self.slippage_rate = max(0.0, float(slippage_bps)) / 10000.0
+        self.protection_supported = protection_supported(
+            self.estimator_cfg.regression_method,
+            self.estimator_cfg.position_update_policy,
+            self.protection_cfg.enabled
+            or self.protection_cfg.max_holding_time_enabled
+            or self.protection_cfg.pair_loss_stop_enabled,
+        )
 
         for pair_def in pairs:
             if not pair_def.enabled:
@@ -65,6 +95,13 @@ class MultiPairStrategy(BaseStrategy):
                 execution_cfg,
             )
 
+        # Validate the effective estimator lookback up front when the feature
+        # is enabled. Pair-level lookback overrides are already applied by
+        # PairPipeline, so each pair gets the same semantics as its model.
+        if self.protection_cfg.max_holding_time_enabled:
+            for pipeline in self.pipelines.values():
+                self._max_holding_bars_for_pipeline(pipeline)
+
         if portfolio_ctor and portfolio_cfg:
             self.portfolio = portfolio_ctor(**_dataclass_to_dict(portfolio_cfg))
             if hasattr(self.portfolio, "total_pair_count"):
@@ -72,14 +109,13 @@ class MultiPairStrategy(BaseStrategy):
         else:
             self.portfolio = None
 
-        self.estimator_cfg = estimator_cfg
-        self.signal_cfg = signal_cfg
-        self.sizing_cfg = sizing_cfg
-        self.portfolio_cfg = portfolio_cfg
         self.max_entries_per_pair = max(1, int(getattr(portfolio_cfg, "max_entries_per_pair", 1) or 1))
         self.add_cooldown_bars = max(0, int(getattr(portfolio_cfg, "add_cooldown_bars", 0) or 0))
         self.min_hold_bars = max(0, int(getattr(portfolio_cfg, "min_hold_bars", 0) or 0))
         self._pair_bar_indices: dict[str, int] = {}
+        self._pending_open_pair_ids: set[str] = set()
+        self._pending_rebalance_pair_ids: set[str] = set()
+        self._pending_rebalance_release: float = 0.0
 
         self.signal = self
         self.last_state: dict[str, Any] = {}
@@ -102,12 +138,7 @@ class MultiPairStrategy(BaseStrategy):
                 state[prefix + "spread_mean"] = estimator.spread_mean
                 state[prefix + "spread_std"] = estimator.spread_std
                 state[prefix + "latest_spread"] = estimator.latest_spread
-            state[prefix + "position_exit_zscore"] = getattr(
-                pipeline, "_last_position_exit_zscore", None
-            )
-            state[prefix + "position_exit_zscore_method"] = (
-                pipeline.position_exit_zscore.method
-            )
+                state[prefix + "last_model_update_index"] = estimator.last_model_update_index
             state[prefix + "action"] = getattr(pipeline, "_last_action", "none")
             state[prefix + "side"] = runtime_state.sizing_state.position_side
             state[prefix + "entry_count"] = runtime_state.sizing_state.entry_count
@@ -123,6 +154,15 @@ class MultiPairStrategy(BaseStrategy):
             state[prefix + "remaining_pair_gross"] = runtime_state.sizing_state.remaining_pair_gross
             state[prefix + "add_cooldown_remaining_bars"] = runtime_state.sizing_state.add_cooldown_remaining_bars
             state[prefix + "min_hold_remaining_bars"] = runtime_state.sizing_state.min_hold_remaining_bars
+            state[prefix + "max_holding_bars"] = runtime_state.protection_state.max_holding_bars
+            state[prefix + "max_holding_deadline_bar"] = runtime_state.protection_state.max_holding_deadline_bar
+            state[prefix + "reopen_lock_pending"] = runtime_state.protection_state.reopen_lock_pending
+            state[prefix + "pair_loss_stop_freeze_until_bar"] = runtime_state.protection_state.pair_loss_stop_freeze_until_bar
+            state[prefix + "protection_rule"] = runtime_state.protection_state.protection_rule
+            state[prefix + "freeze_rule"] = runtime_state.protection_state.freeze_rule
+            state[prefix + "freeze_bars"] = runtime_state.protection_state.freeze_bars
+            state[prefix + "freeze_until_bar"] = runtime_state.protection_state.freeze_until_bar
+            state[prefix + "last_exit_class"] = runtime_state.protection_state.last_exit_class
             state[prefix + "block_reason"] = runtime_state.last_block_reason
         self.last_state = state
         return state
@@ -147,13 +187,19 @@ class MultiPairStrategy(BaseStrategy):
             self._pair_bar_indices[pair_id] = pair_bar_index
             result = pipeline.on_bar(bundle, compute_sizing=False)
             results[pair_id] = result
+            self._maybe_release_protection_lock(pipeline)
             if result.signal:
-                pipeline._last_zscore = result.signal.zscore
+                signal_details = (getattr(result.signal, "para", {}) or {}).get("signal") or {}
+                pipeline._last_zscore = signal_details.get(
+                    "standard_zscore", result.signal.zscore
+                )
                 pipeline._last_action = result.signal.action
 
         orders: list[Order] = []
         entry_candidates: dict[str, dict[str, Any]] = {}
         entry_targets: dict[str, RawPairTarget] = {}
+        self.portfolio_state.open_pair_ids = self._open_pair_ids()
+        self.portfolio_state.open_pair_count = len(self.portfolio_state.open_pair_ids)
         for pair_id, pipeline in self.pipelines.items():
             result = results.get(pair_id)
             if result is None or result.signal is None:
@@ -167,10 +213,37 @@ class MultiPairStrategy(BaseStrategy):
             bundle = bundles.get(pair_id)
             self._refresh_pair_capacity(pair_id, pipeline, pair_def, bundle)
 
+            # Protective exits have priority over the ordinary Z-score exit
+            # and are evaluated on the current bar close.  The generated
+            # market orders are still filled by Exchange on the next bar.
+            protection_decision = self._protection_exit_decision(pipeline, bundle)
+            if protection_decision is not None:
+                protection_orders = self._close_orders(
+                    pair_id,
+                    pipeline,
+                    pair_def,
+                    fallback_hedge,
+                    exit_reason=protection_decision["reason"],
+                    protection_trigger=protection_decision["trigger"],
+                )
+                if protection_orders:
+                    orders.extend(protection_orders)
+                else:
+                    pipeline.state.protection_state.pending_exit = False
+                continue
+            if pipeline.state.protection_state.pending_exit:
+                continue
+
             if signal.action == "close":
                 if self._can_close_pair(pipeline, signal.bar_index):
                     orders.extend(self._close_orders(pair_id, pipeline, pair_def, fallback_hedge))
             elif signal.action in ("open", "add") and signal.side:
+                already_holding = self._pair_holds_position(pipeline)
+                if pair_id in self._pending_open_pair_ids:
+                    reason = "open order pending fill"
+                    pipeline.state.sizing_state.last_schedule_reason = reason
+                    pipeline.state.last_block_reason = reason
+                    continue
                 candidate = self._prepare_entry_candidate(
                     pair_id,
                     pipeline,
@@ -184,18 +257,32 @@ class MultiPairStrategy(BaseStrategy):
                     entry_candidates[pair_id] = candidate
                     entry_targets[pair_id] = candidate["raw_target"]
 
+        rebalance_orders = self._plan_rebalance(entry_candidates, bundles, bar_index)
+        if rebalance_orders:
+            orders.extend(rebalance_orders)
+        # Planned rebalance proceeds are usable by replacement orders on the
+        # next executable bar, but must not mutate the account balance before
+        # the close orders actually fill. Give the allocator a temporary
+        # planning balance and restore the exchange-reported value afterwards.
+        actual_available = float(self.portfolio_state.available_balance or 0.0)
+        planned_available = actual_available + float(self._pending_rebalance_release or 0.0)
+        self.portfolio_state.available_balance = planned_available
         allocation = self._allocate_entry_targets(entry_targets, bar_index)
+        self.portfolio_state.available_balance = actual_available
         orders.extend(self._orders_from_entry_allocation(entry_candidates, allocation))
+        self._pending_rebalance_release = 0.0
 
         self._update_portfolio_state(bundles, ts, bar_index, allocation)
         return orders
 
     def _sync_account_context(self):
         equity = getattr(self, "_current_equity", None)
-        if equity is None or equity <= 0:
+        if equity is None:
             return
         if self.portfolio is not None and hasattr(self.portfolio, "equity"):
             self.portfolio.equity = float(equity)
+        self.portfolio_state.equity = float(equity or 0.0)
+        self.portfolio_state.available_balance = max(0.0, float(getattr(self, "_current_available_balance", 0.0) or 0.0))
 
     def _prepare_entry_candidate(
         self,
@@ -222,6 +309,21 @@ class MultiPairStrategy(BaseStrategy):
             return None
 
         signal_para = _merge_para(getattr(result, "para", {}), getattr(signal, "para", {}))
+        if self.protection_supported:
+            signal_para = _merge_para(signal_para, {
+                "protection": {
+                    "enabled": True,
+                    "regression_method": self.estimator_cfg.regression_method,
+                    "position_update_policy": self.estimator_cfg.position_update_policy,
+                    "alpha": result.estimator.alpha,
+                    "beta": result.estimator.beta,
+                    "spread_mean": result.estimator.spread_mean,
+                    "spread_std": result.estimator.spread_std,
+                    "exit_z": signal.exit_z,
+                    "signal_ts": signal.ts,
+                    "signal_bar_index": signal.bar_index,
+                }
+            })
         signal_para = _merge_para(signal_para, {
             "portfolio": {
                 "scheduled_action": decision["action"],
@@ -233,6 +335,7 @@ class MultiPairStrategy(BaseStrategy):
                 "pair_cap_gross": sizing_state.pair_cap_gross,
                 "entry_gross_cap": sizing_state.entry_gross_cap,
                 "remaining_pair_gross": sizing_state.remaining_pair_gross,
+                "target_capital": pair_def.target_capital,
                 "position_id": sizing_state.position_id,
             },
             "pair": {
@@ -258,6 +361,43 @@ class MultiPairStrategy(BaseStrategy):
             pipeline.state.last_block_reason = reason
             return None
 
+        # Compute the candidate's frozen-model theoretical zero-net-return
+        # boundary at signal time.  This is historical/model information only;
+        # no next-bar price is used.  Rebalance quality gates can therefore
+        # inspect the same quantity and cost basis that protection will use
+        # after the eventual fill.
+        if self.protection_supported:
+            try:
+                boundary = solve_zero_net_x_price(
+                    self.estimator_cfg.regression_method,
+                    result.estimator.alpha,
+                    result.estimator.beta,
+                    result.estimator.spread_mean,
+                    result.estimator.spread_std,
+                    signal.exit_z,
+                    signal.side,
+                    bundle.x_bar.close,
+                    bundle.y_bar.close,
+                    raw_target.x_quantity,
+                    raw_target.y_quantity,
+                    (abs(raw_target.x_notional) + abs(raw_target.y_notional))
+                    * (self.fee_rate + self.slippage_rate),
+                    self.fee_rate,
+                    self.slippage_rate,
+                )
+                x_move = None
+                if boundary.x_price is not None and bundle.x_bar.close > 0:
+                    x_move = abs(float(boundary.x_price) / float(bundle.x_bar.close) - 1.0)
+                signal_para = _merge_para(signal_para, {
+                    "protection": {
+                        "theoretical_zero_return_x_move": x_move,
+                        "theoretical_zero_return_x_price": boundary.x_price,
+                        "theoretical_zero_return_x_direction": boundary.trigger_direction,
+                        "theoretical_zero_return_reason": boundary.reason,
+                    }
+                })
+            except (TypeError, ValueError, OverflowError):
+                pass
         raw_target.para = _merge_para(raw_target.para, signal_para)
         raw_target.reason = f"{raw_target.reason}; scheduled_{decision['action']}"
         result.raw_target = raw_target
@@ -270,6 +410,7 @@ class MultiPairStrategy(BaseStrategy):
             "signal": signal,
             "scheduled_action": decision["action"],
             "raw_target": raw_target,
+            "result": result,
             "fallback_hedge": fallback_hedge,
             "position_id": sizing_state.position_id if decision["action"] == "add" else None,
         }
@@ -287,6 +428,23 @@ class MultiPairStrategy(BaseStrategy):
 
     def _entry_schedule_decision(self, pipeline, signal, bar_index) -> dict[str, Any]:
         state = pipeline.state.sizing_state
+        protection_state = pipeline.state.protection_state
+        freeze_until = protection_state.freeze_until_bar
+        if freeze_until is None:
+            freeze_until = protection_state.pair_loss_stop_freeze_until_bar
+        if freeze_until is not None and bar_index < freeze_until:
+            rule = protection_state.freeze_rule or "pair loss stop"
+            return {
+                "allowed": False,
+                "action": "none",
+                "reason": f"{rule} freeze {freeze_until - bar_index} bars remaining",
+            }
+        if protection_state.reopen_lock_pending:
+            return {
+                "allowed": False,
+                "action": "none",
+                "reason": "waiting for model update after protective exit",
+            }
         side = signal.side
         if not side:
             return {"allowed": False, "action": "none", "reason": "entry signal has no side"}
@@ -319,6 +477,186 @@ class MultiPairStrategy(BaseStrategy):
 
         return {"allowed": True, "action": "add", "reason": f"add entry #{state.entry_count + 1}"}
 
+    def _plan_rebalance(self, entry_candidates, bundles, bar_index):
+        """Plan one atomic batch of replacements for all underfunded entries.
+
+        The decision is made once per strategy bar: calculate the aggregate
+        minimum capital required by the new entries, rank current positions by
+        net floating return, and select enough old Pairs in one batch.  Close
+        groups are emitted before open groups; the exchange then releases the
+        real margin before executing replacements on the same fill bar.
+        """
+        if not self.rebalance_cfg.enabled or not entry_candidates:
+            return []
+
+        available = max(0.0, float(self.portfolio_state.available_balance or 0.0))
+        requirements = []
+        for new_id, candidate in entry_candidates.items():
+            pipeline = self.pipelines.get(new_id)
+            if pipeline is None or self._pair_holds_position(pipeline):
+                continue
+            raw = candidate.get("raw_target")
+            target = float(getattr(raw, "gross_notional", 0.0) or 0.0)
+            if target <= 0:
+                target = float(getattr(raw, "target_capital", 0.0) or 0.0)
+            if target <= 0:
+                continue
+            minimum = target * float(self.rebalance_cfg.minimum_entry_capital_ratio)
+            requirements.append((new_id, target, minimum, candidate))
+
+        if not requirements:
+            return []
+        # Mirror PairTargetCapitalAllocator's sequential policy.  A partially
+        # fundable candidate consumes the remaining balance, so later
+        # candidates do not create extra liquidation demand on this bar.  If a
+        # candidate is below its minimum, release only the shortfall to that
+        # minimum; the allocator then uses all resulting available capital.
+        planning_available = available
+        release_needed = 0.0
+        for _new_id, target, minimum, _candidate in requirements:
+            if planning_available >= target - 1e-9:
+                planning_available -= target
+                continue
+            if planning_available >= minimum - 1e-9:
+                planning_available = 0.0
+                break
+            release_needed = minimum - planning_available
+            break
+        if release_needed <= 1e-9:
+            return []
+
+        eligible = []
+        for pair_id, old_pipeline in self.pipelines.items():
+            old_bundle = bundles.get(pair_id)
+            # A replacement must not be planned against a Pair whose current
+            # executable bar is incomplete; otherwise its close could wait
+            # while the new entry is filled without the intended release.
+            if (pair_id in self._pending_rebalance_pair_ids
+                    or not self._pair_holds_position(old_pipeline)
+                    or old_bundle is None
+                    or old_bundle.x_bar is None
+                    or old_bundle.y_bar is None):
+                continue
+            pnl_return = self._pair_unrealized_return(old_pipeline, old_bundle)
+            eligible.append((pnl_return, pair_id, old_pipeline))
+        eligible.sort(key=lambda item: (item[0], item[1]))
+        if not eligible:
+            return []
+
+        # Losing positions are always eligible.  Replacing a position that is
+        # already profitable requires the configured scenario/ADF gate.
+        gate_passed = all(item[0] >= 0.0 for item in eligible)
+        if gate_passed:
+            for _new_id, _target, _minimum, candidate in requirements:
+                if not self._profitable_replacement_allowed(candidate):
+                    return []
+        selected = []
+        release = 0.0
+        orders = []
+        rebalance_batch_id = None
+        for pnl_return, pair_id, old_pipeline in eligible:
+            if pnl_return >= 0.0:
+                # Once a losing position is insufficient, profitable positions
+                # may be used only when the candidate passes the replacement
+                # quality gate.
+                if any(not self._profitable_replacement_allowed(item[3]) for item in requirements):
+                    continue
+            old_state = old_pipeline.state.sizing_state
+            if self.rebalance_cfg.eviction_min_holding_bars > 0:
+                entry_bar = old_pipeline.state.protection_state.entry_bar_index
+                if entry_bar is not None and bar_index - entry_bar < self.rebalance_cfg.eviction_min_holding_bars:
+                    continue
+            gross = float(old_state.current_gross_notional or 0.0)
+            if gross <= 0:
+                old_bundle = bundles.get(pair_id)
+                if old_bundle is not None:
+                    gross = abs(old_state.x_quantity * old_bundle.x_bar.close) + abs(old_state.y_quantity * old_bundle.y_bar.close)
+            if rebalance_batch_id is None:
+                rebalance_batch_id = str(uuid4())[:8]
+            close_orders = self._close_orders(
+                pair_id, old_pipeline, old_pipeline.pair_def,
+                old_state.target_hedge_ratio or old_pipeline.state.estimator_state.hedge_beta or 1.0,
+                exit_reason="rebalance_replacement",
+                protection_trigger="rebalance_replacement",
+                exit_class="rebalance_replacement",
+                protection_freeze_bars=self._rebalance_freeze_bars(old_pipeline),
+                rebalance_batch_id=rebalance_batch_id,
+            )
+            if not close_orders:
+                continue
+            orders.extend(close_orders)
+            self._pending_rebalance_pair_ids.add(pair_id)
+            selected.append(pair_id)
+            release += max(0.0, gross)
+            if release >= release_needed - 1e-9:
+                break
+
+        if not selected:
+            return []
+        for requirement in requirements:
+            requirement[3]["raw_target"].para.setdefault("portfolio", {})["rebalance_batch_id"] = rebalance_batch_id
+        self._pending_rebalance_release += release
+        return orders
+
+    def _pair_unrealized_return(self, pipeline, bundle):
+        state = pipeline.state.sizing_state
+        pstate = pipeline.state.protection_state
+        if bundle is None or pstate.entry_gross_notional <= 0:
+            return 0.0
+        side = state.position_side or pstate.side
+        x_entry = pstate.entry_x_price or bundle.x_bar.close
+        y_entry = pstate.entry_y_price or bundle.y_bar.close
+        pnl = mark_net_pnl(
+            side,
+            float(bundle.x_bar.close),
+            float(bundle.y_bar.close),
+            x_entry,
+            y_entry,
+            state.x_quantity,
+            state.y_quantity,
+            pstate.entry_fee,
+            pstate.funding_cost,
+            self.fee_rate,
+            self.slippage_rate,
+        )
+        return float(pnl / max(pstate.entry_gross_notional, 1e-12))
+
+    def _profitable_replacement_allowed(self, candidate):
+        rule = self.rebalance_cfg.profitable_position_replacement
+        if not rule.enabled:
+            return False
+        result = candidate.get("result") or {}
+        estimator = getattr(result, "estimator", None)
+        pvalue = getattr(estimator, "cointegration_pvalue", None)
+        if pvalue is None or float(pvalue) > rule.max_adf_pvalue:
+            return False
+        raw = candidate.get("raw_target")
+        para = getattr(raw, "para", {}) or {}
+        protection = para.get("protection", {}) if isinstance(para, dict) else {}
+        move = protection.get("theoretical_zero_return_x_move")
+        if move is None:
+            stop_price = protection.get("stop_loss_x_price")
+            entry_price = protection.get("entry_x_price")
+            if stop_price is not None and entry_price:
+                move = abs(float(stop_price) / float(entry_price) - 1.0)
+        try:
+            return move is not None and float(move) >= rule.min_theoretical_zero_return_x_move
+        except (TypeError, ValueError):
+            return False
+
+    def _rebalance_freeze_bars(self, pipeline):
+        multiplier = float(self.rebalance_cfg.closed_pair_freeze_model_lookback_multiplier)
+        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
+        if lookback is None:
+            lookback = getattr(self.estimator_cfg, "model_lookback_bars", 0)
+        lookback = float(lookback or 0.0)
+        if multiplier > 0.0 and (not isfinite(lookback) or lookback <= 0.0):
+            raise ValueError("rebalance freeze multiplier requires a positive model lookback")
+        product = lookback * multiplier
+        if not isfinite(product) or product < 0.0:
+            raise ValueError("rebalance freeze period is invalid")
+        return max(0, int(ceil(product)))
+
     def _allocate_entry_targets(
         self,
         entry_targets: dict[str, RawPairTarget],
@@ -329,6 +667,7 @@ class MultiPairStrategy(BaseStrategy):
         if self.portfolio is not None:
             return self.portfolio.allocate(self.portfolio_state, entry_targets, bar_index)
 
+        # Fallback path: preserve every candidate; Exchange enforces margin.
         pair_targets = {}
         for pair_id, raw in entry_targets.items():
             pair_targets[pair_id] = AllocatedPairTarget(
@@ -371,7 +710,7 @@ class MultiPairStrategy(BaseStrategy):
             target_hedge = alloc_target.hedge_ratio or raw_target.hedge_ratio or candidate["fallback_hedge"]
             if alloc_target.final_x_quantity <= 0 or alloc_target.final_y_quantity <= 0:
                 continue
-            orders.extend(self.order_planner.orders_for_target(
+            pair_orders = self.order_planner.orders_for_target(
                 alloc_target,
                 pair_def,
                 x_exchange=pair_def.x_exchange,
@@ -379,7 +718,8 @@ class MultiPairStrategy(BaseStrategy):
                 hedge_ratio=target_hedge,
                 action="open",
                 position_id=candidate["position_id"],
-            ))
+            )
+            orders.extend(pair_orders)
         return orders
 
     def _refresh_pair_capacity(self, pair_id, pipeline, pair_def, bundle):
@@ -388,8 +728,7 @@ class MultiPairStrategy(BaseStrategy):
             return
 
         equity = self._current_equity_value(pipeline)
-        pair_count = self._pair_cap_count()
-        pair_cap = equity / pair_count if equity > 0 else 0.0
+        pair_cap = self._pair_target_capital(pair_def, pipeline)
         entry_cap = pair_cap / self.max_entries_per_pair if self.max_entries_per_pair > 0 else pair_cap
 
         x_price = bundle.x_bar.close if bundle.x_bar else 0.0
@@ -416,8 +755,35 @@ class MultiPairStrategy(BaseStrategy):
             and (state.entry_count >= self.max_entries_per_pair or remaining <= eps)
         )
 
-    def _pair_cap_count(self) -> int:
-        return max(1, int(getattr(self.portfolio_cfg, "max_open_pairs", 1) or 1))
+    def _pair_target_capital(self, pair_def, pipeline=None) -> float:
+        value = getattr(pair_def, "target_capital", None)
+        if value is not None:
+            return max(0.0, float(value))
+        state = pipeline.state.sizing_state if pipeline is not None else None
+        current = float(getattr(state, "pair_cap_gross", 0.0) or 0.0) if state is not None else 0.0
+        if current > 0:
+            return current
+        return max(0.0, float(getattr(self.sizing_cfg, "notional", 0.0) or 0.0))
+
+    def _open_pair_count(self) -> int:
+        """Return the number of currently occupied Pair positions for diagnostics."""
+        return sum(
+            1 for pipeline in self.pipelines.values() if self._pair_holds_position(pipeline)
+        )
+
+    def _open_pair_ids(self) -> list[str]:
+        return [
+            pair_id
+            for pair_id, pipeline in self.pipelines.items()
+            if self._pair_holds_position(pipeline)
+        ]
+
+    @staticmethod
+    def _pair_holds_position(pipeline) -> bool:
+        state = pipeline.state.sizing_state
+        if state.position_side is not None:
+            return True
+        return abs(float(state.x_quantity)) > 1e-12 or abs(float(state.y_quantity)) > 1e-12
 
     def _current_equity_value(self, pipeline=None) -> float:
         equity = getattr(self, "_current_equity", None)
@@ -485,10 +851,30 @@ class MultiPairStrategy(BaseStrategy):
         exposure["_gross"] = sum(v for k, v in exposure.items() if k != "_gross")
         return exposure
 
-    def _close_orders(self, pair_id, pipeline, pair_def, fallback_hedge) -> list[Order]:
+    def _close_orders(
+        self,
+        pair_id,
+        pipeline,
+        pair_def,
+        fallback_hedge,
+        exit_reason: str | None = None,
+        protection_trigger: str | None = None,
+        exit_class: str | None = None,
+        protection_freeze_bars: int | None = None,
+        rebalance_batch_id: str | None = None,
+    ) -> list[Order]:
         sizing_state = pipeline.state.sizing_state
         if sizing_state.x_quantity <= 0 or sizing_state.y_quantity <= 0:
             return []
+
+        exit_class = self._resolve_exit_class(exit_class, exit_reason, protection_trigger)
+        reopen_lock_pending = self._should_wait_after_non_z_exit(exit_class)
+        protection_state = pipeline.state.protection_state
+        if exit_reason == "rebalance_replacement":
+            protection_state.pending_exit = True
+            protection_state.protection_rule = "rebalance_replacement"
+            protection_state.freeze_rule = "rebalance_replacement"
+            protection_state.freeze_bars = int(protection_freeze_bars or 0)
 
         close_hedge = sizing_state.target_hedge_ratio or fallback_hedge
         target = AllocatedPairTarget(
@@ -498,6 +884,13 @@ class MultiPairStrategy(BaseStrategy):
             hedge_ratio=close_hedge,
             final_x_quantity=sizing_state.x_quantity,
             final_y_quantity=sizing_state.y_quantity,
+            para={
+                "protection": {
+                    "exit_reason": exit_reason,
+                    "protection_trigger": protection_trigger,
+                    "exit_class": exit_class,
+                }
+            } if exit_reason else {},
         )
         orders = self.order_planner.orders_for_target(
             target,
@@ -506,10 +899,250 @@ class MultiPairStrategy(BaseStrategy):
             y_exchange=pair_def.y_exchange,
             hedge_ratio=close_hedge,
             action="close",
+            exit_reason=exit_reason,
+            protection_trigger=protection_trigger,
+            exit_class=exit_class,
+            reopen_lock_pending=reopen_lock_pending,
+            protection_max_holding_bars=protection_state.max_holding_bars,
+            protection_max_holding_deadline_bar=protection_state.max_holding_deadline_bar,
+            protection_pair_loss_stop_return=protection_state.pair_loss_stop_return,
+            protection_pair_loss_stop_freeze_bars=protection_state.pair_loss_stop_freeze_bars,
+            protection_pair_loss_stop_freeze_until_bar=protection_state.pair_loss_stop_freeze_until_bar,
+            protection_rule=protection_state.protection_rule,
+            protection_freeze_bars=(protection_freeze_bars if protection_freeze_bars is not None else protection_state.freeze_bars),
+            rebalance_batch_id=rebalance_batch_id,
+            protection_freeze_until_bar=(
+                (pipeline.state.last_bar_index + 1 + (protection_freeze_bars if protection_freeze_bars is not None else protection_state.freeze_bars))
+                if (protection_freeze_bars if protection_freeze_bars is not None else protection_state.freeze_bars) > 0
+                else protection_state.freeze_until_bar
+            ),
         )
         for order in orders:
             order.position_id = sizing_state.position_id
         return orders
+
+    def _protection_exit_decision(self, pipeline, bundle):
+        if not self.protection_supported or bundle is None:
+            return None
+        state = pipeline.state.protection_state
+        sizing_state = pipeline.state.sizing_state
+        if not state.active or state.pending_exit or sizing_state.position_side is None:
+            return None
+        decision = self.protection_manager.evaluate(ProtectionContext(
+            pipeline=pipeline, bundle=bundle, state=state,
+            sizing_state=sizing_state, config=self.protection_cfg,
+            fee_rate=self.fee_rate, slippage_rate=self.slippage_rate,
+        ))
+        if decision is None:
+            return None
+        state.pending_exit = True
+        state.last_trigger = decision.protection_trigger
+        state.last_exit_reason = decision.diagnostic.get('net_return') and f"pair net return {decision.diagnostic['net_return']:.4%}" or None
+        state.protection_rule = decision.rule_name
+        state.freeze_rule = decision.rule_name
+        state.freeze_bars = int(decision.freeze_bars)
+        state.last_exit_class = decision.exit_class
+        # Keep the old dict contract for callers and historical tests; the
+        # complete decision is carried by the protection state/order metadata.
+        return {"reason": decision.exit_reason, "trigger": decision.protection_trigger}
+
+    def _pair_loss_stop_freeze_bars_for_pipeline(self, pipeline) -> int:
+        configured = getattr(self.protection_cfg, "pair_loss_stop_freeze_model_lookback_multiplier", None)
+        if configured is None:
+            return max(0, int(self.protection_cfg.pair_loss_stop_freeze_bars))
+        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
+        try:
+            lookback = float(lookback)
+            product = lookback * float(configured)
+        except (TypeError, ValueError):
+            product = 0.0
+        if not isfinite(product) or product <= 0.0:
+            raise ValueError("protection.pair_loss_stop_freeze_model_lookback_multiplier requires a valid model lookback")
+        return max(1, int(ceil(product)))
+
+    def _max_holding_bars_for_pipeline(self, pipeline) -> int | None:
+        if not self.protection_cfg.max_holding_time_enabled:
+            return None
+        configured_lookback = getattr(self.estimator_cfg, "model_lookback_bars", None)
+        try:
+            configured_lookback = float(configured_lookback)
+        except (TypeError, ValueError):
+            configured_lookback = 0.0
+        if not isfinite(configured_lookback) or configured_lookback <= 0.0:
+            raise ValueError(
+                "protection.max_holding_time_enabled requires a valid positive estimator model_lookback_bars"
+            )
+        override = getattr(pipeline.pair_def, "model_lookback_bars_override", None)
+        if override is not None:
+            try:
+                override = float(override)
+            except (TypeError, ValueError):
+                override = 0.0
+            if not isfinite(override) or override <= 0.0:
+                raise ValueError(
+                    "protection.max_holding_time_enabled requires a valid positive pair model_lookback_bars_override"
+                )
+        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
+        try:
+            lookback = float(lookback)
+        except (TypeError, ValueError):
+            lookback = 0.0
+        if not isfinite(lookback) or lookback <= 0.0:
+            raise ValueError(
+                "protection.max_holding_time_enabled requires a valid positive estimator model_lookback_bars"
+            )
+        product = lookback * float(
+            self.protection_cfg.max_holding_time_model_lookback_multiplier
+        )
+        if not isfinite(product):
+            raise ValueError(
+                "protection.max_holding_time_model_lookback_multiplier produces an invalid max holding period"
+            )
+        return max(1, int(ceil(product)))
+
+    def _should_wait_after_non_z_exit(self, exit_class: str | None) -> bool:
+        """Only a stop-loss (or max-holding) exit locks the pair.
+
+        A take-profit exit deliberately reopens immediately: the frozen model
+        is still the one that produced the entry, so waiting for the next refit
+        only throws away re-entry opportunities.
+        """
+        if exit_class != "stop_loss":
+            return False
+        configured = self.protection_cfg.wait_for_model_update_after_non_z_exit
+        # Missing key means a legacy config. Preserve the historical
+        # unconditional protective-exit lock in that case.
+        return True if configured is None else bool(configured)
+
+    @staticmethod
+    def _resolve_exit_class(exit_class, exit_reason, protection_trigger) -> str:
+        """Classify a close: zscore_reversion / take_profit / stop_loss.
+
+        Stop-loss and max-holding exits share the ``stop_loss`` class because
+        both mean "the frozen model was wrong, wait for a refit"; a take-profit
+        exit is its own class and never locks the pair.
+        """
+        if exit_class:
+            return str(exit_class)
+        trigger = str(protection_trigger or "")
+        reason = str(exit_reason or "")
+        if trigger == "take_profit" or reason == "protective_take_profit":
+            return "take_profit"
+        if trigger or reason:
+            return "stop_loss"
+        return "zscore_reversion"
+
+    def _initialize_or_update_protection(self, pipeline, group, pair_side):
+        if not self.protection_supported:
+            return
+        state = pipeline.state.protection_state
+        sizing_state = pipeline.state.sizing_state
+        para = self._first_attr(group, "para", {}) or {}
+        protection = dict(para.get("protection") or {}) if isinstance(para, dict) else {}
+        if not state.active:
+            state.entry_x_quantity = 0.0
+            state.entry_y_quantity = 0.0
+            state.entry_x_price = None
+            state.entry_y_price = None
+            state.entry_gross_notional = 0.0
+            state.entry_fee = 0.0
+            state.entry_slippage = 0.0
+            state.funding_cost = 0.0
+            state.active = True
+            state.pending_exit = False
+            state.last_trigger = None
+            state.pair_loss_stop_freeze_until_bar = None
+            state.freeze_rule = None
+            state.freeze_bars = 0
+            state.freeze_until_bar = None
+            state.protection_rule = None
+            state.side = pair_side
+            state.position_id = sizing_state.position_id
+            # Orders created on the current signal bar are filled by the
+            # exchange before the next strategy bar.  Therefore the first
+            # actual fill is the next pair bar, not the signal bar.
+            state.entry_bar_index = pipeline.state.last_bar_index + 1
+            state.entry_ts = self._first_attr(group, "ts", None)
+            state.alpha = protection.get("alpha")
+            state.beta = protection.get("beta")
+            state.spread_mean = protection.get("spread_mean")
+            state.spread_std = protection.get("spread_std")
+            state.exit_z = protection.get("exit_z")
+            state.take_profit_return = float(self.protection_cfg.take_profit_return)
+            state.pair_loss_stop_return = float(self.protection_cfg.pair_loss_stop_return)
+            state.pair_loss_stop_freeze_bars = self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
+            state.max_holding_bars = self._max_holding_bars_for_pipeline(pipeline)
+            state.max_holding_deadline_bar = (
+                state.entry_bar_index + state.max_holding_bars
+                if state.entry_bar_index is not None and state.max_holding_bars is not None
+                else None
+            )
+
+        old_x_qty = state.entry_x_quantity
+        old_y_qty = state.entry_y_quantity
+        for trade in group:
+            symbol = getattr(trade, "symbol", "")
+            qty = abs(float(getattr(trade, "quantity", 0.0) or 0.0))
+            price = float(getattr(trade, "price", 0.0) or 0.0)
+            if symbol == pipeline.pair_def.x_symbol:
+                total = old_x_qty + qty
+                state.entry_x_price = ((state.entry_x_price or 0.0) * old_x_qty + price * qty) / total if total else None
+                state.entry_x_quantity = total
+                old_x_qty = total
+            elif symbol == pipeline.pair_def.y_symbol:
+                total = old_y_qty + qty
+                state.entry_y_price = ((state.entry_y_price or 0.0) * old_y_qty + price * qty) / total if total else None
+                state.entry_y_quantity = total
+                old_y_qty = total
+            state.entry_fee += float(getattr(trade, "fee", 0.0) or 0.0)
+            state.entry_slippage += float(getattr(trade, "slippage", 0.0) or 0.0)
+        state.entry_gross_notional = (
+            state.entry_x_quantity * float(state.entry_x_price or 0.0)
+            + state.entry_y_quantity * float(state.entry_y_price or 0.0)
+        )
+        boundary = solve_zero_net_x_price(
+            self.estimator_cfg.regression_method,
+            state.alpha,
+            state.beta,
+            state.spread_mean,
+            state.spread_std,
+            state.exit_z,
+            state.side,
+            state.entry_x_price,
+            state.entry_y_price,
+            state.entry_x_quantity,
+            state.entry_y_quantity,
+            # The stored entry prices include execution slippage. Subtract
+            # only the separately charged entry fee here; otherwise the
+            # theoretical stop would double-count entry slippage.
+            state.entry_fee,
+            self.fee_rate,
+            self.slippage_rate,
+        )
+        state.stop_loss_x_price = boundary.x_price
+        state.stop_loss_direction = boundary.trigger_direction
+        state.stop_loss_net_pnl = 0.0 if boundary.x_price is not None else None
+        state.stop_loss_reason = boundary.reason
+        for trade in group:
+            trade.protection_stop_x_price = state.stop_loss_x_price
+            trade.protection_take_profit_return = state.take_profit_return
+            trade.protection_target_residual = boundary.target_residual
+            trade.protection_stop_reason = boundary.reason
+            trade.protection_max_holding_bars = state.max_holding_bars
+            trade.protection_max_holding_deadline_bar = state.max_holding_deadline_bar
+            trade.protection_pair_loss_stop_return = state.pair_loss_stop_return
+            trade.protection_pair_loss_stop_freeze_bars = state.pair_loss_stop_freeze_bars
+
+    def _maybe_release_protection_lock(self, pipeline):
+        state = pipeline.state.protection_state
+        if not state.reopen_lock_pending or state.close_bar_index is None:
+            return
+        estimator_state = pipeline.state.estimator_state
+        if (
+            estimator_state.last_model_update_index is not None
+            and estimator_state.last_model_update_index > state.close_bar_index
+        ):
+            state.reopen_lock_pending = False
 
     def _can_close_pair(self, pipeline, bar_index) -> bool:
         sizing_state = pipeline.state.sizing_state
@@ -560,6 +1193,25 @@ class MultiPairStrategy(BaseStrategy):
             return None
         if not target.hedge_ratio:
             target.hedge_ratio = fallback_hedge
+        # Pair target capital is the complete X+Y gross notional. Preserve the
+        # beta-neutral weights produced by sizing while replacing only the
+        # gross amount. Add-ons consume the remaining Pair target.
+        target_capital = getattr(pair_def, "target_capital", None)
+        if target_capital is not None:
+            total = max(float(target.x_notional + target.y_notional), 1e-12)
+            x_weight = float(target.x_notional) / total
+            y_weight = float(target.y_notional) / total
+            state = pipeline.state.sizing_state
+            desired = max(0.0, float(target_capital))
+            if state.position_side is not None:
+                current = float(state.current_gross_notional or 0.0)
+                desired = max(0.0, desired - current)
+            target.x_notional = desired * x_weight
+            target.y_notional = desired * y_weight
+            target.x_quantity = target.x_notional / x_price if x_price > 0 else 0.0
+            target.y_quantity = target.y_notional / y_price if y_price > 0 else 0.0
+            target.gross_notional = desired
+            target.target_capital = float(target_capital)
         return target
 
     def on_trades_filled(self, trades: list):
@@ -579,6 +1231,7 @@ class MultiPairStrategy(BaseStrategy):
             action = str(getattr(group[0], "action", ""))
 
             if action == "open":
+                self._pending_open_pair_ids.discard(pair_id)
                 pair_side = self._filled_pair_side(pipeline.pair_def, group)
                 if pair_side is not None:
                     sizing_state.position_side = pair_side
@@ -591,11 +1244,34 @@ class MultiPairStrategy(BaseStrategy):
                 sizing_state.entry_count += 1
                 sizing_state.last_entry_bar_index = pipeline.state.last_bar_index
                 sizing_state.pair_full = sizing_state.entry_count >= self.max_entries_per_pair
-                pipeline.on_position_opened()
+                self._initialize_or_update_protection(pipeline, group, pair_side)
 
             elif action == "close":
+                exit_reason = self._first_attr(group, "exit_reason", None)
+                protection_trigger = self._first_attr(group, "protection_trigger", None)
+                exit_class = self._first_attr(group, "exit_class", None)
+                exit_class = self._resolve_exit_class(exit_class, exit_reason, protection_trigger)
                 for trade in group:
                     self._apply_pair_quantity_delta(pipeline, sizing_state, trade, sign=-1.0)
+                self._apply_protection_close_delta(pipeline, group)
+                if sizing_state.x_quantity >= 1e-12 or sizing_state.y_quantity >= 1e-12:
+                    fill_prices = {
+                        getattr(trade, "symbol", ""): float(getattr(trade, "price", 0.0) or 0.0)
+                        for trade in group
+                    }
+                    x_price = fill_prices.get(pipeline.pair_def.x_symbol)
+                    y_price = fill_prices.get(pipeline.pair_def.y_symbol)
+                    if x_price is not None and y_price is not None:
+                        sizing_state.current_gross_notional = (
+                            sizing_state.x_quantity * x_price
+                            + sizing_state.y_quantity * y_price
+                        )
+                        sizing_state.remaining_pair_gross = max(
+                            0.0,
+                            float(sizing_state.pair_cap_gross or 0.0)
+                            - sizing_state.current_gross_notional,
+                        )
+                        sizing_state.pair_full = sizing_state.remaining_pair_gross <= 1e-8
                 if sizing_state.x_quantity < 1e-12 and sizing_state.y_quantity < 1e-12:
                     sizing_state.position_side = None
                     sizing_state.position_id = None
@@ -609,7 +1285,45 @@ class MultiPairStrategy(BaseStrategy):
                     sizing_state.pair_full = False
                     sizing_state.add_cooldown_remaining_bars = 0
                     sizing_state.min_hold_remaining_bars = 0
-                    pipeline.on_position_closed()
+                    self._pending_rebalance_pair_ids.discard(pair_id)
+                    protection_state = pipeline.state.protection_state
+                    was_protective = exit_class == "stop_loss"
+                    protection_state.active = False
+                    protection_state.pending_exit = False
+                    protection_state.last_exit_reason = exit_reason
+                    protection_state.last_trigger = protection_trigger
+                    protection_state.last_exit_class = exit_class
+                    # As with entry, the close callback runs before the next
+                    # strategy bar is processed, so record the actual fill
+                    # bar rather than the prior signal bar.
+                    protection_state.close_bar_index = pipeline.state.last_bar_index + 1
+                    protection_state.protection_rule = self._first_attr(group, "protection_rule", protection_state.last_trigger)
+                    protection_state.freeze_rule = protection_state.protection_rule
+                    protection_state.freeze_bars = int(self._first_attr(group, "protection_freeze_bars", 0) or 0)
+                    protection_state.freeze_until_bar = (
+                        protection_state.close_bar_index + protection_state.freeze_bars
+                        if protection_state.freeze_bars > 0 else None
+                    )
+                    if protection_state.last_trigger == "pair_loss_stop":
+                        protection_state.pair_loss_stop_freeze_until_bar = (
+                            protection_state.close_bar_index + protection_state.pair_loss_stop_freeze_bars
+                        )
+                    explicit_lock = self._first_attr(group, "reopen_lock_pending", None)
+                    protection_state.reopen_lock_pending = (
+                        bool(explicit_lock)
+                        if explicit_lock is not None
+                        else (was_protective and self._should_wait_after_non_z_exit(exit_class))
+                    )
+                    protection_state.position_id = None
+                    protection_state.entry_x_quantity = 0.0
+                    protection_state.entry_y_quantity = 0.0
+                    protection_state.entry_x_price = None
+                    protection_state.entry_y_price = None
+                    protection_state.stop_loss_direction = None
+                    protection_state.entry_gross_notional = 0.0
+                    protection_state.entry_fee = 0.0
+                    protection_state.entry_slippage = 0.0
+                    protection_state.funding_cost = 0.0
 
     def _filled_pair_side(self, pair_def, trades):
         x_side = None
@@ -636,6 +1350,33 @@ class MultiPairStrategy(BaseStrategy):
         elif symbol == pipeline.pair_def.y_symbol:
             sizing_state.y_quantity = max(0.0, sizing_state.y_quantity + sign * quantity)
 
+    def _apply_protection_close_delta(self, pipeline, trades):
+        """Keep protection accounting aligned after a partial Pair close."""
+        state = pipeline.state.protection_state
+        if not state.active:
+            return
+
+        old_gross = float(state.entry_gross_notional or 0.0)
+        for trade in trades:
+            symbol = getattr(trade, "symbol", "")
+            quantity = abs(float(getattr(trade, "quantity", 0.0) or 0.0))
+            if symbol == pipeline.pair_def.x_symbol:
+                state.entry_x_quantity = max(0.0, state.entry_x_quantity - quantity)
+            elif symbol == pipeline.pair_def.y_symbol:
+                state.entry_y_quantity = max(0.0, state.entry_y_quantity - quantity)
+
+        state.entry_gross_notional = (
+            state.entry_x_quantity * float(state.entry_x_price or 0.0)
+            + state.entry_y_quantity * float(state.entry_y_price or 0.0)
+        )
+        remaining_ratio = (
+            min(1.0, max(0.0, state.entry_gross_notional / old_gross))
+            if old_gross > 1e-12 else 0.0
+        )
+        state.entry_fee *= remaining_ratio
+        state.entry_slippage *= remaining_ratio
+        state.funding_cost *= remaining_ratio
+
     def _first_attr(self, items, attr, default=None):
         for item in items:
             value = getattr(item, attr, None)
@@ -652,6 +1393,64 @@ class MultiPairStrategy(BaseStrategy):
             if pipeline is None:
                 continue
             pipeline.state.signal_state.last_open_reject_bar_index = pipeline.state.last_bar_index
+            action = getattr(order, "action", "")
+            action = getattr(action, "value", action)
+            if str(action) == "open":
+                self._pending_open_pair_ids.discard(pair_id)
+            if str(action) == "close":
+                trigger = getattr(order, "protection_trigger", None)
+                if trigger == "rebalance_replacement":
+                    self._pending_rebalance_pair_ids.discard(pair_id)
+                    pipeline.state.protection_state.pending_exit = False
+                elif trigger:
+                    pipeline.state.protection_state.pending_exit = False
+
+    def on_orders_accepted(self, orders: list[Order]):
+        for order in orders or []:
+            action = getattr(order, "action", "")
+            action = getattr(action, "value", action)
+            pair_id = getattr(order, "pair_id", None)
+            if str(action) != "open" or not pair_id:
+                continue
+            pipeline = self.pipelines.get(pair_id)
+            if pipeline is not None and not self._pair_holds_position(pipeline):
+                self._pending_open_pair_ids.add(pair_id)
+
+    def on_funding_payments(self, payments: list):
+        """Allocate exchange funding payments to active Pair positions.
+
+        Funding records are symbol-level.  When several Pair positions share a
+        symbol, allocate each payment by that Pair's absolute quantity share;
+        this keeps take-profit mark returns from counting the same funding
+        payment once per Pair.
+        """
+        if not payments:
+            return
+        for payment in payments:
+            symbol = str(getattr(payment, "symbol", "") or "")
+            amount = float(getattr(payment, "payment", 0.0) or 0.0)
+            if not symbol or amount == 0.0:
+                continue
+            active = []
+            total = 0.0
+            for pipeline in self.pipelines.values():
+                pstate = pipeline.state.protection_state
+                if not pstate.active:
+                    continue
+                if symbol == pipeline.pair_def.x_symbol:
+                    qty = pstate.entry_x_quantity
+                elif symbol == pipeline.pair_def.y_symbol:
+                    qty = pstate.entry_y_quantity
+                else:
+                    continue
+                qty = abs(float(qty))
+                if qty > 0:
+                    active.append((pstate, qty))
+                    total += qty
+            if total <= 0:
+                continue
+            for pstate, qty in active:
+                pstate.funding_cost += amount * qty / total
 
     def _build_bundle(self, pair_id, pair_def, bars, ts, bar_index):
         x_bar = self._find_bar(bars, pair_def.x_exchange, pair_def.x_symbol)

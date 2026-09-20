@@ -4,6 +4,7 @@ import polars as pl
 
 from core.modules.metrics.performance import (
     MILLISECONDS_PER_DAY,
+    _to_frame,
     performance_metrics,
     trading_metrics,
 )
@@ -108,3 +109,22 @@ def test_trade_count_counts_closed_positions_and_win_rate_includes_funding():
     assert metrics["fill_count"] == 4
     assert metrics["trade_count"] == 1
     assert metrics["win_rate"] == 0.0
+
+
+def test_sparse_protective_exit_metadata_does_not_create_null_builder():
+    rows = [
+        {"group_id": f"g-{index}", "action": "open", "exit_reason": None}
+        for index in range(101)
+    ]
+    rows.append(
+        {
+            "group_id": "g-close",
+            "action": "close",
+            "exit_reason": "protective_max_holding_time",
+        }
+    )
+
+    frame = _to_frame(rows)
+
+    assert frame.schema["exit_reason"] == pl.Utf8
+    assert frame.tail(1)["exit_reason"].item() == "protective_max_holding_time"

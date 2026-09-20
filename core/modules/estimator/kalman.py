@@ -45,6 +45,8 @@ class KalmanEstimator:
     ):
         self.pair_id = pair_id
         self.regression_method = regression_method
+        if regression_method not in {"log_price", "price"}:
+            raise ValueError(f"unsupported regression_method: {regression_method}")
         self.delta = kalman_delta   # Q = delta * I (state noise)
         self.v0 = kalman_v0         # initial P scale
         self.q_alpha = float(kalman_delta if kalman_q_alpha is None else kalman_q_alpha)
@@ -329,4 +331,6 @@ class KalmanEstimator:
     def _transform(self, x, y):
         if self.regression_method == "log_price":
             return log(max(x, 1e-12)), log(max(y, 1e-12))
+        if self.regression_method != "price":
+            raise ValueError(f"unsupported regression_method: {self.regression_method}")
         return float(x), float(y)
