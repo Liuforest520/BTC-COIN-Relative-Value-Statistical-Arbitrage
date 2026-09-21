@@ -46,7 +46,7 @@ def main():
         run_sweep_batch(sweep_path, sweep, args.workers)
         return
 
-    manifest_path = resolve_path(sweep.get("manifest_path", Path(sweep["output_dir"]) / "manifest.csv"))
+    manifest_path = resolve_path(_manifest_path_value(sweep))
     result_path = resolve_path(sweep["result_path"])
     sort_by = sweep.get("sort_by", "sharpe")
     fast_summary = _as_bool(sweep.get("fast_summary", True))
@@ -135,6 +135,24 @@ def parse_args():
 def read_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _manifest_path_value(sweep):
+    """Return the configured manifest path without eagerly evaluating fallbacks.
+
+    ``dict.get(key, default)`` evaluates ``default`` before ``get`` is called.
+    The previous implementation therefore raised ``KeyError('output_dir')`` for
+    valid sweep files that explicitly supplied ``manifest_path`` but omitted the
+    legacy ``output_dir`` field.
+    """
+    manifest_path = sweep.get("manifest_path")
+    if manifest_path is not None:
+        return manifest_path
+
+    output_dir = sweep.get("output_dir")
+    if output_dir is None:
+        raise KeyError("sweep requires 'manifest_path' or 'output_dir'")
+    return Path(output_dir) / "manifest.csv"
 
 
 def resolve_path(path):

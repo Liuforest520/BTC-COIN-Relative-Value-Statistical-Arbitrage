@@ -7,6 +7,7 @@ from core.modules.models.pipeline_types import (
     RawPairTarget,
 )
 from core.modules.data.rolling_window import tail_values
+from core.modules.data.resampler import timeframe_bars, timeframe_to_minutes
 from core.modules.strategy.config import EstimatorConfig, ExecutionConfig, PairDefinition, SignalConfig, SizingConfig
 
 
@@ -27,19 +28,55 @@ class PairPipeline:
         from core.modules.models import OrderType
         self.pair_def = pair_def
         self.state = PairRuntimeState(pair_id=pair_def.pair_id)
+        self.model_timeframe_minutes = timeframe_to_minutes(
+            getattr(estimator_cfg, "model_timeframe", "1m")
+        )
 
         est_kwargs = _dataclass_to_dict(estimator_cfg)
         est_kwargs["pair_id"] = pair_def.pair_id
+        raw_lookback = est_kwargs.get("model_lookback_bars", 10080)
         if pair_def.model_lookback_bars_override:
-            est_kwargs["model_lookback_bars"] = min(
-                est_kwargs.get("model_lookback_bars", 10080),
-                pair_def.model_lookback_bars_override,
-            )
+            raw_lookback = min(raw_lookback, pair_def.model_lookback_bars_override)
+        est_kwargs["model_lookback_bars"] = timeframe_bars(
+            raw_lookback, self.model_timeframe_minutes, label="model_lookback_bars"
+        )
+        est_kwargs["model_update_interval_bars"] = timeframe_bars(
+            est_kwargs.get("model_update_interval_bars", 240),
+            self.model_timeframe_minutes,
+            label="model_update_interval_bars",
+        )
+        _scale_bar_fields(
+            est_kwargs,
+            {
+                "ewls_half_life_bars",
+                "beta_stability_lookback_bars",
+                "beta_stability_min_samples",
+                "hedge_model_lookback_bars",
+                "hedge_model_update_interval_bars",
+            },
+            self.model_timeframe_minutes,
+            "estimator",
+        )
         self.estimator = estimator_ctor(**est_kwargs)
 
         if signal_ctor and signal_cfg:
             sig_kwargs = _dataclass_to_dict(signal_cfg)
             sig_kwargs["pair_id"] = pair_def.pair_id
+            _scale_bar_fields(
+                sig_kwargs,
+                {
+                    "entry_rule_lookback_bars",
+                    "entry_rule_update_interval_bars",
+                    "entry_rule_min_samples",
+                    "reversion_ma_lookback_bars",
+                    "reversion_ma_short_lookback_bars",
+                    "reversion_min_samples",
+                    "pair_quality_min_samples",
+                    "two_stage_max_wait_bars",
+                },
+                self.model_timeframe_minutes,
+                "signal",
+            )
             self.signal = signal_ctor(**sig_kwargs)
         else:
             self.signal = None
@@ -47,6 +84,18 @@ class PairPipeline:
         if sizing_ctor and sizing_cfg:
             siz_kwargs = _dataclass_to_dict(sizing_cfg)
             siz_kwargs["pair_id"] = pair_def.pair_id
+            _scale_bar_fields(
+                siz_kwargs,
+                {
+                    "add_interval_bars",
+                    "min_add_interval_bars",
+                    "max_add_interval_bars",
+                    "hedge_beta_lookback_bars",
+                    "hedge_beta_min_samples",
+                },
+                self.model_timeframe_minutes,
+                "sizing",
+            )
             self.sizing = sizing_ctor(**siz_kwargs)
         else:
             self.sizing = None
@@ -181,3 +230,16 @@ def _merge_para(base: dict | None, extra: dict | None) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _scale_bar_fields(values: dict, fields: set[str], timeframe_minutes: int, label: str) -> None:
+    for field_name in fields:
+        value = values.get(field_name)
+        if value is None:
+            continue
+        # Legacy optional windows use 0 to mean disabled.
+        if float(value) == 0.0:
+            continue
+        values[field_name] = timeframe_bars(
+            value, timeframe_minutes, label=f"{label}.{field_name}"
+        )

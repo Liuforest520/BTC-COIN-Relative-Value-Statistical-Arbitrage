@@ -6,7 +6,14 @@ import polars as pl
 
 from core.backtest.curve_buffer import ColumnarRowBuffer, NumericCurveBuffer, PAIR_STATE_SCHEMA
 from core.modules.config import Config, load_config
-from core.modules.data import build_funding_map, iter_csv_bars, load_csv_data, load_funding_data
+from core.modules.data import (
+    PairTimeframeResampler,
+    build_funding_map,
+    iter_csv_bars,
+    load_csv_data,
+    load_funding_data,
+    timeframe_to_minutes,
+)
 from core.modules.exchange import ExchangeManager
 from core.modules.logger import logger
 from core.modules.metrics import calculate_metrics
@@ -66,6 +73,7 @@ class Backtest:
 
     def run(self) -> BacktestResult:
         market_data = self._load_market_data()
+        model_resampler = self._build_model_resampler(market_data)
         funding_data = self._load_funding_data()
         self._check_funding_alignment(funding_data, market_data)
         funding_timestamps = sorted(funding_data)
@@ -137,31 +145,35 @@ class Backtest:
                 equity=portfolio_snapshot.get("equity", 0),
                 available_balance=portfolio_snapshot.get("available_balance", 0),
             )
-            orders = self.strategy(bars)
-            should_record_diagnostics = self._should_record_diagnostics(orders, new_trades, rejected_orders)
-            # Z-score is part of the minute-level trade path and must never be
-            # sampled.  Model parameters are stored in the sparse pair-state
-            # curve below, avoiding a hundreds-of-columns minute-level table.
-            self._record_signal_state(ts)
-            self._record_pair_state(ts, should_record_diagnostics)
-            if not orders:
-                continue
+            for model_bars in model_resampler.update(bars):
+                model_ts = self._bars_ts(model_bars)
+                orders = self.strategy(model_bars)
+                should_record_diagnostics = self._should_record_diagnostics(
+                    orders, new_trades, rejected_orders
+                )
+                self._record_signal_state(model_ts)
+                self._record_pair_state(model_ts, should_record_diagnostics)
+                if not orders:
+                    continue
 
-            risk_results = self.risk_manager.check_orders(orders, bars)
-            if not self.risk_manager.passed(risk_results):
-                if self.risk_manager.block_open_orders:
-                    self.signal_curve.append({"ts": ts, "action": "open_blocked_by_risk", "reason": "risk block"})
-                self.strategy.on_orders_rejected(orders)
-                continue
+                # Orders are generated from the completed model bar, but risk
+                # checks use the current raw 1-minute market snapshot. The
+                # exchange queues them for the next executable 1-minute open.
+                risk_results = self.risk_manager.check_orders(orders, bars)
+                if not self.risk_manager.passed(risk_results):
+                    if self.risk_manager.block_open_orders:
+                        self.signal_curve.append({"ts": model_ts, "action": "open_blocked_by_risk", "reason": "risk block"})
+                    self.strategy.on_orders_rejected(orders)
+                    continue
 
-            accepted_orders = self.exchange_manager.place_orders(orders)
-            if len(accepted_orders) != len(orders):
-                self.strategy.on_orders_rejected(orders)
-                self.exchange_manager.cancel_all_orders()
-                continue
+                accepted_orders = self.exchange_manager.place_orders(orders)
+                if len(accepted_orders) != len(orders):
+                    self.strategy.on_orders_rejected(orders)
+                    self.exchange_manager.cancel_all_orders()
+                    continue
 
-            self.strategy.on_orders_accepted(accepted_orders)
-            self.orders.extend(accepted_orders)
+                self.strategy.on_orders_accepted(accepted_orders)
+                self.orders.extend(accepted_orders)
 
         metrics = calculate_metrics(
             equity_curve=self.exchange_manager.equity_curve,
@@ -172,6 +184,7 @@ class Backtest:
             hedge_ratio_tolerance=float(self.config.risk.get("order_hedge_ratio_tolerance", 0.02)),
         )
         metrics.update(self._account_audit_metrics())
+        metrics.update(self._model_resampler_audit_metrics(model_resampler))
 
         return BacktestResult(
             metrics=metrics,
@@ -597,6 +610,7 @@ class Backtest:
         snapshot["raw_gross_exposure_ratio"] = (
             snapshot["gross_exposure"] / equity if equity else None
         )
+
         snapshot["gross_exposure_ratio"] = (
             occupied_capital / allocatable_capital
             if allocatable_capital > 0 else 0.0
@@ -604,6 +618,25 @@ class Backtest:
         snapshot["net_exposure_ratio"] = snapshot["net_exposure"] / equity if equity else None
         snapshot["margin_utilization"] = snapshot["gross_exposure_ratio"]
         return snapshot
+
+    def _build_model_resampler(self, market_data):
+        estimator_cfg = (self.config.strategy.pipeline or {}).get("estimator", {}) or {}
+        timeframe = timeframe_to_minutes(estimator_cfg.get("model_timeframe", "1m"))
+        pair_specs = []
+        for pair in self.config.strategy.pairs:
+            if not pair.get("enabled", True):
+                continue
+            x_symbol = pair.get("x_symbol", pair.get("long_symbol"))
+            y_symbol = pair.get("y_symbol", pair.get("short_symbol"))
+            if x_symbol not in market_data or y_symbol not in market_data:
+                continue
+            x_exchange = pair.get("x_exchange", market_data[x_symbol]["exchange"])
+            y_exchange = pair.get("y_exchange", market_data[y_symbol]["exchange"])
+            pair_specs.append((
+                pair.get("pair_id", f"{x_symbol}_{y_symbol}"),
+                x_exchange, x_symbol, y_exchange, y_symbol,
+            ))
+        return PairTimeframeResampler(timeframe, pair_specs)
 
     def _account_audit_metrics(self):
         peak_open_pairs = 0
@@ -628,6 +661,21 @@ class Backtest:
             "max_pending_open_pair_count": max_pending_pairs,
             "max_margin_utilization": max_margin_utilization,
             "min_available_balance": min_available_balance,
+        }
+
+    @staticmethod
+    def _model_resampler_audit_metrics(model_resampler):
+        discarded = int(getattr(model_resampler, "discarded_bucket_count", 0) or 0)
+        examples = list(getattr(model_resampler, "discarded_bucket_examples", []) or [])
+        if discarded:
+            logger.warning(
+                "model resampler discarded {} incomplete/non-contiguous buckets; examples={}",
+                discarded,
+                examples,
+            )
+        return {
+            "discarded_model_buckets": discarded,
+            "discarded_model_bucket_examples": examples,
         }
 
     def _close_price(self, bars, exchange_name, symbol):

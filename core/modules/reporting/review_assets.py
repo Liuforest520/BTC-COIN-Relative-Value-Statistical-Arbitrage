@@ -1273,7 +1273,7 @@ OVERVIEW_TEMPLATE = r"""<!doctype html>
       <div class="panel">
         <h2>持仓资金占比</h2>
         <div class="legend">
-          <span><i class="dot" style="background: var(--blue)"></i>持仓资金占比（持仓名义市值 ÷ 当前权益）</span>
+          <span><i class="dot" style="background: var(--blue)"></i>持仓资金占比（持仓占用资金 ÷ 可分配资金）</span>
         </div>
         <canvas class="chart" id="exposureChart"></canvas>
         <div class="hint" id="exposureHint"></div>

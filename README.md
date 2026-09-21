@@ -117,7 +117,10 @@ setups:
     strategy: multi_pair
     pairs: []
     pipeline:
-      estimator: {}
+      estimator:
+        model_timeframe: 1m  # 1m / 15m / 1h / 2h / 4h; omitted = 1m
+        model_lookback_bars: 2880  # source 1-minute minutes
+        model_update_interval_bars: 240
       signal: {}
       sizing: {}
       portfolio: {}
@@ -151,6 +154,10 @@ risk:
 | Funding | `funding_enabled: true` |
 | Protection | 理论 X 止损、Pair 净亏损止损、止盈和最长持仓均可独立配置 |
 | Risk | `pass_through` 只跳过可选的下单前风控；Exchange 始终执行 `max_leverage: 1.0`、保证金和可用余额检查 |
+
+`estimator.model_timeframe` 是新增可选字段。`model_lookback_bars` 和 `model_update_interval_bars` 仍按原始 1 分钟数据点填写；例如 `2880` 在 `15m` 模型下会转换为 `192` 根 15 分钟 K 线。模型只在完整聚合 K 线形成后决策，账户、资金费率和订单成交仍按 1 分钟运行。旧配置未填写该字段时保持原来的 1 分钟逻辑。
+
+启动时会按当前模型周期显示这类换算；不能整除时向上取整，并提示实际覆盖的源分钟数。例如 `2881m` 在 `15m` 下会使用 `193` 根模型 K 线，实际覆盖 `2895m`。`pending_timeout_bars` 是订单生命周期参数，始终按原始 1 分钟 bar 计数，不随 `model_timeframe` 换算。
 
 修改配置时，`pairs` 中使用的标的必须已经存在于 `data.symbols`。回测只加载当前启用 Pair 所需的数据，不会无条件读取配置中的全部标的。
 

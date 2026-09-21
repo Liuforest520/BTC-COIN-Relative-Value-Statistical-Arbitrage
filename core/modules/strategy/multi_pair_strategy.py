@@ -6,7 +6,9 @@ from uuid import uuid4
 from dataclasses import replace
 from typing import Any
 
+from core.modules.data.resampler import timeframe_bars, timeframe_to_minutes
 from core.modules.execution.order_planner import OrderPlanner
+from core.modules.logger import logger
 from core.modules.models import Order
 from core.modules.models.pipeline_types import (
     AllocatedPairTarget,
@@ -35,6 +37,15 @@ from core.modules.strategy.config import (
 )
 from core.modules.strategy.pair_pipeline import PairPipeline, _dataclass_to_dict, _merge_para
 
+
+def _decision_bars(value, timeframe_minutes: int, label: str) -> int:
+    """Convert a legacy source-minute bar count to model decision bars."""
+    raw = int(value or 0)
+    if raw < 0:
+        raise ValueError(f"{label} must be non-negative")
+    if raw == 0:
+        return 0
+    return timeframe_bars(raw, timeframe_minutes, label=label)
 
 class MultiPairStrategy(BaseStrategy):
     """Top-level strategy: dispatch pair pipelines, allocate portfolio, create market orders."""
@@ -70,6 +81,84 @@ class MultiPairStrategy(BaseStrategy):
         self.portfolio_cfg = portfolio_cfg or PortfolioConfig()
         self.protection_cfg = protection_cfg or ProtectionConfig()
         self.rebalance_cfg = rebalance_cfg or RebalanceConfig()
+        # Strategy bar counters advance only when a complete model bar is
+        # available. Keep legacy bar-valued strategy settings in source-minute
+        # units and convert them once for the active model timeframe.
+        self.model_timeframe_minutes = timeframe_to_minutes(
+            getattr(estimator_cfg, "model_timeframe", "1m")
+        )
+        raw_lookback = float(getattr(estimator_cfg, "model_lookback_bars", 10080))
+        raw_update = float(getattr(estimator_cfg, "model_update_interval_bars", 240))
+        if self.model_timeframe_minutes > 1:
+            lookback_bars = timeframe_bars(
+                raw_lookback,
+                self.model_timeframe_minutes,
+                label="estimator.model_lookback_bars",
+            )
+            update_bars = timeframe_bars(
+                raw_update,
+                self.model_timeframe_minutes,
+                label="estimator.model_update_interval_bars",
+            )
+            logger.info(
+                "model timeframe={} lookback {}m -> {} bars ({}m); update {}m -> {} bars ({}m)",
+                getattr(estimator_cfg, "model_timeframe", "1m"),
+                int(raw_lookback) if raw_lookback.is_integer() else raw_lookback,
+                lookback_bars,
+                lookback_bars * self.model_timeframe_minutes,
+                int(raw_update) if raw_update.is_integer() else raw_update,
+                update_bars,
+                update_bars * self.model_timeframe_minutes,
+            )
+            if raw_lookback % self.model_timeframe_minutes or raw_update % self.model_timeframe_minutes:
+                logger.warning(
+                    "model timeframe={} uses ceil conversion for a non-divisible source-minute window",
+                    getattr(estimator_cfg, "model_timeframe", "1m"),
+                )
+        self.portfolio_cfg = replace(
+            self.portfolio_cfg,
+            add_cooldown_bars=_decision_bars(
+                self.portfolio_cfg.add_cooldown_bars,
+                self.model_timeframe_minutes,
+                "portfolio.add_cooldown_bars",
+            ),
+            min_hold_bars=_decision_bars(
+                self.portfolio_cfg.min_hold_bars,
+                self.model_timeframe_minutes,
+                "portfolio.min_hold_bars",
+            ),
+        )
+        self.protection_cfg = replace(
+            self.protection_cfg,
+            stop_loss_freeze_bars=_decision_bars(
+                self.protection_cfg.stop_loss_freeze_bars,
+                self.model_timeframe_minutes,
+                "protection.stop_loss_freeze_bars",
+            ),
+            pair_loss_stop_freeze_bars=_decision_bars(
+                self.protection_cfg.pair_loss_stop_freeze_bars,
+                self.model_timeframe_minutes,
+                "protection.pair_loss_stop_freeze_bars",
+            ),
+            take_profit_freeze_bars=_decision_bars(
+                self.protection_cfg.take_profit_freeze_bars,
+                self.model_timeframe_minutes,
+                "protection.take_profit_freeze_bars",
+            ),
+            max_holding_time_freeze_bars=_decision_bars(
+                self.protection_cfg.max_holding_time_freeze_bars,
+                self.model_timeframe_minutes,
+                "protection.max_holding_time_freeze_bars",
+            ),
+        )
+        self.rebalance_cfg = replace(
+            self.rebalance_cfg,
+            eviction_min_holding_bars=_decision_bars(
+                self.rebalance_cfg.eviction_min_holding_bars,
+                self.model_timeframe_minutes,
+                "rebalance.eviction_min_holding_bars",
+            ),
+        )
         self.protection_manager = ProtectionManager(self.protection_cfg)
         self.fee_rate = max(0.0, float(fee_rate))
         self.slippage_rate = max(0.0, float(slippage_bps)) / 10000.0
@@ -103,15 +192,15 @@ class MultiPairStrategy(BaseStrategy):
                 self._max_holding_bars_for_pipeline(pipeline)
 
         if portfolio_ctor and portfolio_cfg:
-            self.portfolio = portfolio_ctor(**_dataclass_to_dict(portfolio_cfg))
+            self.portfolio = portfolio_ctor(**_dataclass_to_dict(self.portfolio_cfg))
             if hasattr(self.portfolio, "total_pair_count"):
                 self.portfolio.total_pair_count = len(self.pipelines)
         else:
             self.portfolio = None
 
-        self.max_entries_per_pair = max(1, int(getattr(portfolio_cfg, "max_entries_per_pair", 1) or 1))
-        self.add_cooldown_bars = max(0, int(getattr(portfolio_cfg, "add_cooldown_bars", 0) or 0))
-        self.min_hold_bars = max(0, int(getattr(portfolio_cfg, "min_hold_bars", 0) or 0))
+        self.max_entries_per_pair = max(1, int(getattr(self.portfolio_cfg, "max_entries_per_pair", 1) or 1))
+        self.add_cooldown_bars = max(0, int(getattr(self.portfolio_cfg, "add_cooldown_bars", 0) or 0))
+        self.min_hold_bars = max(0, int(getattr(self.portfolio_cfg, "min_hold_bars", 0) or 0))
         self._pair_bar_indices: dict[str, int] = {}
         self._pending_open_pair_ids: set[str] = set()
         self._pending_rebalance_pair_ids: set[str] = set()
@@ -563,7 +652,16 @@ class MultiPairStrategy(BaseStrategy):
                     continue
             if self.rebalance_cfg.eviction_min_holding_bars > 0:
                 entry_bar = old_pipeline.state.protection_state.entry_bar_index
-                if entry_bar is not None and bar_index - entry_bar < self.rebalance_cfg.eviction_min_holding_bars:
+                # ``entry_bar_index`` is a Pair-local model-bar index.  The
+                # strategy ``bar_index`` is global and therefore includes
+                # bars that this Pair did not receive (late listings,
+                # missing legs, or gaps).  Mixing the two counters can make a
+                # newly opened Pair look old enough to evict immediately.
+                pair_bar_index = bundles[pair_id].bar_index
+                if (
+                    entry_bar is not None
+                    and pair_bar_index - entry_bar < self.rebalance_cfg.eviction_min_holding_bars
+                ):
                     continue
             # Closing a Pair releases only its remaining isolated net equity,
             # never its current gross market value.  Losses therefore cannot

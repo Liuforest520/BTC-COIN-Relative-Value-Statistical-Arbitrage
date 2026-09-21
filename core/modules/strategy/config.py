@@ -38,6 +38,8 @@ class EstimatorConfig:
     regression_method: str = "log_price"      # "log_price" | "price"
     model_lookback_bars: int = 10080       # fit window and initial warmup length
     model_update_interval_bars: int = 240
+    # Source-minute model window.  1m preserves all legacy configs.
+    model_timeframe: str = "1m"
     position_update_policy: str = "freeze"     # "freeze" | "update"
     # Residual ADF, run after every successful scheduled fit.
     residual_adf_max_pvalue: float = 0.40

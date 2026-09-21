@@ -87,7 +87,9 @@ class ExchangeManager:
                 self._group_first_seen.pop(group_id, None)
                 if any(getattr(o, "protection_trigger", None) == "rebalance_replacement" for o in group_orders):
                     failed_rebalance_batches.update(
-                        getattr(o, "rebalance_batch_id", None) for o in group_orders
+                        batch_id
+                        for batch_id in (getattr(o, "rebalance_batch_id", None) for o in group_orders)
+                        if batch_id is not None
                     )
                 continue
             actions = {getattr(o.action, "value", o.action) for o in group_orders}
@@ -127,7 +129,11 @@ class ExchangeManager:
                 for order in rejected:
                     per_exchange[order.exchange]["rejected_orders"].append(order)
                 if any(getattr(o, "protection_trigger", None) == "rebalance_replacement" for o in group_orders):
-                    failed_rebalance_batches.update(getattr(o, "rebalance_batch_id", None) for o in group_orders)
+                    failed_rebalance_batches.update(
+                        batch_id
+                        for batch_id in (getattr(o, "rebalance_batch_id", None) for o in group_orders)
+                        if batch_id is not None
+                    )
                 continue
 
             actions = {

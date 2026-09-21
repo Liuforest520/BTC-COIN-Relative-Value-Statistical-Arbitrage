@@ -5,7 +5,7 @@ import polars as pl
 
 from core.backtest.backtest import Backtest, BacktestResult
 from core.modules.config import Config, load_config
-from core.modules.data import load_csv_data
+from core.modules.data import load_csv_data, timeframe_to_minutes, PairTimeframeResampler
 from core.modules.metrics import calculate_metrics
 from tqdm import tqdm
 
@@ -68,6 +68,7 @@ class SweepBacktest(Backtest):
 
     def run(self) -> BacktestResult:
         market_data = self._load_market_data()
+        model_resampler = self._build_model_resampler(market_data)
         funding_data = self._load_funding_data()
         self._check_funding_alignment(funding_data, market_data)
         funding_timestamps = sorted(funding_data)
@@ -135,23 +136,24 @@ class SweepBacktest(Backtest):
                 equity=portfolio_snapshot.get("equity", 0),
                 available_balance=portfolio_snapshot.get("available_balance", 0),
             )
-            orders = self.strategy(bars)
-            if not orders:
-                continue
+            for model_bars in model_resampler.update(bars):
+                orders = self.strategy(model_bars)
+                if not orders:
+                    continue
 
-            risk_results = self.risk_manager.check_orders(orders, bars)
-            if not self.risk_manager.passed(risk_results):
-                self.strategy.on_orders_rejected(orders)
-                continue
+                risk_results = self.risk_manager.check_orders(orders, bars)
+                if not self.risk_manager.passed(risk_results):
+                    self.strategy.on_orders_rejected(orders)
+                    continue
 
-            accepted_orders = self.exchange_manager.place_orders(orders)
-            if len(accepted_orders) != len(orders):
-                self.strategy.on_orders_rejected(orders)
-                self.exchange_manager.cancel_all_orders()
-                continue
+                accepted_orders = self.exchange_manager.place_orders(orders)
+                if len(accepted_orders) != len(orders):
+                    self.strategy.on_orders_rejected(orders)
+                    self.exchange_manager.cancel_all_orders()
+                    continue
 
-            self.strategy.on_orders_accepted(accepted_orders)
-            self.orders.extend(accepted_orders)
+                self.strategy.on_orders_accepted(accepted_orders)
+                self.orders.extend(accepted_orders)
 
         metrics = calculate_metrics(
             equity_curve=self.exchange_manager.equity_curve,
@@ -161,6 +163,7 @@ class SweepBacktest(Backtest):
             benchmark_returns=self._benchmark_returns(market_data),
             hedge_ratio_tolerance=float(self.config.risk.get("order_hedge_ratio_tolerance", 0.02)),
         )
+        metrics.update(self._model_resampler_audit_metrics(model_resampler))
 
         return BacktestResult(
             metrics=metrics,
@@ -186,6 +189,25 @@ class SweepBacktest(Backtest):
         )
         benchmark = benchmark.select(["ts", f"{name.lower()}_return"])
         return frame.join(benchmark, on="ts", how="left")
+
+    def _build_model_resampler(self, market_data):
+        estimator_cfg = (self.config.strategy.pipeline or {}).get("estimator", {}) or {}
+        timeframe = timeframe_to_minutes(estimator_cfg.get("model_timeframe", "1m"))
+        pair_specs = []
+        for pair in self.config.strategy.pairs:
+            if not pair.get("enabled", True):
+                continue
+            x_symbol = pair.get("x_symbol", pair.get("long_symbol"))
+            y_symbol = pair.get("y_symbol", pair.get("short_symbol"))
+            if x_symbol not in market_data or y_symbol not in market_data:
+                continue
+            x_exchange = pair.get("x_exchange", market_data[x_symbol]["exchange"])
+            y_exchange = pair.get("y_exchange", market_data[y_symbol]["exchange"])
+            pair_specs.append((
+                pair.get("pair_id", f"{x_symbol}_{y_symbol}"),
+                x_exchange, x_symbol, y_exchange, y_symbol,
+            ))
+        return PairTimeframeResampler(timeframe, pair_specs)
 
     def _position_snapshot(self, ts, bars, exchange_result):
         return None
