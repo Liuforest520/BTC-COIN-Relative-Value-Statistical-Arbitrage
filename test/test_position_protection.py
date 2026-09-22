@@ -61,7 +61,11 @@ def _strategy_with_protection():
         estimator_cfg=EstimatorConfig(
             regression_method="price", position_update_policy="freeze"
         ),
-        protection_cfg=ProtectionConfig(enabled=True, take_profit_return=0.03),
+        protection_cfg=ProtectionConfig(
+            enabled=True,
+            take_profit_return=0.03,
+            pair_loss_stop_freeze_model_lookback_multiplier=1.0,
+        ),
     )
     pipeline = strategy.pipelines["p"]
     pipeline.state.sizing_state.position_side = "long_x"
@@ -412,6 +416,45 @@ def test_close_fill_uses_exit_class_for_reopen_lock_and_actual_fill_bar():
     assert protection.last_exit_class == "stop_loss"
     assert protection.reopen_lock_pending is True
     assert protection.close_bar_index == 11
+
+
+def test_pair_equity_zero_forced_close_freezes_one_model_lookback_and_waits_for_update():
+    strategy, pipeline = _strategy_with_protection()
+    sizing = pipeline.state.sizing_state
+    sizing.position_side = "long_x"
+    sizing.x_quantity = 1.0
+    sizing.y_quantity = 1.0
+    pipeline.state.last_bar_index = 10
+    close_group = [
+        SimpleNamespace(
+            pair_id="p", group_id="forced", action="close", symbol="X", quantity=1.0,
+            exit_class="stop_loss", reopen_lock_pending=True,
+            exit_reason="protective_pair_equity_zero",
+            protection_trigger="pair_equity_zero", protection_rule="pair_equity_zero",
+            protection_freeze_bars=0,
+        ),
+        SimpleNamespace(
+            pair_id="p", group_id="forced", action="close", symbol="Y", quantity=1.0,
+            exit_class="stop_loss", reopen_lock_pending=True,
+            exit_reason="protective_pair_equity_zero",
+            protection_trigger="pair_equity_zero", protection_rule="pair_equity_zero",
+            protection_freeze_bars=0,
+        ),
+    ]
+
+    strategy.on_trades_filled(close_group)
+
+    protection = pipeline.state.protection_state
+    expected_freeze = pipeline.estimator.model_lookback_bars
+    assert protection.freeze_rule == "pair_equity_zero"
+    assert protection.freeze_bars == expected_freeze
+    assert protection.freeze_until_bar == 11 + expected_freeze
+    assert protection.reopen_lock_pending is True
+    assert all(trade.protection_freeze_bars == expected_freeze for trade in close_group)
+    assert all(
+        trade.protection_freeze_until_bar == 11 + expected_freeze
+        for trade in close_group
+    )
 
 
 def test_forced_margin_partial_close_keeps_pair_state_and_updates_notional():

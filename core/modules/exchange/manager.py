@@ -60,6 +60,24 @@ class ExchangeManager:
                 "funding_payments": payments,
             }
 
+        # A Pair whose isolated account is already at or below zero must be
+        # liquidated before any other pending order is considered.  The
+        # exchange marks at the executable open in ``begin_bar`` above, so
+        # these orders are filled through the same atomic close path at this
+        # bar's open.  This realizes the loss instead of allowing the Pair to
+        # remain as a free option until it happens to recover.
+        forced_orders_by_exchange = {}
+        forced_order_ids = set()
+        for exchange_name, exchange in self.exchanges.items():
+            forced_orders = exchange.forced_liquidation_orders(
+                formatted_bars[exchange_name], self._bar_index
+            )
+            if not forced_orders:
+                continue
+            accepted = exchange.place_order(forced_orders)
+            forced_orders_by_exchange[exchange_name] = accepted
+            forced_order_ids.update(order.order_id for order in accepted)
+
         # Execute complete logical Pair groups sequentially.  This makes the
         # available margin consumed by an earlier group visible to every later
         # group on the same bar and keeps cross-exchange legs atomic.
@@ -188,6 +206,13 @@ class ExchangeManager:
                 per_exchange[exchange_name]["new_trades"].extend(result["new_trades"])
                 new_trades.extend(result["new_trades"])
 
+        forced_filled_orders = [
+            order
+            for exchange_name in forced_orders_by_exchange
+            for order in per_exchange[exchange_name]["filled_orders"]
+            if order.order_id in forced_order_ids
+        ]
+
         for exchange in self.exchanges.values():
             exchange.finish_bar()
 
@@ -227,11 +252,12 @@ class ExchangeManager:
             "open_pair_count": portfolio_state["open_pair_count"],
             "open_pair_ids": portfolio_state["open_pair_ids"],
             "pending_open_pair_count": portfolio_state["pending_open_pair_count"],
-            # Retained as inert compatibility fields for existing reports.
+            # These fields are retained for report compatibility and now
+            # describe actual Pair-equity-zero liquidations.
             "margin_deficit": 0.0,
-            "forced_deleveraging_triggered": False,
-            "forced_deleveraging_scale": 0.0,
-            "forced_deleveraging_orders": [],
+            "forced_deleveraging_triggered": bool(forced_filled_orders),
+            "forced_deleveraging_scale": 1.0 if forced_filled_orders else 0.0,
+            "forced_deleveraging_orders": forced_filled_orders,
             "initial_cash": self.initial_cash,
             "equity_curve": self.equity_curve,
             "has_fill": len(new_trades) > 0,
@@ -260,9 +286,9 @@ class ExchangeManager:
         used_margin = sum(float(result["used_margin"]) for result in results.values())
         gross_exposure = sum(float(result["gross_exposure"]) for result in results.values())
         net_exposure = sum(float(result["net_exposure"]) for result in results.values())
-        # Each exchange already floors every isolated Pair at zero.  Rebuilding
-        # equity as wallet + aggregate unrealized PnL would let one Pair's loss
-        # leak into free cash or another Pair after its own capital is exhausted.
+        # Rebuild from each exchange's isolated-ledger equity.  Pair losses are
+        # no longer floored at zero: an insolvent Pair is liquidated at the
+        # executable open and its realized shortfall is charged to free cash.
         equity = sum(float(result["equity"]) for result in results.values())
         open_pair_ids = sorted({
             pair_id
@@ -327,6 +353,11 @@ class ExchangeManager:
         def priority(item):
             orders = item[1]
             actions = {getattr(o.action, "value", o.action) for o in orders}
+            if any(
+                getattr(o, "protection_trigger", None) == "pair_equity_zero"
+                for o in orders
+            ):
+                return -1
             if actions == {"close"}:
                 return 0
             if actions == {"open"}:

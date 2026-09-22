@@ -237,7 +237,7 @@ def test_adverse_price_move_changes_equity_but_not_unallocated_cash():
     assert isclose(abs(exchange.positions["X"]), abs(exchange.positions["Y"]), rel_tol=1e-12)
 
 
-def test_adverse_pair_loss_never_triggers_account_wide_forced_exit():
+def test_pair_equity_zero_forces_only_the_insolvent_pair_on_next_open():
     exchange = Exchange("binance", initial_cash=100.0, fee_rate=0.0, slippage_bps=0.0)
     manager = ExchangeManager({"binance": exchange})
     manager.place_orders([
@@ -257,6 +257,8 @@ def test_adverse_pair_loss_never_triggers_account_wide_forced_exit():
         "B2": _ohlc_bar(2, 10.0, 10.0),
     }})
 
+    # The loss is observed at the completed bar's close, but liquidation is
+    # evaluated at the next executable open.
     assert result["new_trades"] == []
     assert "a" in exchange.position_lots
     assert "b" in exchange.position_lots
@@ -265,8 +267,34 @@ def test_adverse_pair_loss_never_triggers_account_wide_forced_exit():
     assert isclose(abs(exchange.positions["B1"]), 2.0)
     assert isclose(abs(exchange.positions["B2"]), 2.0)
     assert isclose(exchange.available_balance, 20.0)
-    assert isclose(exchange.equity, 60.0)
+    assert isclose(exchange.equity, 42.0)
     assert result["forced_deleveraging_triggered"] is False
+
+    result = manager.on_bar({
+        "binance": {
+            "A1": _bar(3, 1.0),
+            "A2": _bar(3, 30.0),
+            "B1": _bar(3, 10.0),
+            "B2": _bar(3, 10.0),
+        }
+    })
+
+    assert result["forced_deleveraging_triggered"] is True
+    assert result["forced_deleveraging_scale"] == 1.0
+    assert len(result["forced_deleveraging_orders"]) == 2
+    assert {trade.pair_id for trade in result["new_trades"]} == {"a"}
+    assert {trade.exit_reason for trade in result["new_trades"]} == {
+        "protective_pair_equity_zero"
+    }
+    assert {trade.protection_trigger for trade in result["new_trades"]} == {
+        "pair_equity_zero"
+    }
+    assert {trade.exit_class for trade in result["new_trades"]} == {"stop_loss"}
+    assert "a" not in exchange.position_lots
+    assert "b" in exchange.position_lots
+    assert isclose(exchange.available_balance, 2.0)
+    assert isclose(exchange.position_capital["b"], 40.0)
+    assert isclose(exchange.equity, 42.0)
 
 
 def test_funding_is_charged_only_to_the_relevant_isolated_pair():
@@ -338,7 +366,7 @@ def test_opposite_pairs_on_shared_symbol_settle_funding_independently():
     assert {payment.position_id for payment in result["funding_payments"]} == {"a", "b"}
 
 
-def test_pair_loss_beyond_allocated_capital_releases_zero_on_close():
+def test_pair_loss_beyond_allocated_capital_is_charged_to_free_cash_on_close():
     exchange = Exchange("binance", initial_cash=200.0, fee_rate=0.0, slippage_bps=0.0)
     manager = ExchangeManager({"binance": exchange})
     manager.place_orders([
@@ -365,9 +393,9 @@ def test_pair_loss_beyond_allocated_capital_releases_zero_on_close():
     assert "a" not in exchange.position_lots
     assert "a" not in exchange.position_capital
     assert "b" in exchange.position_lots
-    assert isclose(exchange.available_balance, 120.0)
+    assert isclose(exchange.available_balance, 100.2)
     assert isclose(exchange.position_capital["b"], 40.0)
-    assert isclose(exchange.equity, 160.0)
+    assert isclose(exchange.equity, 140.2)
 
 
 def test_position_occupancy_uses_occupied_plus_unused_capital():

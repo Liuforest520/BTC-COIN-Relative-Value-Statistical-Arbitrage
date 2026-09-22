@@ -257,6 +257,9 @@ def _per_pair_metrics(result, config_path: Path) -> list[dict]:
         funding_payments=getattr(result, "funding_payments", None),
         pair_defs=pair_defs_from_config(Path(config_path)),
         initial_equity=(getattr(result, "metrics", {}) or {}).get("initial_equity"),
+        price_source=config_path,
+        timeline=getattr(result, "equity_curve", None),
+        final_position_valuation=getattr(result, "final_position_valuation", None),
     )
 
 

@@ -1072,6 +1072,15 @@ class MultiPairStrategy(BaseStrategy):
             raise ValueError("protection.pair_loss_stop_freeze_model_lookback_multiplier requires a valid model lookback")
         return max(1, int(ceil(product)))
 
+    def _forced_liquidation_freeze_bars_for_pipeline(self, pipeline) -> int:
+        """Resolve forced-liquidation freeze from the shared stop-loss setting.
+
+        Pair-equity-zero is the account-level last-resort stop-loss.  It uses
+        the same model-relative multiplier as the ordinary Pair loss stop so
+        one configuration controls both protective exits consistently.
+        """
+        return self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
+
     def _max_holding_bars_for_pipeline(self, pipeline) -> int | None:
         if not self.protection_cfg.max_holding_time_enabled:
             return None
@@ -1412,6 +1421,13 @@ class MultiPairStrategy(BaseStrategy):
                     protection_state.protection_rule = self._first_attr(group, "protection_rule", protection_state.last_trigger)
                     protection_state.freeze_rule = protection_state.protection_rule
                     protection_state.freeze_bars = int(self._first_attr(group, "protection_freeze_bars", 0) or 0)
+                    if protection_state.protection_rule == "pair_equity_zero" and protection_state.freeze_bars <= 0:
+                        protection_state.freeze_bars = self._forced_liquidation_freeze_bars_for_pipeline(pipeline)
+                        for trade in group:
+                            trade.protection_freeze_bars = protection_state.freeze_bars
+                            trade.protection_freeze_until_bar = (
+                                protection_state.close_bar_index + protection_state.freeze_bars
+                            )
                     protection_state.freeze_until_bar = (
                         protection_state.close_bar_index + protection_state.freeze_bars
                         if protection_state.freeze_bars > 0 else None

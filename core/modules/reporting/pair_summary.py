@@ -7,7 +7,11 @@ from typing import Any
 import polars as pl
 import yaml
 
+from core.modules.data.loader import load_csv_data
 from core.modules.reporting.utils import reporting_frame
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def pair_defs_from_config(config_path: Path) -> list[dict]:
@@ -69,6 +73,9 @@ def build_pair_summary(
     funding_payments: Any = None,
     pair_defs: list[dict] | None = None,
     initial_equity: float | None = None,
+    price_source: Path | str | None = None,
+    timeline: Any = None,
+    final_position_valuation: dict | None = None,
 ) -> list[dict]:
     pair_defs = pair_defs or []
     pair_symbols = {
@@ -178,10 +185,25 @@ def build_pair_summary(
             pl.col("holding_minutes").filter(pl.col("is_closed")).max().alias("max_holding_minutes"),
         )
     )
-    final_position_values = _final_pair_position_values(position_df, pair_symbols)
+    reconstructed_curves = _reconstructed_pair_curves(
+        trade_df,
+        position_df,
+        pair_symbols,
+        funding_events,
+        price_source=price_source,
+        timeline=timeline,
+        final_position_valuation=final_position_valuation,
+    )
+    final_position_values = _final_pair_position_values(
+        position_df,
+        pair_symbols,
+        reconstructed_curves=reconstructed_curves,
+        final_position_valuation=final_position_valuation,
+    )
     open_holding = _open_holding_stats(positions, position_df)
     drawdowns = _pair_drawdowns(
-        trade_df, position_df, pair_symbols, initial_equity, funding_events
+        trade_df, position_df, pair_symbols, initial_equity, funding_events,
+        reconstructed_curves=reconstructed_curves,
     )
 
     rows = []
@@ -487,19 +509,207 @@ def _rows_by_pair(frame: pl.DataFrame) -> dict[str, dict]:
     return {str(row["pair_id"]): row for row in frame.to_dicts()}
 
 
-def _final_pair_position_values(position_curve: pl.DataFrame, pair_symbols: dict[str, tuple]) -> dict[str, float]:
-    if position_curve.is_empty():
-        return {pair_id: 0.0 for pair_id in pair_symbols}
-    last = position_curve.tail(1)
-    values = {}
-    for pair_id, symbols in pair_symbols.items():
-        total = 0.0
-        for symbol in symbols:
-            column = f"{symbol}_position_value"
-            if column in last.columns:
-                total += _float(last[column][0], 0.0)
-        values[pair_id] = total
+def _final_pair_position_values(
+    position_curve: pl.DataFrame,
+    pair_symbols: dict[str, tuple],
+    reconstructed_curves: dict[str, pl.DataFrame] | None = None,
+    final_position_valuation: dict | None = None,
+) -> dict[str, float]:
+    """Return final signed position value per pair.
+
+    Newer runs intentionally omit per-symbol columns from ``position_curve``.
+    In that format the value is reconstructed from fills and raw close prices;
+    the legacy columns remain the first choice for backwards compatibility.
+    """
+    values = {pair_id: 0.0 for pair_id in pair_symbols}
+    if not position_curve.is_empty():
+        last = position_curve.tail(1)
+        for pair_id, symbols in pair_symbols.items():
+            columns = [f"{symbol}_position_value" for symbol in symbols]
+            available = [column for column in columns if column in last.columns]
+            if available:
+                values[pair_id] = sum(_float(last[column][0], 0.0) for column in available)
+
+    for pair_id, curve in (reconstructed_curves or {}).items():
+        if curve.is_empty() or "position_value" not in curve.columns:
+            continue
+        values[pair_id] = _float(curve.tail(1)["position_value"][0], values.get(pair_id, 0.0))
+
+    # Last-resort support for reports that have neither symbol columns nor raw
+    # data paths.  ``final_position_valuation`` contains aggregate symbol
+    # quantities/marks, so it is only used when a pair has a single unambiguous
+    # symbol contribution; raw-price reconstruction is preferred above.
+    if final_position_valuation:
+        marks = {}
+        for exchange_positions in (final_position_valuation.get("positions", {}) or {}).values():
+            for symbol, item in (exchange_positions or {}).items():
+                marks[symbol] = _float((item or {}).get("mark_price"), None)
+        for pair_id, symbols in pair_symbols.items():
+            if pair_id in (reconstructed_curves or {}):
+                continue
+            # No quantity is available at this layer; retain the legacy zero
+            # rather than treating aggregate symbol notional as pair PnL.
+            if not any(symbol in marks for symbol in symbols):
+                values[pair_id] = 0.0
     return values
+
+
+def _reconstructed_pair_curves(
+    trades: pl.DataFrame,
+    position_curve: pl.DataFrame,
+    pair_symbols: dict[str, tuple],
+    funding_events: list[dict],
+    *,
+    price_source: Path | str | None = None,
+    timeline: Any = None,
+    final_position_valuation: dict | None = None,
+) -> dict[str, pl.DataFrame]:
+    """Rebuild pair valuation paths when symbol columns were compacted away."""
+    if trades.is_empty() or not pair_symbols:
+        return {}
+    config = _read_report_config(price_source)
+    price_cache: dict[str, pl.DataFrame] = {}
+    timeline_frame = _timeline_frame(position_curve, timeline)
+    results: dict[str, pl.DataFrame] = {}
+    for pair_id, symbols in pair_symbols.items():
+        if all(f"{symbol}_position_value" in position_curve.columns for symbol in symbols):
+            continue
+        pair_trades = trades.filter(pl.col("pair_id") == pair_id)
+        if pair_trades.is_empty():
+            continue
+        x_prices = _load_close_frame(config, symbols[0], price_cache)
+        y_prices = _load_close_frame(config, symbols[1], price_cache)
+        pair_timeline = timeline_frame
+        if pair_timeline.is_empty():
+            ts_frames = [frame.select("ts") for frame in (x_prices, y_prices) if not frame.is_empty()]
+            ts_frames.append(pair_trades.select("ts"))
+            funding_ts = [
+                {"ts": int(row["ts"])}
+                for row in funding_events
+                if row.get("pair_id") == pair_id and row.get("ts") is not None
+            ]
+            if funding_ts:
+                ts_frames.append(pl.DataFrame(funding_ts))
+            if ts_frames:
+                pair_timeline = pl.concat(ts_frames, how="vertical_relaxed").unique().sort("ts")
+        if pair_timeline.is_empty():
+            continue
+
+        price_timeline = _asof_close(pair_timeline, x_prices, "x_close")
+        price_timeline = _asof_close(price_timeline, y_prices, "y_close")
+        events = pair_trades.select(
+            "ts",
+            pl.when(pl.col("symbol") == symbols[0])
+            .then(pl.when(pl.col("side") == "buy").then(pl.col("quantity")).otherwise(-pl.col("quantity")))
+            .otherwise(0.0)
+            .alias("x_delta"),
+            pl.when(pl.col("symbol") == symbols[1])
+            .then(pl.when(pl.col("side") == "buy").then(pl.col("quantity")).otherwise(-pl.col("quantity")))
+            .otherwise(0.0)
+            .alias("y_delta"),
+            pl.col("cashflow"),
+        ).group_by("ts").agg(
+            pl.col("x_delta").sum(),
+            pl.col("y_delta").sum(),
+            pl.col("cashflow").sum(),
+        )
+        funding = pl.DataFrame(
+            [
+                {"ts": int(row["ts"]), "funding_cashflow": -float(row["payment"])}
+                for row in funding_events
+                if row.get("pair_id") == pair_id and row.get("ts") is not None
+            ],
+            schema={"ts": pl.Int64, "funding_cashflow": pl.Float64},
+        )
+        curve = (
+            price_timeline.join(events, on="ts", how="left")
+            .join(funding, on="ts", how="left")
+            .with_columns(
+                pl.col("x_delta").fill_null(0.0),
+                pl.col("y_delta").fill_null(0.0),
+                pl.col("cashflow").fill_null(0.0),
+                pl.col("funding_cashflow").fill_null(0.0),
+                pl.col("x_close").forward_fill(),
+                pl.col("y_close").forward_fill(),
+            )
+            .with_columns(
+                pl.col("x_delta").cum_sum().alias("x_quantity"),
+                pl.col("y_delta").cum_sum().alias("y_quantity"),
+                pl.col("cashflow").cum_sum().alias("cum_cashflow"),
+                pl.col("funding_cashflow").cum_sum().alias("cum_funding"),
+            )
+            .with_columns(
+                (
+                    pl.col("x_quantity") * pl.col("x_close").fill_null(0.0)
+                    + pl.col("y_quantity") * pl.col("y_close").fill_null(0.0)
+                ).alias("position_value"),
+            )
+            .with_columns(
+                (pl.col("cum_cashflow") + pl.col("position_value") + pl.col("cum_funding")).alias("pair_pnl")
+            )
+            .select("ts", "position_value", "pair_pnl")
+        )
+        results[pair_id] = curve
+    return results
+
+
+def _read_report_config(source: Path | str | None) -> dict:
+    if source is None:
+        return {}
+    path = Path(source)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def _timeline_frame(position_curve: pl.DataFrame, timeline: Any) -> pl.DataFrame:
+    if not position_curve.is_empty() and "ts" in position_curve.columns:
+        return position_curve.select(pl.col("ts").cast(pl.Int64, strict=False)).drop_nulls().unique().sort("ts")
+    if timeline is None:
+        return pl.DataFrame(schema={"ts": pl.Int64})
+    frame = _to_frame(timeline)
+    if frame.is_empty() or "ts" not in frame.columns:
+        return pl.DataFrame(schema={"ts": pl.Int64})
+    return frame.select(pl.col("ts").cast(pl.Int64, strict=False)).drop_nulls().unique().sort("ts")
+
+
+def _symbol_data_path(config: dict, symbol: str) -> Path | None:
+    path = ((config.get("data", {}).get("symbols", {}).get(symbol, {}) or {}).get("path"))
+    candidates = []
+    if path:
+        candidate = Path(path)
+        candidates.append(candidate if candidate.is_absolute() else PROJECT_ROOT / candidate)
+    candidates.extend([
+        PROJECT_ROOT / "data" / symbol / f"{symbol}-1m.csv",
+        PROJECT_ROOT / "data" / symbol / f"{symbol}_1m.csv",
+    ])
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+
+def _load_close_frame(config: dict, symbol: str, cache: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    if symbol in cache:
+        return cache[symbol]
+    path = _symbol_data_path(config, symbol)
+    if path is None:
+        frame = pl.DataFrame(schema={"ts": pl.Int64, "close": pl.Float64})
+    else:
+        try:
+            frame = load_csv_data(path).select("ts", "close")
+        except Exception:
+            frame = pl.DataFrame(schema={"ts": pl.Int64, "close": pl.Float64})
+    cache[symbol] = frame
+    return frame
+
+
+def _asof_close(timeline: pl.DataFrame, prices: pl.DataFrame, name: str) -> pl.DataFrame:
+    if prices.is_empty():
+        return timeline.with_columns(pl.lit(None, dtype=pl.Float64).alias(name))
+    return timeline.join_asof(
+        prices.rename({"close": name}).sort("ts"), on="ts", strategy="backward"
+    )
 
 
 def _open_holding_stats(positions: pl.DataFrame, position_curve: pl.DataFrame) -> dict[str, dict]:
@@ -536,43 +746,50 @@ def _pair_drawdowns(
     pair_symbols: dict[str, tuple],
     initial_equity: float | None,
     funding_events: list[dict] | None = None,
+    reconstructed_curves: dict[str, pl.DataFrame] | None = None,
 ) -> dict[str, dict]:
-    if trades.is_empty() or position_curve.is_empty() or "ts" not in position_curve.columns:
+    if trades.is_empty():
         return {}
     result = {}
     for pair_id, symbols in pair_symbols.items():
-        value_exprs = []
-        for symbol in symbols:
-            column = f"{symbol}_position_value"
-            if column in position_curve.columns:
-                value_exprs.append(pl.col(column).cast(pl.Float64, strict=False).fill_null(0.0))
-        if not value_exprs:
+        reconstructed = (reconstructed_curves or {}).get(pair_id)
+        if reconstructed is not None and not reconstructed.is_empty():
+            curve = reconstructed
+        elif position_curve.is_empty() or "ts" not in position_curve.columns:
             continue
-        pair_position = position_curve.select(
-            "ts",
-            sum(value_exprs, start=pl.lit(0.0)).alias("position_value"),
-        )
-        pair_cash = (
-            trades.filter(pl.col("pair_id") == pair_id)
-            .group_by("ts")
-            .agg(pl.col("cashflow").sum().alias("cashflow"))
-            .sort("ts")
-        )
-        pair_funding_rows = [
-            {"ts": row["ts"], "cashflow": -float(row["payment"])}
-            for row in (funding_events or [])
-            if row.get("pair_id") == pair_id
-        ]
-        if pair_funding_rows:
-            pair_cash = pl.concat(
-                [pair_cash, pl.DataFrame(pair_funding_rows, infer_schema_length=None)],
-                how="diagonal_relaxed",
-            ).group_by("ts").agg(pl.col("cashflow").sum()).sort("ts")
-        curve = (
-            pair_position.join(pair_cash, on="ts", how="left")
-            .with_columns(pl.col("cashflow").fill_null(0.0).cum_sum().alias("cum_cashflow"))
-            .with_columns((pl.col("cum_cashflow") + pl.col("position_value")).alias("pair_pnl"))
-        )
+        else:
+            value_exprs = []
+            for symbol in symbols:
+                column = f"{symbol}_position_value"
+                if column in position_curve.columns:
+                    value_exprs.append(pl.col(column).cast(pl.Float64, strict=False).fill_null(0.0))
+            if not value_exprs:
+                continue
+            pair_position = position_curve.select(
+                "ts",
+                sum(value_exprs, start=pl.lit(0.0)).alias("position_value"),
+            )
+            pair_cash = (
+                trades.filter(pl.col("pair_id") == pair_id)
+                .group_by("ts")
+                .agg(pl.col("cashflow").sum().alias("cashflow"))
+                .sort("ts")
+            )
+            pair_funding_rows = [
+                {"ts": row["ts"], "cashflow": -float(row["payment"])}
+                for row in (funding_events or [])
+                if row.get("pair_id") == pair_id
+            ]
+            if pair_funding_rows:
+                pair_cash = pl.concat(
+                    [pair_cash, pl.DataFrame(pair_funding_rows, infer_schema_length=None)],
+                    how="diagonal_relaxed",
+                ).group_by("ts").agg(pl.col("cashflow").sum()).sort("ts")
+            curve = (
+                pair_position.join(pair_cash, on="ts", how="left")
+                .with_columns(pl.col("cashflow").fill_null(0.0).cum_sum().alias("cum_cashflow"))
+                .with_columns((pl.col("cum_cashflow") + pl.col("position_value")).alias("pair_pnl"))
+            )
         if curve.is_empty():
             continue
         drawdown = (

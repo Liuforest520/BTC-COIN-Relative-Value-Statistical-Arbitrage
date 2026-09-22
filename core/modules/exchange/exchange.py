@@ -101,6 +101,82 @@ class Exchange:
         self._update_account(self.last_bars, price_field="open")
         return bars, funding_payments
 
+    def forced_liquidation_orders(self, bars, bar_index: int):
+        """Create market closes for isolated Pair accounts whose equity is <= 0.
+
+        The account is marked at the executable open before this method is
+        called.  A liquidation is therefore queued at the same open and is
+        filled by the normal atomic order path, so the loss is realized rather
+        than silently capped at the Pair's initial capital.
+        """
+        insolvent = self._insolvent_position_ids(bars)
+        if not insolvent:
+            return []
+
+        orders = []
+        for position_id in sorted(insolvent):
+            symbols = self.position_lots.get(position_id, {})
+            if not symbols or any(symbol not in bars for symbol in symbols):
+                continue
+            # A strategy close already waiting for this position must not be
+            # filled alongside the forced close.  Replace it with one complete
+            # liquidation group.
+            self._cancel_position_orders(position_id)
+            pair_id = self.position_pair_ids.get(position_id)
+            group_id = f"forced-liquidation-{self.exchange_name}-{position_id}-{bar_index}"
+            for leg_index, (symbol, quantity) in enumerate(sorted(symbols.items())):
+                quantity = float(quantity)
+                if abs(quantity) <= 1e-12:
+                    continue
+                orders.append(
+                    Order(
+                        order_id=f"{group_id}-{leg_index}",
+                        group_id=group_id,
+                        exchange=self.exchange_name,
+                        symbol=symbol,
+                        action=OrderAction.CLOSE,
+                        side=OrderSide.SELL if quantity > 0 else OrderSide.BUY,
+                        order_type=OrderType.MARKET,
+                        quantity=abs(quantity),
+                        position_id=position_id,
+                        pair_id=pair_id,
+                        exit_reason="protective_pair_equity_zero",
+                        protection_trigger="pair_equity_zero",
+                        exit_class="stop_loss",
+                        reopen_lock_pending=True,
+                        protection_rule="pair_equity_zero",
+                    )
+                )
+        return orders
+
+    def _insolvent_position_ids(self, bars) -> set[str]:
+        insolvent = set()
+        for position_id, symbols in self.position_lots.items():
+            if not symbols:
+                continue
+            capital = self._position_capital_value(position_id)
+            unrealized = 0.0
+            complete = True
+            for symbol, quantity in symbols.items():
+                mark = self._mark_price(symbol, bars, "open")
+                if mark is None:
+                    complete = False
+                    break
+                entry = float(self.position_entry_prices.get(position_id, {}).get(symbol, mark))
+                unrealized += float(quantity) * (float(mark) - entry)
+            if complete and capital + unrealized <= 1e-9:
+                insolvent.add(position_id)
+        return insolvent
+
+    def _cancel_position_orders(self, position_id: str) -> None:
+        remaining = []
+        for order in self.orders:
+            if order.position_id == position_id:
+                order.status = OrderStatus.CANCELED
+            else:
+                remaining.append(order)
+        self.orders = remaining
+
     def finish_bar(self):
         self._update_account(self.last_bars, price_field="close")
 
@@ -334,12 +410,12 @@ class Exchange:
 
             capital_after = before_capital + float(info["realized"]) - float(info["fees"])
             if after_reserve <= 1e-12:
-                free_cash += max(0.0, capital_after)
+                free_cash += capital_after
                 capital.pop(position_id, None)
                 continue
             released = max(0.0, before_reserve - after_reserve)
             fraction = min(1.0, released / before_reserve) if before_reserve > 1e-12 else 0.0
-            release = max(0.0, capital_after) * fraction
+            release = capital_after * fraction
             free_cash += release
             capital[position_id] = capital_after - release
 
@@ -643,7 +719,7 @@ class Exchange:
                     - float(fees_by_position.get(position_id, 0.0))
                 )
                 if after_reserve <= 1e-12:
-                    release = max(0.0, capital_after_pnl)
+                    release = capital_after_pnl
                     self.available_balance += release
                     self.position_capital.pop(position_id, None)
                     continue
@@ -652,17 +728,18 @@ class Exchange:
                     min(1.0, released_reserve / before_reserve)
                     if before_reserve > 1e-12 else 0.0
                 )
-                release = max(0.0, capital_after_pnl) * fraction
+                release = capital_after_pnl * fraction
                 self.available_balance += release
                 self.position_capital[position_id] = capital_after_pnl - release
 
         self._sync_wallet_balance()
 
     def _sync_wallet_balance(self) -> None:
-        # Negative Pair capital is isolated and cannot consume free cash or a
-        # different Pair's capital.  Its contribution to account cash is zero.
+        # Pair capital remains visible in the account ledger, including a
+        # negative value until the Pair is liquidated/closed.  This prevents a
+        # loss beyond the isolated reserve from being silently written off.
         self.wallet_balance = float(self.available_balance) + sum(
-            max(0.0, float(value)) for value in self.position_capital.values()
+            float(value) for value in self.position_capital.values()
         )
         self.cash = self.wallet_balance
 
@@ -742,14 +819,11 @@ class Exchange:
                         max(0.0, float(value))
                         for value in margin_lots.get(position_id, {}).values()
                     )
-                realized_capital += max(0.0, capital)
-                marked_capital += max(
-                    0.0,
-                    capital + float(unrealized_by_position.get(position_id, 0.0)),
-                )
-            wallet = max(0.0, free_cash) + realized_capital
-            equity = max(0.0, free_cash) + marked_capital
-            reported_available = max(0.0, free_cash)
+                realized_capital += capital
+                marked_capital += capital + float(unrealized_by_position.get(position_id, 0.0))
+            wallet = free_cash + realized_capital
+            equity = free_cash + marked_capital
+            reported_available = free_cash
         else:
             # Compatibility for callers that seed aggregate/legacy positions
             # without the isolated position ledgers.

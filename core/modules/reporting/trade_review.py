@@ -85,6 +85,17 @@ def read_frame(path: Path, columns: list[str] | None = None) -> pl.DataFrame:
     return frame.select(columns)
 
 
+def _read_final_position_valuation(run_dir: Path) -> dict:
+    path = run_dir / "final_position_valuation.json"
+    if not path.exists():
+        return {}
+    try:
+        value = loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _empty_frame(columns: list[str] | None = None) -> pl.DataFrame:
     values = {}
     for column in columns or []:
@@ -1488,6 +1499,9 @@ def export_trade_review_html(
             funding_payments=funding,
             pair_defs=pair_defs,
             initial_equity=initial_equity,
+            price_source=run_dir / "config.yaml",
+            timeline=equity,
+            final_position_valuation=_read_final_position_valuation(run_dir),
         )
     }
 

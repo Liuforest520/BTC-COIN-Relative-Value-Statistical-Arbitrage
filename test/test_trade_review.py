@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import polars as pl
 import pytest
+import yaml
 
 from core.modules.reporting import export as report_export
 from core.modules.reporting.review_assets import OVERVIEW_TEMPLATE, PAIR_TEMPLATE, REVIEW_JS
@@ -330,6 +331,62 @@ def test_pair_summary_uses_position_funding_for_pnl_and_win_rate():
     assert summary["total_pnl"] < 0
     assert summary["wins"] == 0
     assert summary["losses"] == 1
+
+
+def test_pair_summary_reconstructs_open_position_without_symbol_curve_columns(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "X.csv").write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1000000000000,100,100,100,100,1\n"
+        "1000000001000,80,80,80,80,1\n",
+        encoding="utf-8",
+    )
+    (data_dir / "Y.csv").write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1000000000000,50,50,50,50,1\n"
+        "1000000001000,50,50,50,50,1\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "data": {"symbols": {
+                    "X": {"path": str(data_dir / "X.csv")},
+                    "Y": {"path": str(data_dir / "Y.csv")},
+                }},
+            }
+        ),
+        encoding="utf-8",
+    )
+    trades = pl.DataFrame(
+        {
+            "pair_id": ["p", "p"],
+            "position_id": ["pos", "pos"],
+            "group_id": ["pos", "pos"],
+            "action": ["open", "open"],
+            "side": ["buy", "sell"],
+            "symbol": ["X", "Y"],
+            "quantity": [10.0, 10.0],
+            "price": [100.0, 50.0],
+            "notional": [1000.0, 500.0],
+            "fee": [0.0, 0.0],
+            "slippage": [0.0, 0.0],
+            "ts": [1000000000000, 1000000000000],
+        }
+    )
+    summary = build_pair_summary(
+        trades=trades,
+        position_curve=pl.DataFrame({"ts": [1000000000000, 1000000001000]}),
+        pair_defs=[{"pair_id": "p", "x_symbol": "X", "y_symbol": "Y"}],
+        initial_equity=10_000.0,
+        price_source=config_path,
+    )[0]
+
+    assert summary["final_position_value"] == pytest.approx(300.0)
+    assert summary["total_pnl"] == pytest.approx(-200.0)
+    assert summary["pair_max_drawdown"] == pytest.approx(-200.0)
 
 
 def test_pair_contribution_carries_last_mark_across_missing_quote():
