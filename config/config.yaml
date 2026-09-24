@@ -795,9 +795,14 @@ setups:
         enabled: true
         minimum_entry_capital_ratio: 0.5
         closed_pair_freeze_model_lookback_multiplier: 0.5
-        eviction_min_holding_bars: 60
-        profitable_position_replacement:
+        eviction_min_holding_model_lookback_multiplier: 0.5
+        candidate_quality:
           enabled: true
+          min_theoretical_zero_return_x_move: 0.20
+          max_adf_pvalue: 0.4
+          min_expected_net_return: 0.0
+        profitable_position_replacement:
+          enabled: false
           min_theoretical_zero_return_x_move: 0.20
           max_adf_pvalue: 0.4
       protection:

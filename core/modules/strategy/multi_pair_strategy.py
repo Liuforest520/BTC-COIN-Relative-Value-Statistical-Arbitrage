@@ -20,10 +20,16 @@ from core.modules.models.pipeline_types import (
 )
 from core.modules.strategy.position_protection import (
     mark_net_pnl,
+    net_pnl_at_x,
     solve_zero_net_x_price,
     supported as protection_supported,
 )
 from core.modules.strategy.protection import ProtectionContext, ProtectionManager
+from core.modules.strategy.rebalance import (
+    RebalanceCandidate,
+    RebalanceManager,
+    RebalancePosition,
+)
 from core.modules.strategy.base import BaseStrategy
 from core.modules.strategy.config import (
     EstimatorConfig,
@@ -151,17 +157,15 @@ class MultiPairStrategy(BaseStrategy):
                 "protection.max_holding_time_freeze_bars",
             ),
         )
-        self.rebalance_cfg = replace(
-            self.rebalance_cfg,
-            eviction_min_holding_bars=_decision_bars(
-                self.rebalance_cfg.eviction_min_holding_bars,
-                self.model_timeframe_minutes,
-                "rebalance.eviction_min_holding_bars",
-            ),
-        )
         self.protection_manager = ProtectionManager(self.protection_cfg)
+        self.rebalance_manager = RebalanceManager(self.rebalance_cfg)
         self.fee_rate = max(0.0, float(fee_rate))
         self.slippage_rate = max(0.0, float(slippage_bps)) / 10000.0
+        self.frozen_model_supported = protection_supported(
+            self.estimator_cfg.regression_method,
+            self.estimator_cfg.position_update_policy,
+            True,
+        )
         self.protection_supported = protection_supported(
             self.estimator_cfg.regression_method,
             self.estimator_cfg.position_update_policy,
@@ -204,7 +208,6 @@ class MultiPairStrategy(BaseStrategy):
         self._pair_bar_indices: dict[str, int] = {}
         self._pending_open_pair_ids: set[str] = set()
         self._pending_rebalance_pair_ids: set[str] = set()
-        self._pending_rebalance_release: float = 0.0
 
         self.signal = self
         self.last_state: dict[str, Any] = {}
@@ -346,20 +349,59 @@ class MultiPairStrategy(BaseStrategy):
                     entry_candidates[pair_id] = candidate
                     entry_targets[pair_id] = candidate["raw_target"]
 
-        rebalance_orders = self._plan_rebalance(entry_candidates, bundles, bar_index)
-        if rebalance_orders:
-            orders.extend(rebalance_orders)
-        # Planned rebalance proceeds are usable by replacement orders on the
-        # next executable bar, but must not mutate the account balance before
-        # the close orders actually fill. Give the allocator a temporary
-        # planning balance and restore the exchange-reported value afterwards.
-        actual_available = float(self.portfolio_state.available_balance or 0.0)
-        planned_available = actual_available + float(self._pending_rebalance_release or 0.0)
-        self.portfolio_state.available_balance = planned_available
+        # First allocate every entry that can be funded normally. Those opens
+        # are not limited to one candidate. Only candidates skipped for lack
+        # of minimum capital are passed to the independent rebalance manager.
         allocation = self._allocate_entry_targets(entry_targets, bar_index)
-        self.portfolio_state.available_balance = actual_available
-        orders.extend(self._orders_from_entry_allocation(entry_candidates, allocation))
-        self._pending_rebalance_release = 0.0
+        direct_orders = self._orders_from_entry_allocation(entry_candidates, allocation)
+        allocation_report = getattr(allocation, "constraint_report", {}) or {}
+        underfunded_ids = set(
+            allocation_report.get("underfunded_pair_ids", []) or []
+        )
+        underfunded_candidates = {
+            pair_id: candidate
+            for pair_id, candidate in entry_candidates.items()
+            if pair_id in underfunded_ids
+        }
+        if self.rebalance_cfg.enabled and underfunded_candidates:
+            qualified_candidates = {}
+            for pair_id, candidate in underfunded_candidates.items():
+                rebalance_candidate = self._rebalance_candidate_from_entry(
+                    pair_id, candidate
+                )
+                if (
+                    rebalance_candidate is not None
+                    and self.rebalance_manager.quality_allowed(rebalance_candidate)
+                ):
+                    qualified_candidates[pair_id] = candidate
+                else:
+                    pipeline = self.pipelines.get(pair_id)
+                    if pipeline is not None:
+                        reason = "rebalance candidate quality gate failed"
+                        pipeline.state.sizing_state.last_schedule_reason = reason
+                        pipeline.state.last_block_reason = reason
+            underfunded_candidates = qualified_candidates
+        available_after_direct = self._allocation_available_after(
+            allocation, self.portfolio_state.available_balance
+        )
+        rebalance_orders, replacement_allocation = self._plan_rebalance(
+            underfunded_candidates,
+            bundles,
+            bar_index,
+            available_after_direct,
+        )
+        # Rebalance closes must be queued before both ordinary and replacement
+        # opens so their actual released margin is visible at execution time.
+        orders.extend(rebalance_orders)
+        orders.extend(direct_orders)
+        orders.extend(
+            self._orders_from_entry_allocation(
+                underfunded_candidates, replacement_allocation
+            )
+        )
+        allocation = self._merge_allocations(
+            allocation, replacement_allocation, bar_index
+        )
 
         self._update_portfolio_state(bundles, ts, bar_index, allocation)
         return orders
@@ -450,13 +492,16 @@ class MultiPairStrategy(BaseStrategy):
             pipeline.state.last_block_reason = reason
             return None
 
-        # Compute the candidate's frozen-model theoretical zero-net-return
-        # boundary at signal time.  This is historical/model information only;
-        # no next-bar price is used.  Rebalance quality gates can therefore
-        # inspect the same quantity and cost basis that protection will use
-        # after the eventual fill.
-        if self.protection_supported:
+        # Compute replacement quality independently from the protection
+        # feature switch. Rebalance must behave identically whether protective
+        # exits are enabled or disabled.
+        if self.frozen_model_supported and (
+            self.protection_supported or self.rebalance_cfg.enabled
+        ):
             try:
+                estimated_entry_cost = (
+                    abs(raw_target.x_notional) + abs(raw_target.y_notional)
+                ) * (self.fee_rate + self.slippage_rate)
                 boundary = solve_zero_net_x_price(
                     self.estimator_cfg.regression_method,
                     result.estimator.alpha,
@@ -469,22 +514,52 @@ class MultiPairStrategy(BaseStrategy):
                     bundle.y_bar.close,
                     raw_target.x_quantity,
                     raw_target.y_quantity,
-                    (abs(raw_target.x_notional) + abs(raw_target.y_notional))
-                    * (self.fee_rate + self.slippage_rate),
+                    estimated_entry_cost,
                     self.fee_rate,
                     self.slippage_rate,
                 )
                 x_move = None
                 if boundary.x_price is not None and bundle.x_bar.close > 0:
                     x_move = abs(float(boundary.x_price) / float(bundle.x_bar.close) - 1.0)
-                signal_para = _merge_para(signal_para, {
-                    "protection": {
+                expected_net_pnl = None
+                expected_net_return = None
+                if boundary.target_residual is not None:
+                    expected_net_pnl = net_pnl_at_x(
+                        self.estimator_cfg.regression_method,
+                        result.estimator.alpha,
+                        result.estimator.beta,
+                        boundary.target_residual,
+                        bundle.x_bar.close,
+                        bundle.x_bar.close,
+                        bundle.y_bar.close,
+                        signal.side,
+                        raw_target.x_quantity,
+                        raw_target.y_quantity,
+                        estimated_entry_cost,
+                        self.fee_rate,
+                        self.slippage_rate,
+                    )
+                    gross = abs(raw_target.x_notional) + abs(raw_target.y_notional)
+                    if expected_net_pnl is not None and gross > 1e-12:
+                        expected_net_return = float(expected_net_pnl) / gross
+                quality = {
+                    "adf_pvalue": getattr(result.estimator, "cointegration_pvalue", None),
+                    "theoretical_zero_return_x_move": x_move,
+                    "theoretical_zero_return_x_price": boundary.x_price,
+                    "theoretical_zero_return_x_direction": boundary.trigger_direction,
+                    "theoretical_zero_return_reason": boundary.reason,
+                    "expected_net_pnl": expected_net_pnl,
+                    "expected_net_return": expected_net_return,
+                    "signal_strength": float(getattr(signal, "signal_strength", 0.0) or 0.0),
+                }
+                signal_para = _merge_para(signal_para, {"rebalance_quality": quality})
+                if self.protection_supported:
+                    signal_para = _merge_para(signal_para, {"protection": {
                         "theoretical_zero_return_x_move": x_move,
                         "theoretical_zero_return_x_price": boundary.x_price,
                         "theoretical_zero_return_x_direction": boundary.trigger_direction,
                         "theoretical_zero_return_reason": boundary.reason,
-                    }
-                })
+                    }})
             except (TypeError, ValueError, OverflowError):
                 pass
         raw_target.para = _merge_para(raw_target.para, signal_para)
@@ -566,159 +641,185 @@ class MultiPairStrategy(BaseStrategy):
 
         return {"allowed": True, "action": "add", "reason": f"add entry #{state.entry_count + 1}"}
 
-    def _plan_rebalance(self, entry_candidates, bundles, bar_index):
-        """Plan one atomic batch of replacements for all underfunded entries.
-
-        The decision is made once per strategy bar: calculate the aggregate
-        minimum capital required by the new entries, rank current positions by
-        net floating return, and select enough old Pairs in one batch.  Close
-        groups are emitted before open groups; the exchange then releases the
-        real margin before executing replacements on the same fill bar.
-        """
+    def _plan_rebalance(
+        self,
+        entry_candidates,
+        bundles,
+        bar_index,
+        available_capital=None,
+    ):
+        """Plan one replacement target after ordinary allocation is complete."""
         if not self.rebalance_cfg.enabled or not entry_candidates:
-            return []
+            return [], None
 
-        available = max(0.0, float(self.portfolio_state.available_balance or 0.0))
-        requirements = []
-        for new_id, candidate in entry_candidates.items():
-            pipeline = self.pipelines.get(new_id)
+        available = max(
+            0.0,
+            float(
+                self.portfolio_state.available_balance
+                if available_capital is None
+                else available_capital
+            ),
+        )
+        candidates = []
+        for pair_id, candidate in entry_candidates.items():
+            pipeline = self.pipelines.get(pair_id)
             if pipeline is None or self._pair_holds_position(pipeline):
                 continue
-            raw = candidate.get("raw_target")
-            target = float(getattr(raw, "gross_notional", 0.0) or 0.0)
-            if target <= 0:
-                target = float(getattr(raw, "target_capital", 0.0) or 0.0)
-            if target <= 0:
-                continue
-            minimum = target * float(self.rebalance_cfg.minimum_entry_capital_ratio)
-            requirements.append((new_id, target, minimum, candidate))
+            rebalance_candidate = self._rebalance_candidate_from_entry(
+                pair_id, candidate
+            )
+            if rebalance_candidate is not None:
+                candidates.append(rebalance_candidate)
 
-        if not requirements:
-            return []
-        # Mirror PairTargetCapitalAllocator's sequential policy.  A partially
-        # fundable candidate consumes the remaining balance, so later
-        # candidates do not create extra liquidation demand on this bar.  If a
-        # candidate is below its minimum, release only the shortfall to that
-        # minimum; the allocator then uses all resulting available capital.
-        planning_available = available
-        release_needed = 0.0
-        for _new_id, target, minimum, _candidate in requirements:
-            if planning_available >= target - 1e-9:
-                planning_available -= target
-                continue
-            if planning_available >= minimum - 1e-9:
-                planning_available = 0.0
-                break
-            release_needed = minimum - planning_available
-            break
-        if release_needed <= 1e-9:
-            return []
-
-        eligible = []
+        positions = []
         for pair_id, old_pipeline in self.pipelines.items():
             old_bundle = bundles.get(pair_id)
-            # A replacement must not be planned against a Pair whose current
-            # executable bar is incomplete; otherwise its close could wait
-            # while the new entry is filled without the intended release.
-            if (pair_id in self._pending_rebalance_pair_ids
-                    or not self._pair_holds_position(old_pipeline)
-                    or old_bundle is None
-                    or old_bundle.x_bar is None
-                    or old_bundle.y_bar is None):
+            if (
+                pair_id in self._pending_rebalance_pair_ids
+                or not self._pair_holds_position(old_pipeline)
+                or old_pipeline.state.protection_state.pending_exit
+                or old_bundle is None
+                or old_bundle.x_bar is None
+                or old_bundle.y_bar is None
+            ):
                 continue
-            pnl_return = self._pair_unrealized_return(old_pipeline, old_bundle)
-            eligible.append((pnl_return, pair_id, old_pipeline))
-        eligible.sort(key=lambda item: (item[0], item[1]))
-        if not eligible:
-            return []
-
-        # Losing positions are always eligible.  Replacing a position that is
-        # already profitable requires the configured scenario/ADF gate.
-        gate_passed = all(item[0] >= 0.0 for item in eligible)
-        if gate_passed:
-            for _new_id, _target, _minimum, candidate in requirements:
-                if not self._profitable_replacement_allowed(candidate):
-                    return []
-        selected = []
-        release = 0.0
-        orders = []
-        rebalance_batch_id = None
-        for pnl_return, pair_id, old_pipeline in eligible:
-            if pnl_return >= 0.0:
-                # Once a losing position is insufficient, profitable positions
-                # may be used only when the candidate passes the replacement
-                # quality gate.
-                if any(not self._profitable_replacement_allowed(item[3]) for item in requirements):
-                    continue
-            if self.rebalance_cfg.eviction_min_holding_bars > 0:
-                entry_bar = old_pipeline.state.protection_state.entry_bar_index
-                # ``entry_bar_index`` is a Pair-local model-bar index.  The
-                # strategy ``bar_index`` is global and therefore includes
-                # bars that this Pair did not receive (late listings,
-                # missing legs, or gaps).  Mixing the two counters can make a
-                # newly opened Pair look old enough to evict immediately.
-                pair_bar_index = bundles[pair_id].bar_index
-                if (
-                    entry_bar is not None
-                    and pair_bar_index - entry_bar < self.rebalance_cfg.eviction_min_holding_bars
-                ):
-                    continue
-            # Closing a Pair releases only its remaining isolated net equity,
-            # never its current gross market value.  Losses therefore cannot
-            # be financed by another Pair or by unallocated account cash.
-            releasable = self._pair_releasable_equity(
-                old_pipeline, bundles.get(pair_id)
+            ledger = old_pipeline.state.position_ledger
+            entry_bar = ledger.entry_bar_index
+            held_bars = (
+                max(0, int(old_bundle.bar_index) - int(entry_bar))
+                if entry_bar is not None else 0
             )
+            positions.append(RebalancePosition(
+                pair_id=pair_id,
+                net_return=self._pair_unrealized_return(old_pipeline, old_bundle),
+                releasable_equity=self._pair_releasable_equity(old_pipeline, old_bundle),
+                held_bars=held_bars,
+                minimum_holding_bars=self._rebalance_min_holding_bars(old_pipeline),
+                payload=old_pipeline,
+            ))
+
+        plan = self.rebalance_manager.plan(candidates, positions, available)
+        if not plan.ready:
+            return [], None
+
+        rebalance_batch_id = str(uuid4())[:8]
+        close_orders = []
+        prepared_pipelines = []
+        for position in plan.evictions:
+            old_pipeline = position.payload
             old_state = old_pipeline.state.sizing_state
-            if rebalance_batch_id is None:
-                rebalance_batch_id = str(uuid4())[:8]
-            close_orders = self._close_orders(
-                pair_id, old_pipeline, old_pipeline.pair_def,
-                old_state.target_hedge_ratio or old_pipeline.state.estimator_state.hedge_beta or 1.0,
+            pair_orders = self._close_orders(
+                position.pair_id,
+                old_pipeline,
+                old_pipeline.pair_def,
+                old_state.target_hedge_ratio
+                or old_pipeline.state.estimator_state.hedge_beta
+                or 1.0,
                 exit_reason="rebalance_replacement",
                 protection_trigger="rebalance_replacement",
                 exit_class="rebalance_replacement",
                 protection_freeze_bars=self._rebalance_freeze_bars(old_pipeline),
                 rebalance_batch_id=rebalance_batch_id,
             )
-            if not close_orders:
-                continue
-            orders.extend(close_orders)
-            self._pending_rebalance_pair_ids.add(pair_id)
-            selected.append(pair_id)
-            release += releasable
-            if release >= release_needed - 1e-9:
-                break
+            if not pair_orders:
+                for prepared in prepared_pipelines:
+                    prepared.state.protection_state.pending_exit = False
+                return [], None
+            close_orders.extend(pair_orders)
+            prepared_pipelines.append(old_pipeline)
 
-        if not selected:
-            return []
-        for requirement in requirements:
-            requirement[3]["raw_target"].para.setdefault("portfolio", {})["rebalance_batch_id"] = rebalance_batch_id
-        self._pending_rebalance_release += release
-        return orders
+        for position in plan.evictions:
+            self._pending_rebalance_pair_ids.add(position.pair_id)
+
+        chosen = plan.candidate.payload
+        chosen_raw = chosen["raw_target"]
+        chosen_raw.para.setdefault("portfolio", {})[
+            "rebalance_batch_id"
+        ] = rebalance_batch_id
+        actual_available = self.portfolio_state.available_balance
+        self.portfolio_state.available_balance = available + plan.planned_release
+        replacement_allocation = self._allocate_entry_targets(
+            {plan.candidate.pair_id: chosen_raw}, bar_index
+        )
+        self.portfolio_state.available_balance = actual_available
+        if (
+            replacement_allocation is None
+            or plan.candidate.pair_id not in replacement_allocation.pair_targets
+        ):
+            for prepared in prepared_pipelines:
+                prepared.state.protection_state.pending_exit = False
+            for position in plan.evictions:
+                self._pending_rebalance_pair_ids.discard(position.pair_id)
+            return [], None
+        return close_orders, replacement_allocation
+
+    def _rebalance_candidate_from_entry(self, pair_id, candidate):
+        raw = candidate.get("raw_target")
+        target = float(getattr(raw, "gross_notional", 0.0) or 0.0)
+        if target <= 0:
+            target = float(getattr(raw, "target_capital", 0.0) or 0.0)
+        if target <= 0:
+            return None
+        para = getattr(raw, "para", {}) or {}
+        quality = (
+            para.get("rebalance_quality", {}) if isinstance(para, dict) else {}
+        )
+        estimator = getattr(candidate.get("result"), "estimator", None)
+        return RebalanceCandidate(
+            pair_id=pair_id,
+            target_capital=target,
+            minimum_capital=(
+                target * float(self.rebalance_cfg.minimum_entry_capital_ratio)
+            ),
+            adf_pvalue=quality.get(
+                "adf_pvalue", getattr(estimator, "cointegration_pvalue", None)
+            ),
+            theoretical_zero_return_x_move=quality.get(
+                "theoretical_zero_return_x_move"
+            ),
+            expected_net_return=quality.get("expected_net_return"),
+            signal_strength=float(
+                quality.get(
+                    "signal_strength",
+                    getattr(raw, "signal_strength", 0.0) or 0.0,
+                ) or 0.0
+            ),
+            payload=candidate,
+        )
 
     def _pair_unrealized_return(self, pipeline, bundle):
-        pstate = pipeline.state.protection_state
-        if bundle is None or pstate.entry_gross_notional <= 0:
+        ledger = pipeline.state.position_ledger
+        if bundle is None or ledger.entry_gross_notional <= 0:
             return 0.0
         pnl = self._pair_mark_net_pnl(pipeline, bundle)
-        return float(pnl / max(pstate.entry_gross_notional, 1e-12))
+        return float(pnl / max(ledger.entry_gross_notional, 1e-12))
 
     def _pair_releasable_equity(self, pipeline, bundle):
-        pstate = pipeline.state.protection_state
-        if bundle is None or pstate.entry_gross_notional <= 0:
+        pair_marked_equity = getattr(self, "_current_pair_marked_equity", {})
+        pair_id = getattr(pipeline.pair_def, "pair_id", None)
+        if pair_id in pair_marked_equity:
+            try:
+                return max(0.0, float(pair_marked_equity[pair_id]))
+            except (TypeError, ValueError):
+                pass
+
+        # Compatibility fallback for direct strategy fixtures that do not
+        # provide the exchange account snapshot. Production backtests use the
+        # exchange-derived Pair marked equity above.
+        ledger = pipeline.state.position_ledger
+        if bundle is None or ledger.entry_gross_notional <= 0:
             return 0.0
         return max(
             0.0,
-            float(pstate.entry_gross_notional) + self._pair_mark_net_pnl(pipeline, bundle),
+            float(ledger.entry_gross_notional) + self._pair_mark_net_pnl(pipeline, bundle),
         )
 
     def _pair_mark_net_pnl(self, pipeline, bundle):
         state = pipeline.state.sizing_state
-        pstate = pipeline.state.protection_state
-        side = state.position_side or pstate.side
-        x_entry = pstate.entry_x_price or bundle.x_bar.close
-        y_entry = pstate.entry_y_price or bundle.y_bar.close
+        ledger = pipeline.state.position_ledger
+        side = state.position_side or ledger.side
+        x_entry = ledger.entry_x_price or bundle.x_bar.close
+        y_entry = ledger.entry_y_price or bundle.y_bar.close
         return float(mark_net_pnl(
             side,
             float(bundle.x_bar.close),
@@ -727,34 +828,28 @@ class MultiPairStrategy(BaseStrategy):
             y_entry,
             state.x_quantity,
             state.y_quantity,
-            pstate.entry_fee,
-            pstate.funding_cost,
+            ledger.entry_fee,
+            ledger.funding_cost,
             self.fee_rate,
             self.slippage_rate,
         ))
 
-    def _profitable_replacement_allowed(self, candidate):
-        rule = self.rebalance_cfg.profitable_position_replacement
-        if not rule.enabled:
-            return False
-        result = candidate.get("result") or {}
-        estimator = getattr(result, "estimator", None)
-        pvalue = getattr(estimator, "cointegration_pvalue", None)
-        if pvalue is None or float(pvalue) > rule.max_adf_pvalue:
-            return False
-        raw = candidate.get("raw_target")
-        para = getattr(raw, "para", {}) or {}
-        protection = para.get("protection", {}) if isinstance(para, dict) else {}
-        move = protection.get("theoretical_zero_return_x_move")
-        if move is None:
-            stop_price = protection.get("stop_loss_x_price")
-            entry_price = protection.get("entry_x_price")
-            if stop_price is not None and entry_price:
-                move = abs(float(stop_price) / float(entry_price) - 1.0)
-        try:
-            return move is not None and float(move) >= rule.min_theoretical_zero_return_x_move
-        except (TypeError, ValueError):
-            return False
+    def _rebalance_min_holding_bars(self, pipeline) -> int:
+        multiplier = float(
+            self.rebalance_cfg.eviction_min_holding_model_lookback_multiplier
+        )
+        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
+        if lookback is None:
+            lookback = getattr(self.estimator_cfg, "model_lookback_bars", 0)
+        lookback = float(lookback or 0.0)
+        if multiplier > 0.0 and (not isfinite(lookback) or lookback <= 0.0):
+            raise ValueError(
+                "rebalance eviction holding multiplier requires a positive model lookback"
+            )
+        product = lookback * multiplier
+        if not isfinite(product) or product < 0.0:
+            raise ValueError("rebalance eviction minimum holding period is invalid")
+        return max(0, int(ceil(product)))
 
     def _rebalance_freeze_bars(self, pipeline):
         multiplier = float(self.rebalance_cfg.closed_pair_freeze_model_lookback_multiplier)
@@ -804,6 +899,51 @@ class MultiPairStrategy(BaseStrategy):
             ),
             portfolio_net_exposure=self._allocated_net_exposure(pair_targets),
             reason="no portfolio allocator",
+        )
+
+    @staticmethod
+    def _allocation_available_after(allocation, available_before) -> float:
+        available = max(0.0, float(available_before or 0.0))
+        if allocation is None:
+            return available
+        report = getattr(allocation, "constraint_report", {}) or {}
+        if "available_after_plan" in report:
+            return max(0.0, float(report["available_after_plan"] or 0.0))
+        allocated = sum(
+            float(target.final_x_notional or 0.0)
+            + float(target.final_y_notional or 0.0)
+            for target in allocation.pair_targets.values()
+            if target.selected
+        )
+        return max(0.0, available - allocated)
+
+    @staticmethod
+    def _merge_allocations(first, second, bar_index):
+        if first is None:
+            return second
+        if second is None:
+            return first
+        pair_targets = dict(first.pair_targets)
+        pair_targets.update(second.pair_targets)
+        selected = list(dict.fromkeys(
+            list(first.selected_pair_ids) + list(second.selected_pair_ids)
+        ))
+        return PortfolioAllocation(
+            bar_index=bar_index,
+            selected_pair_ids=selected,
+            pair_targets=pair_targets,
+            portfolio_gross_exposure=sum(
+                target.final_x_notional + target.final_y_notional
+                for target in pair_targets.values()
+            ),
+            portfolio_net_exposure=MultiPairStrategy._allocated_net_exposure(
+                pair_targets
+            ),
+            constraint_report={
+                "direct": getattr(first, "constraint_report", {}) or {},
+                "replacement": getattr(second, "constraint_report", {}) or {},
+            },
+            reason=f"{first.reason}; {second.reason}",
         )
 
     def _orders_from_entry_allocation(self, entry_candidates, allocation) -> list[Order]:
@@ -1042,6 +1182,7 @@ class MultiPairStrategy(BaseStrategy):
             return None
         decision = self.protection_manager.evaluate(ProtectionContext(
             pipeline=pipeline, bundle=bundle, state=state,
+            ledger=pipeline.state.position_ledger,
             sizing_state=sizing_state, config=self.protection_cfg,
             fee_rate=self.fee_rate, slippage_rate=self.slippage_rate,
         ))
@@ -1152,6 +1293,101 @@ class MultiPairStrategy(BaseStrategy):
         if trigger or reason:
             return "stop_loss"
         return "zscore_reversion"
+
+    def _initialize_or_update_position_ledger(self, pipeline, group, pair_side):
+        """Record every fill independently from protection configuration."""
+        ledger = pipeline.state.position_ledger
+        sizing_state = pipeline.state.sizing_state
+        if not ledger.active:
+            ledger.active = True
+            ledger.side = pair_side
+            ledger.position_id = sizing_state.position_id
+            ledger.entry_bar_index = pipeline.state.last_bar_index + 1
+            ledger.entry_ts = self._first_attr(group, "ts", None)
+            ledger.entry_x_price = None
+            ledger.entry_y_price = None
+            ledger.entry_x_quantity = 0.0
+            ledger.entry_y_quantity = 0.0
+            ledger.entry_gross_notional = 0.0
+            ledger.entry_fee = 0.0
+            ledger.entry_slippage = 0.0
+            ledger.funding_cost = 0.0
+
+        old_x_qty = ledger.entry_x_quantity
+        old_y_qty = ledger.entry_y_quantity
+        for trade in group:
+            symbol = getattr(trade, "symbol", "")
+            quantity = abs(float(getattr(trade, "quantity", 0.0) or 0.0))
+            price = float(getattr(trade, "price", 0.0) or 0.0)
+            if symbol == pipeline.pair_def.x_symbol:
+                total = old_x_qty + quantity
+                ledger.entry_x_price = (
+                    ((ledger.entry_x_price or 0.0) * old_x_qty + price * quantity) / total
+                    if total else None
+                )
+                ledger.entry_x_quantity = total
+                old_x_qty = total
+            elif symbol == pipeline.pair_def.y_symbol:
+                total = old_y_qty + quantity
+                ledger.entry_y_price = (
+                    ((ledger.entry_y_price or 0.0) * old_y_qty + price * quantity) / total
+                    if total else None
+                )
+                ledger.entry_y_quantity = total
+                old_y_qty = total
+            ledger.entry_fee += float(getattr(trade, "fee", 0.0) or 0.0)
+            ledger.entry_slippage += float(
+                getattr(trade, "slippage", 0.0) or 0.0
+            )
+        ledger.entry_gross_notional = (
+            ledger.entry_x_quantity * float(ledger.entry_x_price or 0.0)
+            + ledger.entry_y_quantity * float(ledger.entry_y_price or 0.0)
+        )
+
+    def _apply_position_ledger_close_delta(self, pipeline, trades):
+        ledger = pipeline.state.position_ledger
+        if not ledger.active:
+            return
+        old_gross = float(ledger.entry_gross_notional or 0.0)
+        for trade in trades:
+            symbol = getattr(trade, "symbol", "")
+            quantity = abs(float(getattr(trade, "quantity", 0.0) or 0.0))
+            if symbol == pipeline.pair_def.x_symbol:
+                ledger.entry_x_quantity = max(
+                    0.0, ledger.entry_x_quantity - quantity
+                )
+            elif symbol == pipeline.pair_def.y_symbol:
+                ledger.entry_y_quantity = max(
+                    0.0, ledger.entry_y_quantity - quantity
+                )
+        ledger.entry_gross_notional = (
+            ledger.entry_x_quantity * float(ledger.entry_x_price or 0.0)
+            + ledger.entry_y_quantity * float(ledger.entry_y_price or 0.0)
+        )
+        remaining_ratio = (
+            min(1.0, max(0.0, ledger.entry_gross_notional / old_gross))
+            if old_gross > 1e-12 else 0.0
+        )
+        ledger.entry_fee *= remaining_ratio
+        ledger.entry_slippage *= remaining_ratio
+        ledger.funding_cost *= remaining_ratio
+
+    @staticmethod
+    def _clear_position_ledger(pipeline):
+        ledger = pipeline.state.position_ledger
+        ledger.active = False
+        ledger.side = None
+        ledger.position_id = None
+        ledger.entry_bar_index = None
+        ledger.entry_ts = None
+        ledger.entry_x_price = None
+        ledger.entry_y_price = None
+        ledger.entry_x_quantity = 0.0
+        ledger.entry_y_quantity = 0.0
+        ledger.entry_gross_notional = 0.0
+        ledger.entry_fee = 0.0
+        ledger.entry_slippage = 0.0
+        ledger.funding_cost = 0.0
 
     def _initialize_or_update_protection(self, pipeline, group, pair_side):
         if not self.protection_supported:
@@ -1365,6 +1601,9 @@ class MultiPairStrategy(BaseStrategy):
                 sizing_state.entry_count += 1
                 sizing_state.last_entry_bar_index = pipeline.state.last_bar_index
                 sizing_state.pair_full = sizing_state.entry_count >= self.max_entries_per_pair
+                self._initialize_or_update_position_ledger(
+                    pipeline, group, pair_side
+                )
                 self._initialize_or_update_protection(pipeline, group, pair_side)
 
             elif action == "close":
@@ -1374,6 +1613,7 @@ class MultiPairStrategy(BaseStrategy):
                 exit_class = self._resolve_exit_class(exit_class, exit_reason, protection_trigger)
                 for trade in group:
                     self._apply_pair_quantity_delta(pipeline, sizing_state, trade, sign=-1.0)
+                self._apply_position_ledger_close_delta(pipeline, group)
                 self._apply_protection_close_delta(pipeline, group)
                 if sizing_state.x_quantity >= 1e-12 or sizing_state.y_quantity >= 1e-12:
                     fill_prices = {
@@ -1407,6 +1647,7 @@ class MultiPairStrategy(BaseStrategy):
                     sizing_state.add_cooldown_remaining_bars = 0
                     sizing_state.min_hold_remaining_bars = 0
                     self._pending_rebalance_pair_ids.discard(pair_id)
+                    self._clear_position_ledger(pipeline)
                     protection_state = pipeline.state.protection_state
                     was_protective = exit_class == "stop_loss"
                     protection_state.active = False
@@ -1562,32 +1803,50 @@ class MultiPairStrategy(BaseStrategy):
             pair_id = getattr(payment, "pair_id", None)
             position_id = getattr(payment, "position_id", None)
             if pair_id in self.pipelines:
-                pstate = self.pipelines[pair_id].state.protection_state
+                runtime = self.pipelines[pair_id].state
+                ledger = runtime.position_ledger
+                pstate = runtime.protection_state
+                applied = False
+                if ledger.active and (
+                    position_id is None or ledger.position_id == position_id
+                ):
+                    ledger.funding_cost += amount
+                    applied = True
                 if pstate.active and (
                     position_id is None or pstate.position_id == position_id
                 ):
                     pstate.funding_cost += amount
+                    applied = True
+                if applied:
                     continue
             active = []
             total = 0.0
             for pipeline in self.pipelines.values():
+                ledger = pipeline.state.position_ledger
                 pstate = pipeline.state.protection_state
-                if not pstate.active:
+                accounting = ledger if ledger.active else pstate
+                if not accounting.active:
                     continue
                 if symbol == pipeline.pair_def.x_symbol:
-                    qty = pstate.entry_x_quantity
+                    qty = accounting.entry_x_quantity
                 elif symbol == pipeline.pair_def.y_symbol:
-                    qty = pstate.entry_y_quantity
+                    qty = accounting.entry_y_quantity
                 else:
                     continue
                 qty = abs(float(qty))
                 if qty > 0:
-                    active.append((pstate, qty))
+                    active.append((pipeline, qty))
                     total += qty
             if total <= 0:
                 continue
-            for pstate, qty in active:
-                pstate.funding_cost += amount * qty / total
+            for pipeline, qty in active:
+                share = amount * qty / total
+                ledger = pipeline.state.position_ledger
+                pstate = pipeline.state.protection_state
+                if ledger.active:
+                    ledger.funding_cost += share
+                if pstate.active:
+                    pstate.funding_cost += share
 
     def _build_bundle(self, pair_id, pair_def, bars, ts, bar_index):
         x_bar = self._find_bar(bars, pair_def.x_exchange, pair_def.x_symbol)

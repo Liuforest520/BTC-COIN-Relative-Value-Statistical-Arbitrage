@@ -16,6 +16,27 @@ class ExchangeManager:
         self.pending_timeout_bars = max(0, int(pending_timeout_bars))
         self._bar_index = 0
         self._group_first_seen: dict[str, int] = {}
+        self._rebalance_batch_status: dict[str, dict[str, int | bool]] = {}
+
+    def rebalance_metrics(self) -> dict:
+        planned = len(self._rebalance_batch_status)
+        close_filled = sum(1 for item in self._rebalance_batch_status.values() if item.get("close_filled"))
+        open_filled = sum(1 for item in self._rebalance_batch_status.values() if item.get("open_filled"))
+        failed = sum(1 for item in self._rebalance_batch_status.values() if item.get("failed"))
+        completed = sum(1 for item in self._rebalance_batch_status.values() if item.get("open_filled"))
+        partial_failed = sum(
+            1 for item in self._rebalance_batch_status.values()
+            if item.get("close_filled") and item.get("failed") and not item.get("open_filled")
+        )
+        return {
+            "rebalance_batches_planned": planned,
+            "rebalance_close_groups_filled": close_filled,
+            "rebalance_open_groups_filled": open_filled,
+            "rebalance_batches_failed": failed,
+            "rebalance_batches_completed": completed,
+            "rebalance_batches_incomplete": max(0, planned - completed - failed),
+            "rebalance_partial_failed_batches": partial_failed,
+        }
 
     def cancel_all_orders(self):
         for exchange in self.exchanges.values():
@@ -29,6 +50,11 @@ class ExchangeManager:
 
         accepted = []
         for order in orders:
+            batch_id = getattr(order, "rebalance_batch_id", None)
+            if batch_id:
+                self._rebalance_batch_status.setdefault(
+                    str(batch_id), {"close_filled": False, "open_filled": False, "failed": False}
+                )
             exchange = self.exchanges.get(order.exchange)
             if exchange is None:
                 order.status = OrderStatus.REJECTED
@@ -86,32 +112,136 @@ class ExchangeManager:
         # one of its legs has no executable bar yet, keep all newly queued
         # opens pending rather than opening without the planned released
         # margin.  Normal close/open groups are unaffected.
-        waiting_rebalance_batches = {
-            next((getattr(o, "rebalance_batch_id", None) for o in group if getattr(o, "rebalance_batch_id", None)), None)
-            for group in pending_groups.values()
-            if {getattr(o.action, "value", o.action) for o in group} == {"close"}
-            and any(getattr(o, "protection_trigger", None) == "rebalance_replacement" for o in group)
-            and any(o.symbol not in formatted_bars.get(o.exchange, {}) for o in group)
-        }
-        waiting_rebalance_batches.discard(None)
+        # A rebalance batch can contain several complete close groups and one
+        # replacement open group.  Preflight every close group before allowing
+        # any group in that batch to execute.  This prevents one old Pair from
+        # being closed while another close group in the same replacement batch
+        # is already known to be invalid.
+        rebalance_batch_group_ids = {}
+        rebalance_batch_groups = {}
+        rebalance_batch_close_groups = {}
+        for group_id, group_orders in pending_groups.items():
+            batch_ids = {
+                str(getattr(order, "rebalance_batch_id", None))
+                for order in group_orders
+                if getattr(order, "rebalance_batch_id", None)
+            }
+            if not batch_ids:
+                continue
+            is_rebalance_close = (
+                {getattr(order.action, "value", order.action) for order in group_orders} == {"close"}
+                and any(
+                    getattr(order, "protection_trigger", None) == "rebalance_replacement"
+                    for order in group_orders
+                )
+            )
+            for batch_id in batch_ids:
+                rebalance_batch_group_ids.setdefault(batch_id, set()).add(group_id)
+                rebalance_batch_groups.setdefault(batch_id, []).append((group_id, group_orders))
+                if is_rebalance_close:
+                    rebalance_batch_close_groups.setdefault(batch_id, []).append(
+                        (group_id, group_orders)
+                    )
+
+        waiting_rebalance_batches = set()
+        invalid_rebalance_batches = set()
+        for batch_id, close_groups in rebalance_batch_close_groups.items():
+            batch_waiting = False
+            batch_invalid = False
+            for _group_id, group_orders in close_groups:
+                local_groups = {}
+                for order in group_orders:
+                    bars = formatted_bars.get(order.exchange, {})
+                    if order.symbol not in bars:
+                        batch_waiting = True
+                        break
+                    local_groups.setdefault(order.exchange, []).append(order)
+                if batch_waiting:
+                    break
+                for exchange_name, local_orders in local_groups.items():
+                    status, _prepared = self.exchanges[exchange_name]._prepare_group_execution(
+                        local_orders, formatted_bars[exchange_name]
+                    )
+                    if status != "ready":
+                        batch_invalid = True
+                        break
+                if batch_invalid:
+                    break
+            if batch_waiting:
+                waiting_rebalance_batches.add(batch_id)
+            elif batch_invalid:
+                invalid_rebalance_batches.add(batch_id)
+            else:
+                # Dry-run the complete close-then-open batch at current prices.
+                local_orders_by_exchange = {}
+                for _group_id, group_orders in sorted(
+                    rebalance_batch_groups.get(batch_id, []),
+                    key=lambda item: 0 if {getattr(o.action, "value", o.action) for o in item[1]} == {"close"} else 1,
+                ):
+                    for order in group_orders:
+                        local_orders_by_exchange.setdefault(order.exchange, []).append(order)
+                for exchange_name, local_orders in local_orders_by_exchange.items():
+                    projected = self.exchanges[exchange_name].projected_account_after_orders(
+                        local_orders, formatted_bars[exchange_name], scale=1.0
+                    )
+                    if projected is None or float(projected.get("available_balance", 0.0)) < -1e-8:
+                        invalid_rebalance_batches.add(batch_id)
+                        break
+
+        # A rebalance close is a prerequisite for its replacement opens.  If
+        # one of its legs has no executable bar yet, keep every group in that
+        # batch pending rather than opening without the planned released
+        # margin.  Normal close/open groups are unaffected.
         failed_rebalance_batches = set()
+        rejected_rebalance_batches = set()
+
+        def reject_rebalance_batch(batch_id):
+            batch_id = str(batch_id)
+            if batch_id in rejected_rebalance_batches:
+                return
+            rejected_rebalance_batches.add(batch_id)
+            group_ids = rebalance_batch_group_ids.get(batch_id, set())
+            rejected = self._reject_group_orders(group_ids)
+            rejected_orders.extend(rejected)
+            for order in rejected:
+                per_exchange[order.exchange]["rejected_orders"].append(order)
+                self._group_first_seen.pop(order.group_id or order.order_id, None)
+            self._rebalance_batch_status.setdefault(batch_id, {})["failed"] = True
+            failed_rebalance_batches.add(batch_id)
         for group_id, group_orders in pending_groups.items():
             self._group_first_seen.setdefault(group_id, self._bar_index)
+            actions = {getattr(o.action, "value", o.action) for o in group_orders}
+            batch_ids = {
+                str(getattr(o, "rebalance_batch_id", None))
+                for o in group_orders
+                if getattr(o, "rebalance_batch_id", None)
+            }
+            if batch_ids.intersection(invalid_rebalance_batches):
+                for batch_id in batch_ids.intersection(invalid_rebalance_batches):
+                    reject_rebalance_batch(batch_id)
+                continue
             if self.pending_timeout_bars and self._bar_index - self._group_first_seen[group_id] >= self.pending_timeout_bars:
+                if batch_ids:
+                    for batch_id in batch_ids:
+                        reject_rebalance_batch(batch_id)
+                    continue
                 rejected = self._reject_group_orders({group_id})
                 rejected_orders.extend(rejected)
                 for order in rejected:
                     per_exchange[order.exchange]["rejected_orders"].append(order)
                 self._group_first_seen.pop(group_id, None)
                 if any(getattr(o, "protection_trigger", None) == "rebalance_replacement" for o in group_orders):
-                    failed_rebalance_batches.update(
+                    batch_ids_for_group = {
                         batch_id
                         for batch_id in (getattr(o, "rebalance_batch_id", None) for o in group_orders)
                         if batch_id is not None
-                    )
+                    }
+                    failed_rebalance_batches.update(batch_ids_for_group)
+                    for batch_id in batch_ids_for_group:
+                        self._rebalance_batch_status.setdefault(str(batch_id), {})["failed"] = True
                 continue
             actions = {getattr(o.action, "value", o.action) for o in group_orders}
-            batch_ids = {getattr(o, "rebalance_batch_id", None) for o in group_orders}
+            batch_ids = {str(getattr(o, "rebalance_batch_id", None)) for o in group_orders if getattr(o, "rebalance_batch_id", None)}
             if actions == {"open"} and batch_ids.intersection(failed_rebalance_batches):
                 rejected = self._reject_group_orders({group_id})
                 rejected_orders.extend(rejected)
@@ -119,7 +249,7 @@ class ExchangeManager:
                     per_exchange[order.exchange]["rejected_orders"].append(order)
                 self._group_first_seen.pop(group_id, None)
                 continue
-            if actions == {"open"} and batch_ids.intersection(waiting_rebalance_batches):
+            if batch_ids.intersection(waiting_rebalance_batches):
                 continue
             local_groups = {}
             waiting = False
@@ -147,11 +277,14 @@ class ExchangeManager:
                 for order in rejected:
                     per_exchange[order.exchange]["rejected_orders"].append(order)
                 if any(getattr(o, "protection_trigger", None) == "rebalance_replacement" for o in group_orders):
-                    failed_rebalance_batches.update(
+                    batch_ids_for_group = {
                         batch_id
                         for batch_id in (getattr(o, "rebalance_batch_id", None) for o in group_orders)
                         if batch_id is not None
-                    )
+                    }
+                    failed_rebalance_batches.update(batch_ids_for_group)
+                    for batch_id in batch_ids_for_group:
+                        self._rebalance_batch_status.setdefault(str(batch_id), {})["failed"] = True
                 continue
 
             actions = {
@@ -174,6 +307,13 @@ class ExchangeManager:
                     rejected_orders.extend(rejected)
                     for order in rejected:
                         per_exchange[order.exchange]["rejected_orders"].append(order)
+                    batch_ids_for_group = {
+                        str(getattr(o, "rebalance_batch_id", None))
+                        for o in group_orders
+                        if getattr(o, "rebalance_batch_id", None)
+                    }
+                    for batch_id in batch_ids_for_group:
+                        self._rebalance_batch_status.setdefault(batch_id, {})["failed"] = True
                     continue
                 if common_scale < 1.0 - 1e-12:
                     for order in group_orders:
@@ -201,6 +341,20 @@ class ExchangeManager:
 
             self._remove_group_orders(group_id)
             self._group_first_seen.pop(group_id, None)
+            rebalance_ids = {
+                str(getattr(o, "rebalance_batch_id", None))
+                for o in group_orders
+                if getattr(o, "rebalance_batch_id", None)
+            }
+            if rebalance_ids:
+                is_close = actions == {"close"}
+                is_open = actions == {"open"}
+                for batch_id in rebalance_ids:
+                    item = self._rebalance_batch_status.setdefault(batch_id, {})
+                    if is_close:
+                        item["close_filled"] = True
+                    if is_open:
+                        item["open_filled"] = True
             for exchange_name, result in group_results.items():
                 per_exchange[exchange_name]["filled_orders"].extend(result["filled_orders"])
                 per_exchange[exchange_name]["new_trades"].extend(result["new_trades"])
@@ -236,6 +390,7 @@ class ExchangeManager:
             "new_trades": new_trades,
             "rejected_orders": rejected_orders,
             "funding_payments": funding_payments,
+            "rebalance_metrics": self.rebalance_metrics(),
             # Detailed backtests expose the cumulative trade snapshot for
             # compatibility. Sweeps disable it because rebuilding the full
             # history on every bar makes a run quadratic in its trade count.
@@ -252,6 +407,7 @@ class ExchangeManager:
             "open_pair_count": portfolio_state["open_pair_count"],
             "open_pair_ids": portfolio_state["open_pair_ids"],
             "pending_open_pair_count": portfolio_state["pending_open_pair_count"],
+            "pair_marked_equity": portfolio_state["pair_marked_equity"],
             # These fields are retained for report compatibility and now
             # describe actual Pair-equity-zero liquidations.
             "margin_deficit": 0.0,
@@ -303,6 +459,16 @@ class ExchangeManager:
             if order.pair_id
             and getattr(order.action, "value", order.action) == "open"
         })
+        pair_marked_equity = {}
+        for exchange_name, exchange in self.exchanges.items():
+            marked = results.get(exchange_name, {}).get("position_marked_equity", {})
+            for position_id, value in marked.items():
+                pair_id = exchange.position_pair_ids.get(position_id)
+                if pair_id:
+                    pair_marked_equity[pair_id] = (
+                        pair_marked_equity.get(pair_id, 0.0) + float(value)
+                    )
+
         return {
             "cash": wallet_balance,
             "wallet_balance": wallet_balance,
@@ -318,6 +484,7 @@ class ExchangeManager:
             "open_pair_count": len(open_pair_ids),
             "open_pair_ids": open_pair_ids,
             "pending_open_pair_count": len(set(pending_open_pair_ids).difference(open_pair_ids)),
+            "pair_marked_equity": pair_marked_equity,
         }
 
     def _pair_gross_exposure(self, pair_id, formatted_bars):

@@ -125,7 +125,18 @@ setups:
       sizing: {}
       portfolio: {}
       execution: {}
-      rebalance: {}
+      rebalance:
+        enabled: true
+        minimum_entry_capital_ratio: 0.5
+        eviction_min_holding_model_lookback_multiplier: 0.5
+        closed_pair_freeze_model_lookback_multiplier: 0.5
+        candidate_quality:
+          enabled: true
+          min_theoretical_zero_return_x_move: 0.20
+          max_adf_pvalue: 0.4
+          min_expected_net_return: 0.0
+        profitable_position_replacement:
+          enabled: false
 
 cost:
   fee_rate: 0.0005
@@ -153,11 +164,14 @@ risk:
 | Slippage | `1 bps` |
 | Funding | `funding_enabled: true` |
 | Protection | 理论 X 止损、Pair 净亏损止损、止盈和最长持仓均可独立配置 |
+| Rebalance | 先正常分配可用资金；只对资金不足的候选严格筛选并选择一个最佳目标，仅完整换出达到最短持有期的亏损 Pair |
 | Risk | `pass_through` 只跳过可选的下单前风控；Exchange 始终执行 `max_leverage: 1.0`、保证金和可用余额检查 |
 
 `estimator.model_timeframe` 是新增可选字段。`model_lookback_bars` 和 `model_update_interval_bars` 仍按原始 1 分钟数据点填写；例如 `2880` 在 `15m` 模型下会转换为 `192` 根 15 分钟 K 线。模型只在完整聚合 K 线形成后决策，账户、资金费率和订单成交仍按 1 分钟运行。旧配置未填写该字段时保持原来的 1 分钟逻辑。
 
 启动时会按当前模型周期显示这类换算；不能整除时向上取整，并提示实际覆盖的源分钟数。例如 `2881m` 在 `15m` 下会使用 `193` 根模型 K 线，实际覆盖 `2895m`。`pending_timeout_bars` 是订单生命周期参数，始终按原始 1 分钟 bar 计数，不随 `model_timeframe` 换算。
+
+换仓与保护规则相互独立：关闭 `protection.enabled` 不会关闭换仓所需的持仓成本、资金费和浮盈亏核算。资金充足时，普通分配器可以同时开入多个信号，不经过换仓质量门槛；只有未达到最低开仓资金的候选才进入换仓池，且每个模型决策 bar 最多选择一个最佳候选。进入换仓池的新候选必须满足 `candidate_quality` 的 ADF、理论零收益点安全距离和费后理论收益门槛；旧 Pair 不计算潜在未来收益，也不与新候选做收益差比较。当前版本只允许完整换出费后浮亏仓，不换出盈利仓；`eviction_min_holding_model_lookback_multiplier` 只限制换仓退出，不限制普通 Z-score 平仓或任何保护退出。被换出的 Pair 使用 `closed_pair_freeze_model_lookback_multiplier` 冻结。
 
 修改配置时，`pairs` 中使用的标的必须已经存在于 `data.symbols`。回测只加载当前启用 Pair 所需的数据，不会无条件读取配置中的全部标的。
 

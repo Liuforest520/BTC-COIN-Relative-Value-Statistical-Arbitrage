@@ -135,6 +135,7 @@ class SweepBacktest(Backtest):
                 cash=portfolio_snapshot.get("cash", 0),
                 equity=portfolio_snapshot.get("equity", 0),
                 available_balance=portfolio_snapshot.get("available_balance", 0),
+                pair_marked_equity=portfolio_snapshot.get("pair_marked_equity", {}),
             )
             for model_bars in model_resampler.update(bars):
                 orders = self.strategy(model_bars)
@@ -164,6 +165,7 @@ class SweepBacktest(Backtest):
             hedge_ratio_tolerance=float(self.config.risk.get("order_hedge_ratio_tolerance", 0.02)),
         )
         metrics.update(self._model_resampler_audit_metrics(model_resampler))
+        metrics.update(self.exchange_manager.rebalance_metrics())
 
         return BacktestResult(
             metrics=metrics,

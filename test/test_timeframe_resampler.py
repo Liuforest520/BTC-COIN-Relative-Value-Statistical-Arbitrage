@@ -158,7 +158,9 @@ def test_pipeline_converts_legacy_source_minute_windows_once():
                 "pair_loss_stop_enabled": True,
                 "pair_loss_stop_freeze_bars": 1440,
             },
-            "rebalance": {"eviction_min_holding_bars": 60},
+            "rebalance": {
+                "eviction_min_holding_model_lookback_multiplier": 0.5
+            },
         },
     )
     strategy = build_strategy(setup, {"X": {"exchange": "binance"}, "Y": {"exchange": "binance"}})
@@ -172,7 +174,53 @@ def test_pipeline_converts_legacy_source_minute_windows_once():
     assert strategy.add_cooldown_bars == 2
     assert strategy.min_hold_bars == 3
     assert strategy.protection_cfg.pair_loss_stop_freeze_bars == 96
-    assert strategy.rebalance_cfg.eviction_min_holding_bars == 4
+    assert strategy.rebalance_cfg.eviction_min_holding_model_lookback_multiplier == 0.5
+    assert strategy._rebalance_min_holding_bars(pipeline) == 96
+
+
+@pytest.mark.parametrize("location", ["setup", "pipeline"])
+def test_factory_rejects_legacy_rebalance_holding_key_at_either_config_layer(location):
+    from types import SimpleNamespace
+    from core.modules.strategy.factory import build_strategy
+
+    setup = SimpleNamespace(
+        pairs=[{"pair_id": "p", "x_symbol": "X", "y_symbol": "Y"}],
+        pipeline={
+            "estimator": {"method": "tls", "regression_method": "price", "model_lookback_bars": 10},
+            "signal": {"method": "zscore"},
+            "sizing": {"method": "beta_neutral"},
+            "portfolio": {"method": "equal_weight"},
+            "execution": {},
+        },
+    )
+    if location == "setup":
+        setup.rebalance = {"eviction_min_holding_bars": 60}
+    else:
+        setup.pipeline["rebalance"] = {"eviction_min_holding_bars": 60}
+
+    with pytest.raises(ValueError, match="eviction_min_holding_bars is no longer supported"):
+        build_strategy(setup, {"X": {}, "Y": {}})
+
+
+def test_factory_rejects_legacy_rebalance_key_even_when_both_layers_exist():
+    from types import SimpleNamespace
+    from core.modules.strategy.factory import build_strategy
+
+    setup = SimpleNamespace(
+        pairs=[{"pair_id": "p", "x_symbol": "X", "y_symbol": "Y"}],
+        rebalance={"enabled": True},
+        pipeline={
+            "estimator": {"method": "tls", "regression_method": "price", "model_lookback_bars": 10},
+            "signal": {"method": "zscore"},
+            "sizing": {"method": "beta_neutral"},
+            "portfolio": {"method": "equal_weight"},
+            "execution": {},
+            "rebalance": {"eviction_min_holding_bars": 60},
+        },
+    )
+
+    with pytest.raises(ValueError, match="pipeline.rebalance.eviction_min_holding_bars"):
+        build_strategy(setup, {"X": {}, "Y": {}})
 
 
 def test_one_sided_stream_does_not_retain_unbounded_completed_bars():

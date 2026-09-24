@@ -144,6 +144,7 @@ class Backtest:
                 cash=portfolio_snapshot.get("cash", 0),
                 equity=portfolio_snapshot.get("equity", 0),
                 available_balance=portfolio_snapshot.get("available_balance", 0),
+                pair_marked_equity=portfolio_snapshot.get("pair_marked_equity", {}),
             )
             for model_bars in model_resampler.update(bars):
                 model_ts = self._bars_ts(model_bars)
@@ -185,6 +186,7 @@ class Backtest:
         )
         metrics.update(self._account_audit_metrics())
         metrics.update(self._model_resampler_audit_metrics(model_resampler))
+        metrics.update(self.exchange_manager.rebalance_metrics())
 
         return BacktestResult(
             metrics=metrics,

@@ -423,3 +423,71 @@ def test_position_occupancy_uses_occupied_plus_unused_capital():
     assert snapshot["gross_exposure_ratio"] <= 1.0
 
 
+
+
+def test_exchange_reports_pair_marked_equity_from_isolated_account():
+    exchange = Exchange("binance", initial_cash=100.0, fee_rate=0.0, slippage_bps=0.0)
+    manager = ExchangeManager({"binance": exchange})
+    manager.place_orders([
+        Order(
+            order_id="open-x", group_id="open-p", exchange="binance", symbol="X",
+            action=OrderAction.OPEN, side=OrderSide.BUY, order_type=OrderType.MARKET,
+            quantity=5.0, pair_id="pair-a", position_id="position-a",
+        ),
+        Order(
+            order_id="open-y", group_id="open-p", exchange="binance", symbol="Y",
+            action=OrderAction.OPEN, side=OrderSide.SELL, order_type=OrderType.MARKET,
+            quantity=5.0, pair_id="pair-a", position_id="position-a",
+        ),
+    ])
+    manager.on_bar({"binance": {"X": _bar(price=10.0), "Y": _bar(price=10.0)}})
+    marked = manager.on_bar({"binance": {"X": _bar(price=8.0), "Y": _bar(price=10.0)}})
+
+    assert marked["pair_marked_equity"]["pair-a"] == 90.0
+
+
+def test_rebalance_batch_rejects_all_groups_when_one_close_is_invalid():
+    exchange = Exchange("binance", initial_cash=100.0, fee_rate=0.0, slippage_bps=0.0)
+    manager = ExchangeManager({"binance": exchange})
+    manager.place_orders([
+        _order("a-x", "open-a", "A", OrderSide.BUY, 1.0),
+        _order("a-y", "open-a", "B", OrderSide.SELL, 1.0),
+        _order("b-x", "open-b", "C", OrderSide.BUY, 1.0),
+        _order("b-y", "open-b", "D", OrderSide.SELL, 1.0),
+    ])
+    manager.on_bar({
+        "binance": {
+            "A": _bar(price=10.0), "B": _bar(price=10.0),
+            "C": _bar(price=10.0), "D": _bar(price=10.0),
+        }
+    })
+
+    batch = "replace-1"
+    close_a = [
+        _order("close-a-x", "close-a", "A", OrderSide.SELL, 1.0, OrderAction.CLOSE),
+        _order("close-a-y", "close-a", "B", OrderSide.BUY, 1.0, OrderAction.CLOSE),
+    ]
+    close_b = [
+        _order("close-b-x", "close-b", "C", OrderSide.SELL, 2.0, OrderAction.CLOSE),
+        _order("close-b-y", "close-b", "D", OrderSide.BUY, 2.0, OrderAction.CLOSE),
+    ]
+    open_new = [
+        _order("open-new-x", "open-new", "E", OrderSide.BUY, 1.0),
+        _order("open-new-y", "open-new", "F", OrderSide.SELL, 1.0),
+    ]
+    for order in close_a + close_b + open_new:
+        order.rebalance_batch_id = batch
+        order.protection_trigger = "rebalance_replacement"
+    manager.place_orders(close_a + close_b + open_new)
+
+    result = manager.on_bar({
+        "binance": {
+            "A": _bar(price=10.0), "B": _bar(price=10.0),
+            "C": _bar(price=10.0), "D": _bar(price=10.0),
+            "E": _bar(price=10.0), "F": _bar(price=10.0),
+        }
+    })
+
+    assert exchange.positions == {"A": 1.0, "B": -1.0, "C": 1.0, "D": -1.0}
+    assert result["new_trades"] == []
+    assert result["rebalance_metrics"]["rebalance_batches_failed"] == 1

@@ -58,3 +58,37 @@ def test_pair_target_capital_rejects_below_minimum_ratio_without_equity_fallback
     state = PortfolioState(ready=True, equity=3_000_000, available_balance=250_000)
     allocation = allocator.allocate(state, {"btc_coin": raw}, 1)
     assert allocation.pair_targets == {}
+    assert allocation.constraint_report["underfunded_pair_ids"] == ["btc_coin"]
+
+
+def test_allocator_marks_only_cash_shortfalls_as_underfunded():
+    from core.modules.portfolio.allocator import PairTargetCapitalAllocator
+
+    allocator = PairTargetCapitalAllocator(
+        equity=1_000.0,
+        minimum_entry_capital_ratio=0.5,
+        min_signal_score=2.0,
+    )
+    funded = RawPairTarget(
+        pair_id="funded", ready=True, signal_strength=3.0,
+        x_weight=0.5, y_weight=0.5, x_price=10.0, y_price=10.0,
+        gross_notional=100.0, target_capital=100.0,
+    )
+    underfunded = RawPairTarget(
+        pair_id="underfunded", ready=True, signal_strength=3.0,
+        x_weight=0.5, y_weight=0.5, x_price=10.0, y_price=10.0,
+        gross_notional=100.0, target_capital=100.0,
+    )
+    weak_signal = RawPairTarget(
+        pair_id="weak", ready=True, signal_strength=1.0,
+        x_weight=0.5, y_weight=0.5, x_price=10.0, y_price=10.0,
+        gross_notional=100.0, target_capital=100.0,
+    )
+    state = PortfolioState(ready=True, equity=1_000.0, available_balance=100.0)
+    allocation = allocator.allocate(
+        state,
+        {"funded": funded, "underfunded": underfunded, "weak": weak_signal},
+        1,
+    )
+    assert allocation.selected_pair_ids == ["funded"]
+    assert allocation.constraint_report["underfunded_pair_ids"] == ["underfunded"]

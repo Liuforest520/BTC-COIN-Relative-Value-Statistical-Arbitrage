@@ -254,6 +254,36 @@ class PositionProtectionState:
     last_exit_class: str | None = None
 
 
+@dataclass
+class PairPositionLedger:
+    """Protection-independent accounting basis for one live Pair position.
+
+    This ledger is populated for every filled Pair, even when all protective
+    exits are disabled. Protection and rebalance consumers therefore observe
+    the same entry prices, quantities, costs, funding and Pair-local age
+    without one feature switch implicitly enabling another feature.
+    """
+
+    active: bool = False
+    side: str | None = None
+    position_id: str | None = None
+    entry_bar_index: int | None = None
+    entry_ts: int | None = None
+    entry_x_price: float | None = None
+    entry_y_price: float | None = None
+    entry_x_quantity: float = 0.0
+    entry_y_quantity: float = 0.0
+    entry_gross_notional: float = 0.0
+    entry_fee: float = 0.0
+    entry_slippage: float = 0.0
+    funding_cost: float = 0.0
+    alpha: float | None = None
+    beta: float | None = None
+    spread_mean: float | None = None
+    spread_std: float | None = None
+    exit_z: float | None = None
+
+
 # ---- Portfolio ----
 
 @dataclass
@@ -293,6 +323,7 @@ class PairRuntimeState:
     estimator_state: EstimatorState = field(default_factory=EstimatorState)
     signal_state: SignalState = field(default_factory=SignalState)
     sizing_state: SizingState = field(default_factory=SizingState)
+    position_ledger: PairPositionLedger = field(default_factory=PairPositionLedger)
     protection_state: PositionProtectionState = field(default_factory=PositionProtectionState)
     portfolio_state: PortfolioState = field(default_factory=PortfolioState)
 

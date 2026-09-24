@@ -52,6 +52,7 @@ class Exchange:
         self.available_balance = self.initial_cash
         self.gross_exposure = 0.0
         self.net_exposure = 0.0
+        self.position_marked_equity: dict[str, float] = {}
         self.copy_positions_on_bar = True
 
     def place_order(self, orders):
@@ -837,6 +838,13 @@ class Exchange:
             "net_exposure": net,
             "used_margin": used_margin,
             "available_balance": reported_available,
+            "position_marked_equity": {
+                position_id: float(capital_map.get(position_id, sum(
+                    max(0.0, float(value))
+                    for value in margin_lots.get(position_id, {}).values()
+                ))) + float(unrealized_by_position.get(position_id, 0.0))
+                for position_id in (set(lots) | set(margin_lots) | set(capital_map))
+            },
         }
 
     def _update_account(self, bars, price_field="close"):
@@ -849,6 +857,7 @@ class Exchange:
         self.net_exposure = metrics["net_exposure"]
         self.used_margin = metrics["used_margin"]
         self.available_balance = metrics["available_balance"]
+        self.position_marked_equity = metrics["position_marked_equity"]
 
     def _mark_price(self, symbol, bars, price_field):
         bar = bars.get(symbol) if isinstance(bars, dict) else None
@@ -1001,6 +1010,7 @@ class Exchange:
             "net_exposure": self.net_exposure,
             "positions": dict(self.positions) if self.copy_positions_on_bar else self.positions,
             "equity": self.equity,
+            "position_marked_equity": dict(self.position_marked_equity),
         }
 
     @staticmethod

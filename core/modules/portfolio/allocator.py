@@ -50,7 +50,7 @@ class PairTargetCapitalAllocator:
                 and float(getattr(state, "equity", 0.0) or 0.0) <= 0):
             available_before = self.equity
         available = max(0.0, available_before)
-        pair_targets, selected, skipped = {}, [], []
+        pair_targets, selected, skipped, underfunded = {}, [], [], []
         for pair_id, raw in ready:
             target = _raw_target_capital(raw)
             if target <= 0:
@@ -58,10 +58,13 @@ class PairTargetCapitalAllocator:
             minimum = target * self.minimum_entry_capital_ratio
             if target <= 0 or available < minimum - 1e-9:
                 skipped.append(pair_id)
+                if target > 0:
+                    underfunded.append(pair_id)
                 continue
             gross = min(target, available)
             if gross < minimum - 1e-9:
                 skipped.append(pair_id)
+                underfunded.append(pair_id)
                 continue
             pair_targets[pair_id] = _allocated_from_gross(
                 pair_id, raw, gross, self.equity,
@@ -69,8 +72,6 @@ class PairTargetCapitalAllocator:
             )
             selected.append(pair_id)
             available -= gross
-            if available <= 1e-9:
-                break
         return PortfolioAllocation(
             bar_index=bar_index, selected_pair_ids=selected,
             pair_targets=pair_targets,
@@ -79,7 +80,8 @@ class PairTargetCapitalAllocator:
             reason=f"pair_target_capital selected={len(selected)}/{len(ready)} skipped={len(skipped)}",
             constraint_report={"available_before": available_before,
                                "available_after_plan": available,
-                               "skipped_pair_ids": skipped},
+                               "skipped_pair_ids": skipped,
+                               "underfunded_pair_ids": underfunded},
         )
 
 

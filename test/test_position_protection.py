@@ -616,7 +616,11 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
         ],
         estimator_ctor=TLSEstimator,
         estimator_cfg=EstimatorConfig(regression_method="price", position_update_policy="freeze"),
-        rebalance_cfg=RebalanceConfig(enabled=True, minimum_entry_capital_ratio=0.5),
+        rebalance_cfg=RebalanceConfig(
+            enabled=True,
+            minimum_entry_capital_ratio=0.5,
+            eviction_min_holding_model_lookback_multiplier=0.0,
+        ),
     )
     for pair_id in ("old_a", "old_b"):
         pp = strategy.pipelines[pair_id]
@@ -632,6 +636,14 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
         pp.state.protection_state.entry_x_quantity = 5.0
         pp.state.protection_state.entry_y_quantity = 5.0
         pp.state.protection_state.entry_gross_notional = 100.0
+        ledger = pp.state.position_ledger
+        ledger.active = True
+        ledger.side = "long_x"
+        ledger.entry_x_price = 10.0
+        ledger.entry_y_price = 10.0
+        ledger.entry_x_quantity = 5.0
+        ledger.entry_y_quantity = 5.0
+        ledger.entry_gross_notional = 100.0
     bundles = {
         pair_id: PairBarBundle(
             pair_id, 1, 1,
@@ -642,13 +654,22 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
     raw = RawPairTarget(
         pair_id="new", ready=True, side="long_x", x_weight=0.5, y_weight=0.5,
         x_price=10.0, y_price=10.0, gross_notional=600.0, target_capital=600.0,
+        para={"rebalance_quality": {
+            "adf_pvalue": 0.1,
+            "theoretical_zero_return_x_move": 0.25,
+            "expected_net_return": 0.05,
+            "signal_strength": 3.0,
+        }},
     )
     candidate = {"pair_id": "new", "pair_def": strategy.pipelines["new"].pair_def, "raw_target": raw, "result": SimpleNamespace(estimator=SimpleNamespace(cointegration_pvalue=0.1))}
     strategy.portfolio_state.available_balance = 250.0
-    orders = strategy._plan_rebalance({"new": candidate}, bundles, 1)
+    assert strategy._pair_releasable_equity(
+        strategy.pipelines["old_a"], bundles["old_a"]
+    ) == pytest.approx(89.946)
+    orders, allocation = strategy._plan_rebalance({"new": candidate}, bundles, 1)
     assert len(orders) == 2
+    assert allocation.selected_pair_ids == ["new"]
     assert strategy._pending_rebalance_pair_ids == {"old_a"}
-    assert strategy._pending_rebalance_release == pytest.approx(89.946)
 
 
 def test_rebalance_min_holding_uses_pair_local_bar_index():
@@ -661,11 +682,15 @@ def test_rebalance_min_holding_uses_pair_local_bar_index():
             PairDefinition(pair_id="new", x_symbol="C", y_symbol="D"),
         ],
         estimator_ctor=TLSEstimator,
-        estimator_cfg=EstimatorConfig(regression_method="price", position_update_policy="freeze"),
+        estimator_cfg=EstimatorConfig(
+            regression_method="price",
+            position_update_policy="freeze",
+            model_lookback_bars=10,
+        ),
         rebalance_cfg=RebalanceConfig(
             enabled=True,
             minimum_entry_capital_ratio=0.5,
-            eviction_min_holding_bars=5,
+            eviction_min_holding_model_lookback_multiplier=0.5,
         ),
     )
     old = strategy.pipelines["old"]
@@ -681,6 +706,14 @@ def test_rebalance_min_holding_uses_pair_local_bar_index():
     old.state.protection_state.entry_x_quantity = 5.0
     old.state.protection_state.entry_y_quantity = 5.0
     old.state.protection_state.entry_gross_notional = 100.0
+    old.state.position_ledger.active = True
+    old.state.position_ledger.side = "long_x"
+    old.state.position_ledger.entry_bar_index = 5
+    old.state.position_ledger.entry_x_price = 10.0
+    old.state.position_ledger.entry_y_price = 10.0
+    old.state.position_ledger.entry_x_quantity = 5.0
+    old.state.position_ledger.entry_y_quantity = 5.0
+    old.state.position_ledger.entry_gross_notional = 100.0
     old.state.last_bar_index = 5
 
     bundles = {
@@ -693,6 +726,12 @@ def test_rebalance_min_holding_uses_pair_local_bar_index():
     raw = RawPairTarget(
         pair_id="new", ready=True, side="long_x", x_weight=0.5, y_weight=0.5,
         x_price=10.0, y_price=10.0, gross_notional=100.0, target_capital=100.0,
+        para={"rebalance_quality": {
+            "adf_pvalue": 0.1,
+            "theoretical_zero_return_x_move": 0.25,
+            "expected_net_return": 0.05,
+            "signal_strength": 3.0,
+        }},
     )
     candidate = {
         "pair_id": "new",
@@ -704,9 +743,10 @@ def test_rebalance_min_holding_uses_pair_local_bar_index():
 
     # The global strategy bar is deliberately much later, but this Pair has
     # only held for zero local bars and must not be evicted.
-    assert strategy._plan_rebalance({"new": candidate}, bundles, 100) == []
+    assert strategy._plan_rebalance({"new": candidate}, bundles, 100) == ([], None)
 
     # Once the Pair-local bar reaches the threshold, eviction is allowed.
     bundles["old"] = replace(bundles["old"], bar_index=10)
-    orders = strategy._plan_rebalance({"new": candidate}, bundles, 100)
+    orders, allocation = strategy._plan_rebalance({"new": candidate}, bundles, 100)
     assert orders
+    assert allocation.selected_pair_ids == ["new"]

@@ -16,22 +16,30 @@ class TheoreticalXStopRule(ProtectionRule):
 class PairLossStopRule(ProtectionRule):
     name, priority = "pair_loss_stop", 20
     def evaluate(self, c):
-        s, z, cfg = c.state, c.sizing_state, c.config
+        s, z, ledger, cfg = c.state, c.sizing_state, c.ledger, c.config
         b = c.bundle
-        if not (cfg.enabled and cfg.pair_loss_stop_enabled and b and b.x_bar and b.y_bar and s.entry_x_price and s.entry_y_price and s.pair_loss_stop_return is not None): return None
-        pnl = mark_net_pnl(s.side, float(b.x_bar.close), float(b.y_bar.close), s.entry_x_price, s.entry_y_price, z.x_quantity, z.y_quantity, s.entry_fee, s.funding_cost, c.fee_rate, c.slippage_rate)
-        ret = pnl / max(s.entry_gross_notional, 1e-12)
+        accounting = ledger if ledger.active else s
+        if not (cfg.enabled and cfg.pair_loss_stop_enabled and accounting.active and b and b.x_bar and b.y_bar and accounting.entry_x_price and accounting.entry_y_price and s.pair_loss_stop_return is not None): return None
+        qx = accounting.entry_x_quantity or z.x_quantity
+        qy = accounting.entry_y_quantity or z.y_quantity
+        gross = accounting.entry_gross_notional or (float(accounting.entry_x_price) * qx + float(accounting.entry_y_price) * qy)
+        pnl = mark_net_pnl(accounting.side, float(b.x_bar.close), float(b.y_bar.close), accounting.entry_x_price, accounting.entry_y_price, qx, qy, accounting.entry_fee, accounting.funding_cost, c.fee_rate, c.slippage_rate)
+        ret = pnl / max(gross, 1e-12)
         if ret > -float(s.pair_loss_stop_return): return None
         return ProtectionDecision(True, self.name, "protective_pair_loss_stop", "stop_loss", self.name, int(getattr(s, "pair_loss_stop_freeze_bars", 0)), _wait(cfg), {"net_pnl": pnl, "net_return": ret, "threshold": -float(s.pair_loss_stop_return)})
 
 class TakeProfitRule(ProtectionRule):
     name, priority = "take_profit", 30
     def evaluate(self, c):
-        s, z, cfg = c.state, c.sizing_state, c.config
+        s, z, ledger, cfg = c.state, c.sizing_state, c.ledger, c.config
         b = c.bundle
-        if not (cfg.enabled and cfg.take_profit_enabled and b and b.x_bar and b.y_bar and s.entry_x_price and s.entry_y_price and s.take_profit_return is not None): return None
-        pnl = mark_net_pnl(s.side, float(b.x_bar.close), float(b.y_bar.close), s.entry_x_price, s.entry_y_price, z.x_quantity, z.y_quantity, s.entry_fee, s.funding_cost, c.fee_rate, c.slippage_rate)
-        ret = pnl / max(s.entry_gross_notional, 1e-12)
+        accounting = ledger if ledger.active else s
+        if not (cfg.enabled and cfg.take_profit_enabled and accounting.active and b and b.x_bar and b.y_bar and accounting.entry_x_price and accounting.entry_y_price and s.take_profit_return is not None): return None
+        qx = accounting.entry_x_quantity or z.x_quantity
+        qy = accounting.entry_y_quantity or z.y_quantity
+        gross = accounting.entry_gross_notional or (float(accounting.entry_x_price) * qx + float(accounting.entry_y_price) * qy)
+        pnl = mark_net_pnl(accounting.side, float(b.x_bar.close), float(b.y_bar.close), accounting.entry_x_price, accounting.entry_y_price, qx, qy, accounting.entry_fee, accounting.funding_cost, c.fee_rate, c.slippage_rate)
+        ret = pnl / max(gross, 1e-12)
         if ret < float(s.take_profit_return): return None
         return ProtectionDecision(True, self.name, "protective_take_profit", "take_profit", self.name, int(getattr(cfg, "take_profit_freeze_bars", 0)), False, {"net_pnl": pnl, "net_return": ret, "threshold": float(s.take_profit_return)})
 

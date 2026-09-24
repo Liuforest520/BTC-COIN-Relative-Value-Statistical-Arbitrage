@@ -18,6 +18,7 @@ class ProtectionContext:
     pipeline: Any
     bundle: Any
     state: Any
+    ledger: Any
     sizing_state: Any
     config: Any
     fee_rate: float

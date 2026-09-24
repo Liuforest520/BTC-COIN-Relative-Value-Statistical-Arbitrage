@@ -35,20 +35,11 @@
 !/research/scripts/
 !/research/scripts/**
 
-# Hand-maintained configuration files.
-!config/
-/config/*
-!/config/config.yaml
-!/config/archive/
-!/config/archive/*.yaml
-!/config/archive/*.md
-!/config/sweeps/
-/config/sweeps/*
-!/config/sweeps/archive/
-!/config/sweeps/archive/*.yaml
-!/config/sweeps/archive/*.md
-!/config/tls_huber_selected_12/
-!/config/tls_huber_selected_12/*.yaml
+# Configuration is machine-local and deliberately kept out of the repository.
+# This covers config/config.yaml, config/archive/, config/sweeps/,
+# config/tls_huber_selected_12/ and every generated configuration tree.
+# The loader falls back to dataclass defaults for absent keys.
+/config/
 
 # Credentials and machine-local configuration must never be committed.
 .env

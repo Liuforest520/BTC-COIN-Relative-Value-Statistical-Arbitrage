@@ -176,11 +176,45 @@ class ProfitablePositionReplacementConfig:
 
 
 @dataclass
+class RebalanceCandidateQualityConfig:
+    """Hard gates for a new Pair that would require evicting old positions."""
+
+    enabled: bool = True
+    min_theoretical_zero_return_x_move: float = 0.20
+    max_adf_pvalue: float = 0.4
+    min_expected_net_return: float = 0.0
+
+    def __post_init__(self):
+        move = float(self.min_theoretical_zero_return_x_move)
+        pvalue = float(self.max_adf_pvalue)
+        expected_return = float(self.min_expected_net_return)
+        if not isfinite(move) or move < 0:
+            raise ValueError(
+                "rebalance.candidate_quality.min_theoretical_zero_return_x_move "
+                "must be non-negative"
+            )
+        if not isfinite(pvalue) or pvalue < 0 or pvalue > 1:
+            raise ValueError(
+                "rebalance.candidate_quality.max_adf_pvalue must be in [0, 1]"
+            )
+        if not isfinite(expected_return):
+            raise ValueError(
+                "rebalance.candidate_quality.min_expected_net_return must be finite"
+            )
+        self.min_theoretical_zero_return_x_move = move
+        self.max_adf_pvalue = pvalue
+        self.min_expected_net_return = expected_return
+
+
+@dataclass
 class RebalanceConfig:
     enabled: bool = False
     minimum_entry_capital_ratio: float = 0.5
     closed_pair_freeze_model_lookback_multiplier: float = 0.5
-    eviction_min_holding_bars: int = 0
+    eviction_min_holding_model_lookback_multiplier: float = 0.5
+    candidate_quality: RebalanceCandidateQualityConfig = field(
+        default_factory=RebalanceCandidateQualityConfig
+    )
     profitable_position_replacement: ProfitablePositionReplacementConfig = field(
         default_factory=ProfitablePositionReplacementConfig
     )
@@ -188,15 +222,18 @@ class RebalanceConfig:
     def __post_init__(self):
         ratio = float(self.minimum_entry_capital_ratio)
         multiplier = float(self.closed_pair_freeze_model_lookback_multiplier)
+        holding_multiplier = float(self.eviction_min_holding_model_lookback_multiplier)
         if not isfinite(ratio) or ratio <= 0 or ratio > 1:
             raise ValueError("rebalance.minimum_entry_capital_ratio must be in (0, 1]")
         if not isfinite(multiplier) or multiplier < 0:
             raise ValueError("rebalance.closed_pair_freeze_model_lookback_multiplier must be non-negative")
+        if not isfinite(holding_multiplier) or holding_multiplier < 0:
+            raise ValueError(
+                "rebalance.eviction_min_holding_model_lookback_multiplier must be non-negative"
+            )
         self.minimum_entry_capital_ratio = ratio
         self.closed_pair_freeze_model_lookback_multiplier = multiplier
-        self.eviction_min_holding_bars = int(self.eviction_min_holding_bars)
-        if self.eviction_min_holding_bars < 0:
-            raise ValueError("rebalance.eviction_min_holding_bars must be non-negative")
+        self.eviction_min_holding_model_lookback_multiplier = holding_multiplier
 
 
 @dataclass

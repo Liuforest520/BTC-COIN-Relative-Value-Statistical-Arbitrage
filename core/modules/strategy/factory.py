@@ -6,6 +6,7 @@ from core.modules.strategy.config import (
     PortfolioConfig,
     ProtectionConfig,
     RebalanceConfig,
+    RebalanceCandidateQualityConfig,
     ProfitablePositionReplacementConfig,
     SignalConfig,
     SizingConfig,
@@ -95,9 +96,19 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
     pf_cfg = pipeline.get("portfolio", {})
     exec_cfg = pipeline.get("execution", {})
     protection_cfg = pipeline.get("protection", {})
-    rebalance_cfg = dict(getattr(setup_config, "rebalance", {}) or {})
-    if not rebalance_cfg:
-        rebalance_cfg = dict(pipeline.get("rebalance", {}) or {})
+    setup_rebalance_cfg = dict(getattr(setup_config, "rebalance", {}) or {})
+    pipeline_rebalance_cfg = dict(pipeline.get("rebalance", {}) or {})
+    for source_name, source_cfg in (
+        ("setup.rebalance", setup_rebalance_cfg),
+        ("pipeline.rebalance", pipeline_rebalance_cfg),
+    ):
+        if "eviction_min_holding_bars" in source_cfg:
+            raise ValueError(
+                f"{source_name}.eviction_min_holding_bars is no longer supported; "
+                "use rebalance.eviction_min_holding_model_lookback_multiplier "
+                "with a model-lookback multiplier"
+            )
+    rebalance_cfg = setup_rebalance_cfg or pipeline_rebalance_cfg
 
     # Pair-target-capital is intentionally strict. Falling back to sizing
     # notional silently creates a Pair with a different capital allocation.
@@ -154,11 +165,17 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
     execution_cfg = ExecutionConfig(**_filter_kwargs(ExecutionConfig, exec_cfg, "execution")) if exec_cfg else ExecutionConfig()
     protection_cfg_obj = ProtectionConfig(**_filter_kwargs(ProtectionConfig, protection_cfg, "protection")) if protection_cfg else ProtectionConfig()
     replacement_raw = rebalance_cfg.get("profitable_position_replacement", {}) or {}
+    candidate_quality_raw = rebalance_cfg.get("candidate_quality", {}) or {}
     rebalance_cfg = dict(rebalance_cfg)
     rebalance_cfg.pop("profitable_position_replacement", None)
+    rebalance_cfg.pop("candidate_quality", None)
     replacement_raw = _filter_kwargs(
         ProfitablePositionReplacementConfig, replacement_raw,
         "rebalance.profitable_position_replacement",
+    )
+    candidate_quality_raw = _filter_kwargs(
+        RebalanceCandidateQualityConfig, candidate_quality_raw,
+        "rebalance.candidate_quality",
     )
     if "minimum_entry_capital_ratio" in rebalance_cfg and "minimum_entry_capital_ratio" in pf_cfg:
         if float(rebalance_cfg["minimum_entry_capital_ratio"]) != float(pf_cfg["minimum_entry_capital_ratio"]):
@@ -166,15 +183,26 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
     elif "minimum_entry_capital_ratio" in pf_cfg:
         rebalance_cfg["minimum_entry_capital_ratio"] = pf_cfg["minimum_entry_capital_ratio"]
     rebalance_cfg_obj = RebalanceConfig(
+        candidate_quality=RebalanceCandidateQualityConfig(**candidate_quality_raw),
         profitable_position_replacement=ProfitablePositionReplacementConfig(**replacement_raw),
         **_filter_kwargs(RebalanceConfig, rebalance_cfg, "rebalance"),
     )
-    if (protection_cfg_obj.enabled or protection_cfg_obj.max_holding_time_enabled) and (
+    if (
+        protection_cfg_obj.enabled
+        or protection_cfg_obj.max_holding_time_enabled
+        or rebalance_cfg_obj.enabled
+    ) and (
         estimator_cfg.position_update_policy != "freeze"
         or estimator_cfg.regression_method not in {"price", "log_price"}
     ):
         raise ValueError(
-            "pipeline.protection is supported only for freeze Price/Log-Price models"
+            "pipeline protection/rebalance is supported only for freeze Price/Log-Price models"
+        )
+    if rebalance_cfg_obj.profitable_position_replacement.enabled:
+        from core.modules.logger import logger
+        logger.warning(
+            "rebalance.profitable_position_replacement.enabled is ignored: "
+            "the current rebalance policy replaces losing positions only"
         )
 
     # Import estimators / signals / sizing / portfolio to trigger registration

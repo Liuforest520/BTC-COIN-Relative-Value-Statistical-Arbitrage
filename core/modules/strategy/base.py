@@ -72,10 +72,11 @@ class BaseStrategy(ABC):
     def on_funding_payments(self, payments: list):
         pass
 
-    def set_portfolio_context(self, cash=None, equity=None, available_balance=None):
+    def set_portfolio_context(self, cash=None, equity=None, available_balance=None, pair_marked_equity=None):
         self._current_cash = cash
         self._current_equity = equity
         self._current_available_balance = available_balance
+        self._current_pair_marked_equity = dict(pair_marked_equity or {})
 
     def on_orders_accepted(self, orders: list[Order]):
         pass
