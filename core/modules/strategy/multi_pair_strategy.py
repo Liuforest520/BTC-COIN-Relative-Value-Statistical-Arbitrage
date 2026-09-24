@@ -1069,7 +1069,8 @@ class MultiPairStrategy(BaseStrategy):
             entry_allocation.reason if entry_allocation is not None else "existing positions only"
         )
 
-    def _allocated_net_exposure(self, pair_targets: dict[str, AllocatedPairTarget]) -> float:
+    @staticmethod
+    def _allocated_net_exposure(pair_targets: dict[str, AllocatedPairTarget]) -> float:
         total = 0.0
         for target in pair_targets.values():
             if target.side == "long_x":
