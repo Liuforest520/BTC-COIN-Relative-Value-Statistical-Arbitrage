@@ -24,22 +24,23 @@
 # Runnable scripts and automated tests.
 !scripts/
 !scripts/**
-!test/
-!test/**
 
-# Maintenance and research source code only.
+# Local-only experiment and generated trees. These must never be added to the
+# repository, even when a command creates files below them.
+/config/
+/test/
+/tests/
+/result/
+/results/
+/research/
+/resaerch/
+/tmp/
+/output/
+/outputs/
+
+# Maintenance helpers (market-data inspection + legacy report migration).
 !maintenance/
 !maintenance/**
-!research/
-/research/*
-!/research/scripts/
-!/research/scripts/**
-
-# Configuration is machine-local and deliberately kept out of the repository.
-# This covers config/config.yaml, config/archive/, config/sweeps/,
-# config/tls_huber_selected_12/ and every generated configuration tree.
-# The loader falls back to dataclass defaults for absent keys.
-/config/
 
 # Credentials and machine-local configuration must never be committed.
 .env
@@ -58,10 +59,6 @@
 /documents/
 /logs/
 /node_modules/
-/output/
-/outputs/
-/results/
-/tmp/
 /优化/
 
 # Generated configuration trees.

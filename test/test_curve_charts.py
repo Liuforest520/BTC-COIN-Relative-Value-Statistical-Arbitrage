@@ -137,7 +137,8 @@ def test_pair_metrics_carry_sharpe_calmar_trades_and_drawdown(run_dir):
     assert stats["closed_positions"] == 1
     assert stats["open_positions"] == 0
     assert stats["win_rate"] == 1.0
-    assert stats["sharpe"] is not None and stats["sharpe"] > 0
+    # The fixture spans less than two UTC daily closes, so daily Sharpe is undefined.
+    assert stats["sharpe"] is None
     assert stats["calmar"] is not None
     assert stats["max_drawdown"] is not None and stats["max_drawdown"] <= 0
     assert stats["fee"] == pytest.approx(sum(trade.fee for trade in result.trades))

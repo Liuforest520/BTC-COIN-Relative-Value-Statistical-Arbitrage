@@ -33,6 +33,10 @@ import yaml
 
 from core.modules.logger import logger
 
+
+MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000
+TRADING_DAYS_PER_YEAR = 365.0
+
 CHART_DIR_NAME = "curve_charts"
 PAIR_CHART_DIR_NAME = "pairs"
 PORTFOLIO_CHART_NAME = "portfolio_curve.png"
@@ -583,6 +587,13 @@ def _pair_funding_events(pair_trades: list[PairTrades], funding_events: list[dic
 def _pair_metrics(trades: PairTrades, points: dict, initial_equity: float | None) -> dict:
     pnl = points["pnl"]
     ts = points["ts"]
+    # The chart builder normally emits points in chronological order, but the
+    # metric helper is also used directly by report/tests.  Normalize here so
+    # daily close selection is deterministic for any input ordering.
+    if len(ts) > 1 and np.any(np.diff(ts) < 0):
+        order = np.argsort(ts, kind="stable")
+        ts = ts[order]
+        pnl = pnl[order]
     equity = pnl + (float(initial_equity) if initial_equity else 0.0)
 
     max_drawdown = None
@@ -595,16 +606,25 @@ def _pair_metrics(trades: PairTrades, points: dict, initial_equity: float | None
             drawdown = np.where(peak > 0, equity / peak - 1.0, 0.0)
         max_drawdown = float(np.nanmin(drawdown))
 
-        spacing_ms = float(np.median(np.diff(ts))) if len(ts) > 1 else 0.0
-        if spacing_ms > 0:
-            factor = MILLISECONDS_PER_YEAR / spacing_ms
+        # Pair Sharpe uses close-to-close UTC daily returns, matching the
+        # portfolio-level metric.  Pair curves are otherwise sampled at every
+        # raw bar, which would inflate the ratio for minute-level backtests.
+        daily_equity = {}
+        for timestamp, value in zip(ts, equity):
+            day = int(timestamp) // MILLISECONDS_PER_DAY
+            daily_equity[day] = float(value)
+        daily_values = np.asarray(list(daily_equity.values()), dtype=float)
+        if len(daily_values) >= 3:
             with np.errstate(divide="ignore", invalid="ignore"):
-                returns = np.diff(equity) / equity[:-1]
+                returns = np.diff(daily_values) / daily_values[:-1]
             returns = returns[np.isfinite(returns)]
-            if len(returns) > 2:
+            if len(returns) > 1:
                 std = float(np.std(returns, ddof=1))
                 if std > 0:
-                    sharpe = float(np.mean(returns) * factor / (std * sqrt(factor)))
+                    sharpe = float(
+                        np.mean(returns) * TRADING_DAYS_PER_YEAR
+                        / (std * sqrt(TRADING_DAYS_PER_YEAR))
+                    )
         elapsed_years = (int(ts[-1]) - int(ts[0])) / MILLISECONDS_PER_YEAR
         if elapsed_years > 0 and equity[0] > 0 and equity[-1] > 0:
             cagr = float((equity[-1] / equity[0]) ** (1.0 / elapsed_years) - 1.0)

@@ -28,14 +28,14 @@ def test_annualized_return_is_cagr_from_actual_elapsed_time():
     assert metrics["annualized_return"] >= -1.0
 
 
-def test_sharpe_uses_annualized_arithmetic_mean_but_calmar_uses_cagr():
+def test_sharpe_uses_daily_returns_but_calmar_uses_cagr():
     equity = _equity([100.0, 110.0, 99.0], elapsed_days=365)
     metrics = performance_metrics(equity)
 
     returns = [0.10, -0.10]
     expected_mean = sum(returns) / len(returns)
     expected_std = math.sqrt(sum((value - expected_mean) ** 2 for value in returns) / (len(returns) - 1))
-    periods_per_year = 2.0
+    periods_per_year = 365.0
     expected_annualized_mean = expected_mean * periods_per_year
     expected_volatility = expected_std * math.sqrt(periods_per_year)
 
@@ -46,6 +46,35 @@ def test_sharpe_uses_annualized_arithmetic_mean_but_calmar_uses_cagr():
     assert math.isclose(metrics["max_drawdown"], -0.10)
     assert math.isclose(metrics["calmar"], -0.10)
 
+def test_sharpe_uses_last_equity_of_each_utc_day_not_intraday_marks():
+    day = MILLISECONDS_PER_DAY
+    equity = pl.DataFrame(
+        {
+            "ts": [
+                0,
+                day // 3,
+                day - 1,
+                day,
+                day + day // 3,
+                2 * day,
+                2 * day + day // 3,
+            ],
+            # Daily closes are 100, 110, 99. Intraday marks are deliberately
+            # much more volatile and must not enter the Sharpe calculation.
+            "equity": [100.0, 150.0, 100.0, 50.0, 110.0, 20.0, 99.0],
+        }
+    )
+    metrics = performance_metrics(equity)
+
+    daily_returns = [0.10, 99.0 / 110.0 - 1.0]
+    expected_mean = sum(daily_returns) / len(daily_returns)
+    expected_std = math.sqrt(
+        sum((value - expected_mean) ** 2 for value in daily_returns)
+        / (len(daily_returns) - 1)
+    )
+    expected_sharpe = expected_mean * math.sqrt(365.0) / expected_std
+
+    assert math.isclose(metrics["sharpe"], expected_sharpe, rel_tol=1e-12, abs_tol=1e-12)
 
 def test_zero_final_equity_has_minus_one_cagr():
     metrics = performance_metrics(_equity([100.0, 0.0], elapsed_days=365))

@@ -8,6 +8,7 @@ import polars as pl
 MINUTES_PER_YEAR = 365 * 24 * 60
 MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000
 MILLISECONDS_PER_YEAR = 365 * MILLISECONDS_PER_DAY
+TRADING_DAYS_PER_YEAR = 365.0
 
 
 def calculate_metrics(
@@ -44,18 +45,18 @@ def performance_metrics(equity_curve) -> dict:
     if equity.height < 2:
         return _empty_performance_metrics()
 
-    equity = equity.with_columns(
-        (pl.col("equity") / pl.col("equity").shift(1) - 1).alias("return")
-    )
-    returns = equity.drop_nulls("return")
-
     initial_equity = equity["equity"][0]
     final_equity = equity["equity"][-1]
     total_return = final_equity / initial_equity - 1 if initial_equity else None
 
-    mean_return = _series_mean(returns, "return")
-    std_return = _series_std(returns, "return")
-    annualization_factor = _annualization_factor(equity)
+    # Sharpe is intentionally based on one return observation per UTC day.
+    # The raw equity curve may be sampled every minute (or every model bar);
+    # using those observations would materially overstate Sharpe by treating
+    # highly autocorrelated intraday marks as independent returns.
+    daily_returns = _daily_returns(equity)
+    mean_return = daily_returns.mean() if daily_returns is not None else None
+    std_return = daily_returns.std() if daily_returns is not None else None
+    annualization_factor = TRADING_DAYS_PER_YEAR
     annualized_mean_return = mean_return * annualization_factor if mean_return is not None else None
     annualized_return = _compound_annualized_return(equity, initial_equity, final_equity)
     annualized_volatility = std_return * sqrt(annualization_factor) if std_return is not None else None
@@ -507,6 +508,46 @@ def _annualization_factor(equity):
     if interval_ms <= 0 or not isfinite(interval_ms):
         return MINUTES_PER_YEAR
     return MILLISECONDS_PER_YEAR / interval_ms
+
+
+def _daily_returns(equity):
+    """Return close-to-close UTC daily equity returns.
+
+    The backtest equity curve is marked at every raw bar.  For risk metrics,
+    retain only the last marked equity in each UTC calendar day and calculate
+    returns between those daily closes.  A curve without timestamps cannot be
+    mapped to calendar days, so its observations are treated as already
+    daily; this preserves compatibility for small metric fixtures.
+    """
+    if equity.is_empty() or "equity" not in equity.columns:
+        return None
+    if "ts" not in equity.columns:
+        values = equity.select(pl.col("equity").cast(pl.Float64, strict=False)).drop_nulls()
+        if values.height < 2:
+            return None
+        return values.with_columns(
+            (pl.col("equity") / pl.col("equity").shift(1) - 1).alias("return")
+        )["return"].drop_nulls()
+
+    daily = (
+        equity.select([
+            pl.col("ts").cast(pl.Int64, strict=False).alias("ts"),
+            pl.col("equity").cast(pl.Float64, strict=False).alias("equity"),
+        ])
+        .drop_nulls(["ts", "equity"])
+        .sort("ts")
+        .with_columns(
+            pl.from_epoch(pl.col("ts"), time_unit="ms").dt.date().alias("_utc_date")
+        )
+        .group_by("_utc_date", maintain_order=True)
+        .agg(pl.col("equity").last().alias("equity"))
+        .sort("_utc_date")
+    )
+    if daily.height < 2:
+        return None
+    return daily.with_columns(
+        (pl.col("equity") / pl.col("equity").shift(1) - 1).alias("return")
+    )["return"].drop_nulls()
 
 
 def _compound_annualized_return(equity, initial_equity, final_equity):
