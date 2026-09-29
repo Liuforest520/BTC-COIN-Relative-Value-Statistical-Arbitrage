@@ -536,12 +536,6 @@ setups:
       y_symbol: KORUUSDT
       tags:
       - tradfi
-    - pair_id: koru_soxl
-      target_capital: 600000
-      x_symbol: KORUUSDT
-      y_symbol: SOXLUSDT
-      tags:
-      - tradfi
     - pair_id: xau_xpt
       target_capital: 213058.6222
       x_symbol: XAUUSDT

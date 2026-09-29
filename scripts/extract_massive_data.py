@@ -101,12 +101,54 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overwrite", action="store_true", help="覆盖已存在的 .csv")
     parser.add_argument("--delete-gz", action="store_true", help="解压成功后删除 .csv.gz")
     parser.add_argument("--limit", type=int, help="只处理前 N 个文件（用于试跑）")
+    parser.add_argument("--start", help="只解压该日期（含）之后的文件夹，格式 YYYY-MM-DD")
+    parser.add_argument("--end", help="只解压该日期（含）之前的文件夹，格式 YYYY-MM-DD")
+    parser.add_argument("--clean", action="store_true",
+                        help="删除已解压出来的 .csv（及残留 .part），不解压；配合 --start/--end 限定范围")
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input_dir)
+
+    if args.clean:
+        plains = sorted(list(input_dir.glob("*/*.csv")) + list(input_dir.glob("*/*.csv.part")))
+        if args.start:
+            plains = [p for p in plains if p.parent.name >= args.start]
+        if args.end:
+            plains = [p for p in plains if p.parent.name <= args.end]
+        if not plains:
+            LOGGER.info("没有需要删除的已解压文件（范围 %s → %s）", args.start or "-", args.end or "-")
+            return 0
+        LOGGER.info("=" * 96)
+        LOGGER.info("清理已解压文件：%d 个，合计 %s", len(plains),
+                    _format_bytes(sum(p.stat().st_size for p in plains)))
+        LOGGER.info("  范围 : %s → %s", plains[0].parent.name, plains[-1].parent.name)
+        LOGGER.info("  注意 : 只删除 .csv 明文，.csv.gz 压缩包保留")
+        LOGGER.info("=" * 96)
+        freed = removed = failed = 0
+        for index, path in enumerate(plains, start=1):
+            size = path.stat().st_size
+            try:
+                path.unlink()
+            except OSError as exc:
+                failed += 1
+                LOGGER.error("删除失败 %s : %s", path.resolve(), exc)
+                continue
+            removed += 1
+            freed += size
+            LOGGER.info("[%d/%d] 已删除 %s (%s)", index, len(plains), path.resolve(), _format_bytes(size))
+            if index % PROGRESS_EVERY == 0 or index == len(plains):
+                LOGGER.info("进度 %d/%d | 已删 %d 失败 %d | 释放 %s",
+                            index, len(plains), removed, failed, _format_bytes(freed))
+        LOGGER.info("清理结束：删除 %d 个，失败 %d，释放 %s", removed, failed, _format_bytes(freed))
+        return 1 if failed else 0
+
     archives = sorted(input_dir.glob("*/*.csv.gz"))
+    if args.start:
+        archives = [a for a in archives if a.parent.name >= args.start]
+    if args.end:
+        archives = [a for a in archives if a.parent.name <= args.end]
     if not archives:
-        LOGGER.error("在 %s 下没找到 *.csv.gz（是不是还没下载？）", input_dir.resolve())
+        LOGGER.error("在 %s 下没找到符合条件的 *.csv.gz（是不是还没下载？）", input_dir.resolve())
         return 1
     if args.limit:
         archives = archives[: args.limit]
@@ -116,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("Massive flat file 解压开始")
     LOGGER.info("  输入目录 : %s", input_dir.resolve())
     LOGGER.info("  待处理   : %d 个 .csv.gz", len(archives))
+    LOGGER.info("  日期范围 : %s → %s%s", archives[0].parent.name, archives[-1].parent.name,
+                f"（筛选 --start {args.start} --end {args.end}）" if (args.start or args.end) else "")
     LOGGER.info("  输出位置 : %s", (Path(args.out_dir).resolve() if args.out_dir else "<与压缩包同目录>/<日期>.csv"))
     LOGGER.info("  覆盖已有 : %s    解压后删除压缩包: %s",
                 "是" if args.overwrite else "否（已存在则跳过）", "是" if args.delete_gz else "否")
