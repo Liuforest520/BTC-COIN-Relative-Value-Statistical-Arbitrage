@@ -61,15 +61,28 @@ def load_csv_data(file_path: str | Path) -> pl.DataFrame:
 
 def _read_csv(file_path: str | Path) -> pl.DataFrame:
     raw = Path(file_path).read_bytes()
+    last_error: Exception | None = None
     for encoding in ["utf-8-sig", "utf-8", "gbk", "gb18030"]:
         try:
             text = raw.decode(encoding)
-            return pl.read_csv(StringIO(text))
         except UnicodeDecodeError:
             continue
-        except Exception:
-            continue
-    return pl.read_csv(file_path)
+        # Schema inference looks at the first rows only.  Split-adjusted files
+        # can carry a fractional volume later on (e.g. ``5836854.0``) while the
+        # head looks integral, which makes polars infer Int64 and then fail to
+        # parse.  Retry once with a full-file schema scan before giving up.
+        for kwargs in ({}, {"infer_schema_length": None}):
+            try:
+                return pl.read_csv(StringIO(text), **kwargs)
+            except Exception as exc:  # noqa: BLE001 - try the next strategy
+                last_error = exc
+        continue
+    try:
+        return pl.read_csv(file_path)
+    except Exception:
+        if last_error is not None:
+            raise last_error
+        raise
 
 
 def _rename_columns(data: pl.DataFrame) -> pl.DataFrame:

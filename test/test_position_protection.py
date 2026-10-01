@@ -586,7 +586,7 @@ def test_pair_loss_stop_freeze_blocks_entry_until_deadline():
     assert allowed["allowed"] is True
 
 
-def test_rebalance_close_is_frozen_without_model_update_lock():
+def test_rebalance_close_has_no_freeze_or_model_update_lock():
     strategy, pipeline = _strategy_with_protection()
     pipeline.state.sizing_state.position_side = "long_x"
     pipeline.state.sizing_state.x_quantity = 1.0
@@ -600,7 +600,7 @@ def test_rebalance_close_is_frozen_without_model_update_lock():
     )
     assert orders
     assert all(order.protection_rule == "rebalance_replacement" for order in orders)
-    assert all(order.protection_freeze_bars == 12 for order in orders)
+    assert all(order.protection_freeze_bars == 0 for order in orders)
     assert all(order.reopen_lock_pending is False for order in orders)
 
 
@@ -619,7 +619,6 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
         rebalance_cfg=RebalanceConfig(
             enabled=True,
             minimum_entry_capital_ratio=0.5,
-            eviction_min_holding_model_lookback_multiplier=0.0,
         ),
     )
     for pair_id in ("old_a", "old_b"):
@@ -644,10 +643,13 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
         ledger.entry_x_quantity = 5.0
         ledger.entry_y_quantity = 5.0
         ledger.entry_gross_notional = 100.0
+        ledger.entry_z = 3.3
+        ledger.exit_z = 0.5
+        pp._last_zscore = 1.0
     bundles = {
         pair_id: PairBarBundle(
             pair_id, 1, 1,
-            BarSnapshot(1, 8.0, 8.0, 8.0, 8.0, 1, "binance", strategy.pipelines[pair_id].pair_def.x_symbol),
+            BarSnapshot(1, 12.0, 12.0, 12.0, 12.0, 1, "binance", strategy.pipelines[pair_id].pair_def.x_symbol),
             BarSnapshot(1, 10.0, 10.0, 10.0, 10.0, 1, "binance", strategy.pipelines[pair_id].pair_def.y_symbol),
         ) for pair_id in ("old_a", "old_b")
     }
@@ -665,88 +667,8 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
     strategy.portfolio_state.available_balance = 250.0
     assert strategy._pair_releasable_equity(
         strategy.pipelines["old_a"], bundles["old_a"]
-    ) == pytest.approx(89.946)
+    ) == pytest.approx(109.934)
     orders, allocation = strategy._plan_rebalance({"new": candidate}, bundles, 1)
     assert len(orders) == 2
     assert allocation.selected_pair_ids == ["new"]
     assert strategy._pending_rebalance_pair_ids == {"old_a"}
-
-
-def test_rebalance_min_holding_uses_pair_local_bar_index():
-    from core.modules.models.pipeline_types import RawPairTarget
-    from core.modules.strategy.config import RebalanceConfig
-
-    strategy = MultiPairStrategy(
-        pairs=[
-            PairDefinition(pair_id="old", x_symbol="A", y_symbol="B"),
-            PairDefinition(pair_id="new", x_symbol="C", y_symbol="D"),
-        ],
-        estimator_ctor=TLSEstimator,
-        estimator_cfg=EstimatorConfig(
-            regression_method="price",
-            position_update_policy="freeze",
-            model_lookback_bars=10,
-        ),
-        rebalance_cfg=RebalanceConfig(
-            enabled=True,
-            minimum_entry_capital_ratio=0.5,
-            eviction_min_holding_model_lookback_multiplier=0.5,
-        ),
-    )
-    old = strategy.pipelines["old"]
-    old.state.sizing_state.position_side = "long_x"
-    old.state.sizing_state.x_quantity = 5.0
-    old.state.sizing_state.y_quantity = 5.0
-    old.state.sizing_state.target_hedge_ratio = 1.0
-    old.state.protection_state.active = True
-    old.state.protection_state.side = "long_x"
-    old.state.protection_state.entry_bar_index = 5
-    old.state.protection_state.entry_x_price = 10.0
-    old.state.protection_state.entry_y_price = 10.0
-    old.state.protection_state.entry_x_quantity = 5.0
-    old.state.protection_state.entry_y_quantity = 5.0
-    old.state.protection_state.entry_gross_notional = 100.0
-    old.state.position_ledger.active = True
-    old.state.position_ledger.side = "long_x"
-    old.state.position_ledger.entry_bar_index = 5
-    old.state.position_ledger.entry_x_price = 10.0
-    old.state.position_ledger.entry_y_price = 10.0
-    old.state.position_ledger.entry_x_quantity = 5.0
-    old.state.position_ledger.entry_y_quantity = 5.0
-    old.state.position_ledger.entry_gross_notional = 100.0
-    old.state.last_bar_index = 5
-
-    bundles = {
-        "old": PairBarBundle(
-            "old", 5, 5,
-            BarSnapshot(1, 8.0, 8.0, 8.0, 8.0, 1, "binance", "A"),
-            BarSnapshot(1, 10.0, 10.0, 10.0, 10.0, 1, "binance", "B"),
-        )
-    }
-    raw = RawPairTarget(
-        pair_id="new", ready=True, side="long_x", x_weight=0.5, y_weight=0.5,
-        x_price=10.0, y_price=10.0, gross_notional=100.0, target_capital=100.0,
-        para={"rebalance_quality": {
-            "adf_pvalue": 0.1,
-            "theoretical_zero_return_x_move": 0.25,
-            "expected_net_return": 0.05,
-            "signal_strength": 3.0,
-        }},
-    )
-    candidate = {
-        "pair_id": "new",
-        "pair_def": strategy.pipelines["new"].pair_def,
-        "raw_target": raw,
-        "result": SimpleNamespace(estimator=SimpleNamespace(cointegration_pvalue=0.1)),
-    }
-    strategy.portfolio_state.available_balance = 0.0
-
-    # The global strategy bar is deliberately much later, but this Pair has
-    # only held for zero local bars and must not be evicted.
-    assert strategy._plan_rebalance({"new": candidate}, bundles, 100) == ([], None)
-
-    # Once the Pair-local bar reaches the threshold, eviction is allowed.
-    bundles["old"] = replace(bundles["old"], bar_index=10)
-    orders, allocation = strategy._plan_rebalance({"new": candidate}, bundles, 100)
-    assert orders
-    assert allocation.selected_pair_ids == ["new"]

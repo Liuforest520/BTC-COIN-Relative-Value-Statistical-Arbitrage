@@ -6,12 +6,12 @@ from .base import RebalanceCandidate, RebalancePlan, RebalancePosition
 
 
 class RebalanceManager:
-    """Choose at most one underfunded candidate and its complete evictions.
+    """Choose at most one underfunded candidate and profitable converged evictions.
 
     Normal, directly affordable entries never pass through this manager. It
     only considers candidates rejected by the ordinary allocator for lack of
     minimum capital. Candidate gates are always applied before an existing
-    losing position may be sacrificed.
+    position may be replaced.
     """
 
     def __init__(self, config):
@@ -37,22 +37,40 @@ class RebalanceManager:
                 reason="candidate is directly affordable",
             )
 
+        replacement_cfg = self.config.profitable_position_replacement
+        if not replacement_cfg.enabled:
+            return RebalancePlan(
+                candidate=candidate,
+                available_capital=available,
+                release_needed=release_needed,
+                reason="profitable position replacement disabled",
+            )
+
         eligible = sorted(
             (
                 position
                 for position in positions
-                if position.net_return < 0.0
-                and position.held_bars >= position.minimum_holding_bars
+                if self._finite_strictly_greater(
+                    position.net_return, replacement_cfg.min_net_return
+                )
+                and self._finite_at_least(
+                    position.convergence_ratio,
+                    replacement_cfg.min_convergence_ratio,
+                )
                 and position.releasable_equity > 1e-9
             ),
-            key=lambda position: (position.net_return, position.pair_id),
+            key=lambda position: (
+                -self._finite_or(position.convergence_ratio, float("-inf")),
+                -self._finite_or(position.net_return, float("-inf")),
+                position.pair_id,
+            ),
         )
         if not eligible:
             return RebalancePlan(
                 candidate=candidate,
                 available_capital=available,
                 release_needed=release_needed,
-                reason="no eligible losing position",
+                reason="no eligible profitable converged position",
             )
 
         selected = []
@@ -69,7 +87,7 @@ class RebalanceManager:
                 available_capital=available,
                 release_needed=release_needed,
                 planned_release=release,
-                reason="eligible losing positions cannot fund candidate minimum",
+                reason="eligible profitable converged positions cannot fund candidate minimum",
             )
         return RebalancePlan(
             candidate=candidate,
@@ -132,6 +150,15 @@ class RebalanceManager:
         except (TypeError, ValueError):
             return False
         return isfinite(parsed) and parsed >= float(threshold)
+
+    @staticmethod
+    def _finite_strictly_greater(value, threshold) -> bool:
+        try:
+            parsed = float(value)
+            bound = float(threshold)
+        except (TypeError, ValueError):
+            return False
+        return isfinite(parsed) and isfinite(bound) and parsed > bound
 
     @staticmethod
     def _finite_at_most(value, threshold) -> bool:

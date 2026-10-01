@@ -20,9 +20,8 @@ class RebalanceCandidate:
 class RebalancePosition:
     pair_id: str
     net_return: float
+    convergence_ratio: float | None
     releasable_equity: float
-    held_bars: int
-    minimum_holding_bars: int
     payload: Any = None
 
 

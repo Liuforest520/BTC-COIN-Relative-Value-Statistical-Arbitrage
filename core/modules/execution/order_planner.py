@@ -58,6 +58,8 @@ class OrderPlanner:
             # signal has become a filled order; do not retain full diagnostic
             # payloads on every Order/Trade object.
             order_para["protection"] = dict(raw_para["protection"])
+        if isinstance(raw_para, dict) and isinstance(raw_para.get("pair_position"), dict):
+            order_para["pair_position"] = dict(raw_para["pair_position"])
 
         # long_x / short_spread: buy X, sell Y. short_x / long_spread: sell X, buy Y.
         if side in ("long_x", "short_spread"):

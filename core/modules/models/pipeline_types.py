@@ -281,6 +281,7 @@ class PairPositionLedger:
     beta: float | None = None
     spread_mean: float | None = None
     spread_std: float | None = None
+    entry_z: float | None = None
     exit_z: float | None = None
 
 

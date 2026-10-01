@@ -158,9 +158,7 @@ def test_pipeline_converts_legacy_source_minute_windows_once():
                 "pair_loss_stop_enabled": True,
                 "pair_loss_stop_freeze_bars": 1440,
             },
-            "rebalance": {
-                "eviction_min_holding_model_lookback_multiplier": 0.5
-            },
+            "rebalance": {},
         },
     )
     strategy = build_strategy(setup, {"X": {"exchange": "binance"}, "Y": {"exchange": "binance"}})
@@ -174,8 +172,7 @@ def test_pipeline_converts_legacy_source_minute_windows_once():
     assert strategy.add_cooldown_bars == 2
     assert strategy.min_hold_bars == 3
     assert strategy.protection_cfg.pair_loss_stop_freeze_bars == 96
-    assert strategy.rebalance_cfg.eviction_min_holding_model_lookback_multiplier == 0.5
-    assert strategy._rebalance_min_holding_bars(pipeline) == 96
+    assert not hasattr(strategy.rebalance_cfg, "eviction_min_holding_model_lookback_multiplier")
 
 
 @pytest.mark.parametrize("location", ["setup", "pipeline"])
@@ -198,7 +195,7 @@ def test_factory_rejects_legacy_rebalance_holding_key_at_either_config_layer(loc
     else:
         setup.pipeline["rebalance"] = {"eviction_min_holding_bars": 60}
 
-    with pytest.raises(ValueError, match="eviction_min_holding_bars is no longer supported"):
+    with pytest.raises(ValueError, match="contains removed rebalance key"):
         build_strategy(setup, {"X": {}, "Y": {}})
 
 
@@ -219,7 +216,7 @@ def test_factory_rejects_legacy_rebalance_key_even_when_both_layers_exist():
         },
     )
 
-    with pytest.raises(ValueError, match="pipeline.rebalance.eviction_min_holding_bars"):
+    with pytest.raises(ValueError, match="pipeline.rebalance contains removed rebalance key"):
         build_strategy(setup, {"X": {}, "Y": {}})
 
 

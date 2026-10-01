@@ -102,12 +102,29 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
         ("setup.rebalance", setup_rebalance_cfg),
         ("pipeline.rebalance", pipeline_rebalance_cfg),
     ):
-        if "eviction_min_holding_bars" in source_cfg:
+        legacy_keys = {
+            "closed_pair_freeze_model_lookback_multiplier",
+            "eviction_min_holding_model_lookback_multiplier",
+            "eviction_min_holding_bars",
+        }
+        found = sorted(legacy_keys.intersection(source_cfg))
+        if found:
             raise ValueError(
-                f"{source_name}.eviction_min_holding_bars is no longer supported; "
-                "use rebalance.eviction_min_holding_model_lookback_multiplier "
-                "with a model-lookback multiplier"
+                f"{source_name} contains removed rebalance key(s) {found}; "
+                "rebalance replacement no longer freezes or enforces a minimum holding period"
             )
+        replacement = source_cfg.get("profitable_position_replacement", {}) or {}
+        if isinstance(replacement, dict):
+            old_replacement = {
+                "min_theoretical_zero_return_x_move",
+                "max_adf_pvalue",
+            }
+            found = sorted(old_replacement.intersection(replacement))
+            if found:
+                raise ValueError(
+                    f"{source_name}.profitable_position_replacement contains removed key(s) {found}; "
+                    "use min_net_return and min_convergence_ratio"
+                )
     rebalance_cfg = setup_rebalance_cfg or pipeline_rebalance_cfg
 
     # Pair-target-capital is intentionally strict. Falling back to sizing
@@ -197,12 +214,6 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
     ):
         raise ValueError(
             "pipeline protection/rebalance is supported only for freeze Price/Log-Price models"
-        )
-    if rebalance_cfg_obj.profitable_position_replacement.enabled:
-        from core.modules.logger import logger
-        logger.warning(
-            "rebalance.profitable_position_replacement.enabled is ignored: "
-            "the current rebalance policy replaces losing positions only"
         )
 
     # Import estimators / signals / sizing / portfolio to trigger registration

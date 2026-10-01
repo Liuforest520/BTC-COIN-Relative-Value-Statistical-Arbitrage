@@ -1,6 +1,0 @@
-# One command runs the historical-best review batch first, followed by the
-# TLS/Huber/EWLS raw-price parameter sweep.
-workers: 4
-sweeps:
-  - config/sweeps/archive/sweep_beta_review_best.yaml
-  - config/sweeps/archive/sweep_beta_price.yaml

@@ -160,20 +160,25 @@ class PortfolioConfig:
 
 @dataclass
 class ProfitablePositionReplacementConfig:
-    enabled: bool = False
-    min_theoretical_zero_return_x_move: float = 0.20
-    max_adf_pvalue: float = 0.4
+    """Rules for replacing profitable, sufficiently converged positions."""
+
+    enabled: bool = True
+    min_net_return: float = 0.0
+    min_convergence_ratio: float = 0.80
 
     def __post_init__(self):
-        move = float(self.min_theoretical_zero_return_x_move)
-        pvalue = float(self.max_adf_pvalue)
-        if not isfinite(move) or move < 0:
-            raise ValueError("rebalance.profitable_position_replacement.min_theoretical_zero_return_x_move must be non-negative")
-        if not isfinite(pvalue) or pvalue < 0 or pvalue > 1:
-            raise ValueError("rebalance.profitable_position_replacement.max_adf_pvalue must be in [0, 1]")
-        self.min_theoretical_zero_return_x_move = move
-        self.max_adf_pvalue = pvalue
-
+        net_return = float(self.min_net_return)
+        convergence = float(self.min_convergence_ratio)
+        if not isfinite(net_return) or net_return < 0.0:
+            raise ValueError(
+                "rebalance.profitable_position_replacement.min_net_return must be finite and non-negative"
+            )
+        if not isfinite(convergence) or convergence < 0.0 or convergence > 1.0:
+            raise ValueError(
+                "rebalance.profitable_position_replacement.min_convergence_ratio must be in [0, 1]"
+            )
+        self.min_net_return = net_return
+        self.min_convergence_ratio = convergence
 
 @dataclass
 class RebalanceCandidateQualityConfig:
@@ -210,8 +215,6 @@ class RebalanceCandidateQualityConfig:
 class RebalanceConfig:
     enabled: bool = False
     minimum_entry_capital_ratio: float = 0.5
-    closed_pair_freeze_model_lookback_multiplier: float = 0.5
-    eviction_min_holding_model_lookback_multiplier: float = 0.5
     candidate_quality: RebalanceCandidateQualityConfig = field(
         default_factory=RebalanceCandidateQualityConfig
     )
@@ -221,19 +224,9 @@ class RebalanceConfig:
 
     def __post_init__(self):
         ratio = float(self.minimum_entry_capital_ratio)
-        multiplier = float(self.closed_pair_freeze_model_lookback_multiplier)
-        holding_multiplier = float(self.eviction_min_holding_model_lookback_multiplier)
         if not isfinite(ratio) or ratio <= 0 or ratio > 1:
             raise ValueError("rebalance.minimum_entry_capital_ratio must be in (0, 1]")
-        if not isfinite(multiplier) or multiplier < 0:
-            raise ValueError("rebalance.closed_pair_freeze_model_lookback_multiplier must be non-negative")
-        if not isfinite(holding_multiplier) or holding_multiplier < 0:
-            raise ValueError(
-                "rebalance.eviction_min_holding_model_lookback_multiplier must be non-negative"
-            )
         self.minimum_entry_capital_ratio = ratio
-        self.closed_pair_freeze_model_lookback_multiplier = multiplier
-        self.eviction_min_holding_model_lookback_multiplier = holding_multiplier
 
 
 @dataclass

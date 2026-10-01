@@ -173,6 +173,15 @@ class MultiPairStrategy(BaseStrategy):
             or self.protection_cfg.max_holding_time_enabled
             or self.protection_cfg.pair_loss_stop_enabled,
         )
+        if (
+            self.rebalance_cfg.enabled
+            and self.rebalance_cfg.candidate_quality.enabled
+            and not self.frozen_model_supported
+        ):
+            raise ValueError(
+                "rebalance.candidate_quality requires a frozen Price/Log-Price model "
+                "so its ADF, zero-return boundary, and expected-return gates can be computed"
+            )
 
         for pair_def in pairs:
             if not pair_def.enabled:
@@ -271,6 +280,10 @@ class MultiPairStrategy(BaseStrategy):
         results = {}
         bundles = {}
         for pair_id, pipeline in self.pipelines.items():
+            # A convergence decision is valid only when this Pair produced a
+            # z-score on the current model bar. Never carry an older z-score
+            # into a later rebalance decision.
+            pipeline._last_zscore = None
             pair_bar_index = self._pair_bar_indices.get(pair_id, 0) + 1
             bundle = self._build_bundle(pair_id, pipeline.pair_def, bars, ts, pair_bar_index)
             if bundle is None:
@@ -456,6 +469,10 @@ class MultiPairStrategy(BaseStrategy):
                 }
             })
         signal_para = _merge_para(signal_para, {
+            "pair_position": {
+                "entry_z": signal.zscore,
+                "exit_z": signal.exit_z,
+            },
             "portfolio": {
                 "scheduled_action": decision["action"],
                 "entry_count_before": sizing_state.entry_count,
@@ -683,18 +700,11 @@ class MultiPairStrategy(BaseStrategy):
                 or old_bundle.y_bar is None
             ):
                 continue
-            ledger = old_pipeline.state.position_ledger
-            entry_bar = ledger.entry_bar_index
-            held_bars = (
-                max(0, int(old_bundle.bar_index) - int(entry_bar))
-                if entry_bar is not None else 0
-            )
             positions.append(RebalancePosition(
                 pair_id=pair_id,
                 net_return=self._pair_unrealized_return(old_pipeline, old_bundle),
+                convergence_ratio=self._pair_convergence_ratio(old_pipeline),
                 releasable_equity=self._pair_releasable_equity(old_pipeline, old_bundle),
-                held_bars=held_bars,
-                minimum_holding_bars=self._rebalance_min_holding_bars(old_pipeline),
                 payload=old_pipeline,
             ))
 
@@ -704,10 +714,21 @@ class MultiPairStrategy(BaseStrategy):
 
         rebalance_batch_id = str(uuid4())[:8]
         close_orders = []
-        prepared_pipelines = []
+        prepared_protection_states = {}
         for position in plan.evictions:
             old_pipeline = position.payload
             old_state = old_pipeline.state.sizing_state
+            protection_state = old_pipeline.state.protection_state
+            prepared_protection_states[position.pair_id] = (
+                old_pipeline,
+                (
+                    protection_state.pending_exit,
+                    protection_state.protection_rule,
+                    protection_state.freeze_rule,
+                    protection_state.freeze_bars,
+                    protection_state.freeze_until_bar,
+                ),
+            )
             pair_orders = self._close_orders(
                 position.pair_id,
                 old_pipeline,
@@ -718,15 +739,13 @@ class MultiPairStrategy(BaseStrategy):
                 exit_reason="rebalance_replacement",
                 protection_trigger="rebalance_replacement",
                 exit_class="rebalance_replacement",
-                protection_freeze_bars=self._rebalance_freeze_bars(old_pipeline),
+                protection_freeze_bars=0,
                 rebalance_batch_id=rebalance_batch_id,
             )
             if not pair_orders:
-                for prepared in prepared_pipelines:
-                    prepared.state.protection_state.pending_exit = False
+                self._restore_rebalance_protection_state(prepared_protection_states)
                 return [], None
             close_orders.extend(pair_orders)
-            prepared_pipelines.append(old_pipeline)
 
         for position in plan.evictions:
             self._pending_rebalance_pair_ids.add(position.pair_id)
@@ -746,12 +765,23 @@ class MultiPairStrategy(BaseStrategy):
             replacement_allocation is None
             or plan.candidate.pair_id not in replacement_allocation.pair_targets
         ):
-            for prepared in prepared_pipelines:
-                prepared.state.protection_state.pending_exit = False
+            self._restore_rebalance_protection_state(prepared_protection_states)
             for position in plan.evictions:
                 self._pending_rebalance_pair_ids.discard(position.pair_id)
             return [], None
         return close_orders, replacement_allocation
+
+    @staticmethod
+    def _restore_rebalance_protection_state(snapshots):
+        for pipeline, state_values in snapshots.values():
+            state = pipeline.state.protection_state
+            (
+                state.pending_exit,
+                state.protection_rule,
+                state.freeze_rule,
+                state.freeze_bars,
+                state.freeze_until_bar,
+            ) = state_values
 
     def _rebalance_candidate_from_entry(self, pair_id, candidate):
         raw = candidate.get("raw_target")
@@ -794,6 +824,27 @@ class MultiPairStrategy(BaseStrategy):
         pnl = self._pair_mark_net_pnl(pipeline, bundle)
         return float(pnl / max(ledger.entry_gross_notional, 1e-12))
 
+    def _pair_convergence_ratio(self, pipeline):
+        """Return convergence progress from the filled entry z-score to exit."""
+        ledger = pipeline.state.position_ledger
+        entry_z = ledger.entry_z
+        exit_z = ledger.exit_z
+        current_z = getattr(pipeline, "_last_zscore", None)
+        try:
+            entry = float(entry_z)
+            exit_abs = abs(float(exit_z))
+            current = float(current_z)
+        except (TypeError, ValueError):
+            return None
+        if not all(isfinite(value) for value in (entry, exit_abs, current)):
+            return None
+        entry_abs = abs(entry)
+        if entry_abs <= exit_abs + 1e-12 or entry_abs <= 1e-12:
+            return None
+        directional_distance = max(exit_abs, (1.0 if entry > 0 else -1.0) * current)
+        ratio = (entry_abs - directional_distance) / (entry_abs - exit_abs)
+        return min(1.0, max(0.0, float(ratio)))
+
     def _pair_releasable_equity(self, pipeline, bundle):
         pair_marked_equity = getattr(self, "_current_pair_marked_equity", {})
         pair_id = getattr(pipeline.pair_def, "pair_id", None)
@@ -833,36 +884,6 @@ class MultiPairStrategy(BaseStrategy):
             self.fee_rate,
             self.slippage_rate,
         ))
-
-    def _rebalance_min_holding_bars(self, pipeline) -> int:
-        multiplier = float(
-            self.rebalance_cfg.eviction_min_holding_model_lookback_multiplier
-        )
-        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
-        if lookback is None:
-            lookback = getattr(self.estimator_cfg, "model_lookback_bars", 0)
-        lookback = float(lookback or 0.0)
-        if multiplier > 0.0 and (not isfinite(lookback) or lookback <= 0.0):
-            raise ValueError(
-                "rebalance eviction holding multiplier requires a positive model lookback"
-            )
-        product = lookback * multiplier
-        if not isfinite(product) or product < 0.0:
-            raise ValueError("rebalance eviction minimum holding period is invalid")
-        return max(0, int(ceil(product)))
-
-    def _rebalance_freeze_bars(self, pipeline):
-        multiplier = float(self.rebalance_cfg.closed_pair_freeze_model_lookback_multiplier)
-        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
-        if lookback is None:
-            lookback = getattr(self.estimator_cfg, "model_lookback_bars", 0)
-        lookback = float(lookback or 0.0)
-        if multiplier > 0.0 and (not isfinite(lookback) or lookback <= 0.0):
-            raise ValueError("rebalance freeze multiplier requires a positive model lookback")
-        product = lookback * multiplier
-        if not isfinite(product) or product < 0.0:
-            raise ValueError("rebalance freeze period is invalid")
-        return max(0, int(ceil(product)))
 
     def _allocate_entry_targets(
         self,
@@ -1126,8 +1147,10 @@ class MultiPairStrategy(BaseStrategy):
         if exit_reason == "rebalance_replacement":
             protection_state.pending_exit = True
             protection_state.protection_rule = "rebalance_replacement"
-            protection_state.freeze_rule = "rebalance_replacement"
-            protection_state.freeze_bars = int(protection_freeze_bars or 0)
+            protection_state.freeze_rule = None
+            protection_state.freeze_bars = 0
+            protection_state.freeze_until_bar = None
+            protection_freeze_bars = 0
 
         close_hedge = sizing_state.target_hedge_ratio or fallback_hedge
         target = AllocatedPairTarget(
@@ -1305,6 +1328,15 @@ class MultiPairStrategy(BaseStrategy):
             ledger.position_id = sizing_state.position_id
             ledger.entry_bar_index = pipeline.state.last_bar_index + 1
             ledger.entry_ts = self._first_attr(group, "ts", None)
+            pair_position = {}
+            for fill in group:
+                fill_para = getattr(fill, "para", {}) or {}
+                if isinstance(fill_para, dict) and isinstance(fill_para.get("pair_position"), dict):
+                    pair_position = fill_para["pair_position"]
+                    if pair_position:
+                        break
+            ledger.entry_z = pair_position.get("entry_z")
+            ledger.exit_z = pair_position.get("exit_z")
             ledger.entry_x_price = None
             ledger.entry_y_price = None
             ledger.entry_x_quantity = 0.0
@@ -1389,6 +1421,8 @@ class MultiPairStrategy(BaseStrategy):
         ledger.entry_fee = 0.0
         ledger.entry_slippage = 0.0
         ledger.funding_cost = 0.0
+        ledger.entry_z = None
+        ledger.exit_z = None
 
     def _initialize_or_update_protection(self, pipeline, group, pair_side):
         if not self.protection_supported:
@@ -1661,7 +1695,10 @@ class MultiPairStrategy(BaseStrategy):
                     # bar rather than the prior signal bar.
                     protection_state.close_bar_index = pipeline.state.last_bar_index + 1
                     protection_state.protection_rule = self._first_attr(group, "protection_rule", protection_state.last_trigger)
-                    protection_state.freeze_rule = protection_state.protection_rule
+                    protection_state.freeze_rule = (
+                        None if exit_class == "rebalance_replacement"
+                        else protection_state.protection_rule
+                    )
                     protection_state.freeze_bars = int(self._first_attr(group, "protection_freeze_bars", 0) or 0)
                     if protection_state.protection_rule == "pair_equity_zero" and protection_state.freeze_bars <= 0:
                         protection_state.freeze_bars = self._forced_liquidation_freeze_bars_for_pipeline(pipeline)
