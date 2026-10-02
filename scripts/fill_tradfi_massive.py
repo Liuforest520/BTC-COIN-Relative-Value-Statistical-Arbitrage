@@ -6,7 +6,7 @@
   - 盘前盘后（时段外）默认丢弃，可用 --keep-extended 保留
   - 输出新增列 filled：1=填充值，0=原始成交
 
-输出：data/<SYMBOL>/<SYMBOL>-1m-massive-filled.csv（原始文件不动）
+输出：data/stocks/tradfi/<SYMBOL>/<SYMBOL>-1m-massive-filled.csv（原始文件不动）
 
 用法：
     python scripts/fill_tradfi_massive.py --limit 2          # 试跑 2 个标的
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT / "data" / "stocks" / "tradfi"
 SESSION_OPEN = (9, 30)
 SESSION_MINUTES = 390
 EARLY_CLOSE_MINUTES = 210

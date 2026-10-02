@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "massive_key.config"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "massive" / "stocks" / "corporate_actions" / "splits" / "splits.json"
+DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "stocks" / "corporate_actions" / "splits" / "splits.json"
 API_ENDPOINT = "https://api.massive.com/stocks/v1/splits"
 LOGGER = logging.getLogger("download_massive_splits")
 

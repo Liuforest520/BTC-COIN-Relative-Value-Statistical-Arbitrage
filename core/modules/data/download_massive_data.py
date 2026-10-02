@@ -6,9 +6,9 @@ this downloader intentionally does not accept a symbol filter.
 
 Output layout:
 
-    data/massive_stocks/
-      2025-01-01/2025-01-01.csv.gz
-      2025-01-02/2025-01-02.csv.gz
+    data/stocks/flat_files/minute_aggregates/
+      2025/01/2025-01-01.csv.gz
+      2025/01/2025-01-02.csv.gz
 
 Credentials can be supplied through config/massive_key.config, environment
 variables, command-line options, or the empty constants below. Never commit
@@ -50,7 +50,7 @@ MASSIVE_SECRET_KEY = ""
 MASSIVE_ENDPOINT = "https://files.massive.com"
 MASSIVE_BUCKET = "flatfiles"
 DEFAULT_DATASET_PREFIX = "us_stocks_sip/minute_aggs_v1"
-DEFAULT_OUTPUT_DIR = Path("data/massive_stocks")
+DEFAULT_OUTPUT_DIR = Path("data/stocks/flat_files/minute_aggregates")
 DEFAULT_CREDENTIALS_FILE = Path("config/massive_key.config")
 LOGGER = logging.getLogger("download_massive_data")
 
@@ -180,7 +180,7 @@ def _download_one_day(
     progress: str = "",
 ) -> DownloadedDay | None:
     key = _object_key(day, dataset_prefix)
-    day_dir = output_dir / f"{day:%Y-%m-%d}"
+    day_dir = output_dir / f"{day:%Y}" / f"{day:%m}"
     target = day_dir / f"{day:%Y-%m-%d}.csv.gz"
 
     if target.exists() and target.stat().st_size > 0 and not overwrite:

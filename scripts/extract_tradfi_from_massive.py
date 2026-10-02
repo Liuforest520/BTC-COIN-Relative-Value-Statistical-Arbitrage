@@ -1,6 +1,6 @@
-"""把 Massive 美股分钟数据按 tradfi 标的抽取到各自的 data/<SYMBOL>/ 文件夹。
+"""把 Massive 美股分钟数据按 tradfi 标的抽取到各自的 data/stocks/tradfi/<SYMBOL>/ 文件夹。
 
-输出：data/<SYMBOL>/<SYMBOL>-1m-massive.csv
+输出：data/stocks/tradfi/<SYMBOL>/<SYMBOL>-1m-massive.csv
   列：ticker,volume,open,close,high,low,window_start,transactions,time_utc,time_utc_plus8
   （保留 Massive 原始字段，额外附两列可读时间；与币安数据分开存放，不做合并）
 
@@ -28,8 +28,8 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "massive_stocks"
-DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "stocks" / "flat_files" / "minute_aggregates"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "stocks" / "tradfi"
 LOGGER = logging.getLogger("extract_tradfi")
 HEADER = ["ticker", "volume", "open", "close", "high", "low", "window_start",
           "transactions", "time_utc", "time_utc_plus8"]
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     LOGGER.info("  写入模式  : %s", "覆盖" if args.overwrite else "追加")
     LOGGER.info("=" * 96)
 
-    files = sorted(Path(args.input_dir).glob("*/*.csv"))
+    files = sorted(Path(args.input_dir).rglob("*.csv"))
     if args.start:
         files = [f for f in files if f.parent.name >= args.start]
     if args.end:

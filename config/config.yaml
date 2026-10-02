@@ -6,8 +6,8 @@ data:
       funding_path: data/1000SHIBUSDT/1000SHIBUSDT-funding_rate_daily.csv
     AAOIUSDT:
       exchange: binance
-      path: data/AAOIUSDT/AAOIUSDT-1m.csv
-      funding_path: data/AAOIUSDT/AAOIUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/AAOIUSDT/AAOIUSDT-1m.csv
+      funding_path: data/stocks/tradfi/AAOIUSDT/AAOIUSDT-funding_rate_daily.csv
     AAVEUSDT:
       exchange: binance
       path: data/AAVEUSDT/AAVEUSDT-1m.csv
@@ -30,12 +30,12 @@ data:
       funding_path: data/ALICEUSDT/ALICEUSDT-funding_rate_daily.csv
     AMATUSDT:
       exchange: binance
-      path: data/AMATUSDT/AMATUSDT-1m.csv
-      funding_path: data/AMATUSDT/AMATUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/AMATUSDT/AMATUSDT-1m.csv
+      funding_path: data/stocks/tradfi/AMATUSDT/AMATUSDT-funding_rate_daily.csv
     AMDUSDT:
       exchange: binance
-      path: data/AMDUSDT/AMDUSDT-1m.csv
-      funding_path: data/AMDUSDT/AMDUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/AMDUSDT/AMDUSDT-1m.csv
+      funding_path: data/stocks/tradfi/AMDUSDT/AMDUSDT-funding_rate_daily.csv
     ANTHROPICUSDT:
       exchange: binance
       path: data/ANTHROPICUSDT/ANTHROPICUSDT-1m.csv
@@ -54,8 +54,8 @@ data:
       funding_path: data/ARBUSDT/ARBUSDT-funding_rate_daily.csv
     ARMUSDT:
       exchange: binance
-      path: data/ARMUSDT/ARMUSDT-1m.csv
-      funding_path: data/ARMUSDT/ARMUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/ARMUSDT/ARMUSDT-1m.csv
+      funding_path: data/stocks/tradfi/ARMUSDT/ARMUSDT-funding_rate_daily.csv
     ARUSDT:
       exchange: binance
       path: data/ARUSDT/ARUSDT-1m.csv
@@ -70,16 +70,16 @@ data:
       funding_path: data/AVAXUSDT/AVAXUSDT-funding_rate_daily.csv
     AVGOUSDT:
       exchange: binance
-      path: data/AVGOUSDT/AVGOUSDT-1m.csv
-      funding_path: data/AVGOUSDT/AVGOUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/AVGOUSDT/AVGOUSDT-1m.csv
+      funding_path: data/stocks/tradfi/AVGOUSDT/AVGOUSDT-funding_rate_daily.csv
     BABYUSDT:
       exchange: binance
       path: data/BABYUSDT/BABYUSDT-1m.csv
       funding_path: data/BABYUSDT/BABYUSDT-funding_rate_daily.csv
     BEUSDT:
       exchange: binance
-      path: data/BEUSDT/BEUSDT-1m.csv
-      funding_path: data/BEUSDT/BEUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/BEUSDT/BEUSDT-1m.csv
+      funding_path: data/stocks/tradfi/BEUSDT/BEUSDT-funding_rate_daily.csv
     BICOUSDT:
       exchange: binance
       path: data/BICOUSDT/BICOUSDT-1m.csv
@@ -94,28 +94,28 @@ data:
       funding_path: data/BNBUSDT/BNBUSDT-funding_rate_daily.csv
     BTCUSDT:
       exchange: binance
-      path: data/BTCUSDT/BTCUSDT-1m.csv
-      funding_path: data/BTCUSDT/BTCUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/BTCUSDT/BTCUSDT-1m.csv
+      funding_path: data/stocks/tradfi/BTCUSDT/BTCUSDT-funding_rate_daily.csv
     COHRUSDT:
       exchange: binance
-      path: data/COHRUSDT/COHRUSDT-1m.csv
-      funding_path: data/COHRUSDT/COHRUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/COHRUSDT/COHRUSDT-1m.csv
+      funding_path: data/stocks/tradfi/COHRUSDT/COHRUSDT-funding_rate_daily.csv
     COINUSDT:
       exchange: binance
-      path: data/COINUSDT/COINUSDT-1m.csv
-      funding_path: data/COINUSDT/COINUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/COINUSDT/COINUSDT-1m.csv
+      funding_path: data/stocks/tradfi/COINUSDT/COINUSDT-funding_rate_daily.csv
     CRCLUSDT:
       exchange: binance
-      path: data/CRCLUSDT/CRCLUSDT-1m.csv
-      funding_path: data/CRCLUSDT/CRCLUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/CRCLUSDT/CRCLUSDT-1m.csv
+      funding_path: data/stocks/tradfi/CRCLUSDT/CRCLUSDT-funding_rate_daily.csv
     CRVUSDT:
       exchange: binance
       path: data/CRVUSDT/CRVUSDT-1m.csv
       funding_path: data/CRVUSDT/CRVUSDT-funding_rate_daily.csv
     CRWVUSDT:
       exchange: binance
-      path: data/CRWVUSDT/CRWVUSDT-1m.csv
-      funding_path: data/CRWVUSDT/CRWVUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/CRWVUSDT/CRWVUSDT-1m.csv
+      funding_path: data/stocks/tradfi/CRWVUSDT/CRWVUSDT-funding_rate_daily.csv
     DASHUSDT:
       exchange: binance
       path: data/DASHUSDT/DASHUSDT-1m.csv
@@ -126,8 +126,8 @@ data:
       funding_path: data/DOTUSDT/DOTUSDT-funding_rate_daily.csv
     DRAMUSDT:
       exchange: binance
-      path: data/DRAMUSDT/DRAMUSDT-1m.csv
-      funding_path: data/DRAMUSDT/DRAMUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/DRAMUSDT/DRAMUSDT-1m.csv
+      funding_path: data/stocks/tradfi/DRAMUSDT/DRAMUSDT-funding_rate_daily.csv
     DYDXUSDT:
       exchange: binance
       path: data/DYDXUSDT/DYDXUSDT-1m.csv
@@ -138,16 +138,16 @@ data:
       funding_path: data/EIGENUSDT/EIGENUSDT-funding_rate_daily.csv
     EWJUSDT:
       exchange: binance
-      path: data/EWJUSDT/EWJUSDT-1m.csv
-      funding_path: data/EWJUSDT/EWJUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/EWJUSDT/EWJUSDT-1m.csv
+      funding_path: data/stocks/tradfi/EWJUSDT/EWJUSDT-funding_rate_daily.csv
     EWTUSDT:
       exchange: binance
-      path: data/EWTUSDT/EWTUSDT-1m.csv
-      funding_path: data/EWTUSDT/EWTUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/EWTUSDT/EWTUSDT-1m.csv
+      funding_path: data/stocks/tradfi/EWTUSDT/EWTUSDT-funding_rate_daily.csv
     EWYUSDT:
       exchange: binance
-      path: data/EWYUSDT/EWYUSDT-1m.csv
-      funding_path: data/EWYUSDT/EWYUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/EWYUSDT/EWYUSDT-1m.csv
+      funding_path: data/stocks/tradfi/EWYUSDT/EWYUSDT-funding_rate_daily.csv
     FETUSDT:
       exchange: binance
       path: data/FETUSDT/FETUSDT-1m.csv
@@ -162,8 +162,8 @@ data:
       funding_path: data/GALAUSDT/GALAUSDT-funding_rate_daily.csv
     GLWUSDT:
       exchange: binance
-      path: data/GLWUSDT/GLWUSDT-1m.csv
-      funding_path: data/GLWUSDT/GLWUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/GLWUSDT/GLWUSDT-1m.csv
+      funding_path: data/stocks/tradfi/GLWUSDT/GLWUSDT-funding_rate_daily.csv
     HBARUSDT:
       exchange: binance
       path: data/HBARUSDT/HBARUSDT-1m.csv
@@ -182,60 +182,60 @@ data:
       funding_path: data/ICPUSDT/ICPUSDT-funding_rate_daily.csv
     INTCUSDT:
       exchange: binance
-      path: data/INTCUSDT/INTCUSDT-1m.csv
-      funding_path: data/INTCUSDT/INTCUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/INTCUSDT/INTCUSDT-1m.csv
+      funding_path: data/stocks/tradfi/INTCUSDT/INTCUSDT-funding_rate_daily.csv
     IRENUSDT:
       exchange: binance
-      path: data/IRENUSDT/IRENUSDT-1m.csv
-      funding_path: data/IRENUSDT/IRENUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/IRENUSDT/IRENUSDT-1m.csv
+      funding_path: data/stocks/tradfi/IRENUSDT/IRENUSDT-funding_rate_daily.csv
     JTOUSDT:
       exchange: binance
       path: data/JTOUSDT/JTOUSDT-1m.csv
       funding_path: data/JTOUSDT/JTOUSDT-funding_rate_daily.csv
     KORUUSDT:
       exchange: binance
-      path: data/KORUUSDT/KORUUSDT-1m.csv
-      funding_path: data/KORUUSDT/KORUUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/KORUUSDT/KORUUSDT-1m.csv
+      funding_path: data/stocks/tradfi/KORUUSDT/KORUUSDT-funding_rate_daily.csv
     LDOUSDT:
       exchange: binance
       path: data/LDOUSDT/LDOUSDT-1m.csv
       funding_path: data/LDOUSDT/LDOUSDT-funding_rate_daily.csv
     LITEUSDT:
       exchange: binance
-      path: data/LITEUSDT/LITEUSDT-1m.csv
-      funding_path: data/LITEUSDT/LITEUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/LITEUSDT/LITEUSDT-1m.csv
+      funding_path: data/stocks/tradfi/LITEUSDT/LITEUSDT-funding_rate_daily.csv
     LTCUSDT:
       exchange: binance
       path: data/LTCUSDT/LTCUSDT-1m.csv
       funding_path: data/LTCUSDT/LTCUSDT-funding_rate_daily.csv
     MRVLUSDT:
       exchange: binance
-      path: data/MRVLUSDT/MRVLUSDT-1m.csv
-      funding_path: data/MRVLUSDT/MRVLUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/MRVLUSDT/MRVLUSDT-1m.csv
+      funding_path: data/stocks/tradfi/MRVLUSDT/MRVLUSDT-funding_rate_daily.csv
     MSTRUSDT:
       exchange: binance
-      path: data/MSTRUSDT/MSTRUSDT-1m.csv
-      funding_path: data/MSTRUSDT/MSTRUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/MSTRUSDT/MSTRUSDT-1m.csv
+      funding_path: data/stocks/tradfi/MSTRUSDT/MSTRUSDT-funding_rate_daily.csv
     MUUSDT:
       exchange: binance
-      path: data/MUUSDT/MUUSDT-1m.csv
-      funding_path: data/MUUSDT/MUUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/MUUSDT/MUUSDT-1m.csv
+      funding_path: data/stocks/tradfi/MUUSDT/MUUSDT-funding_rate_daily.csv
     NBISUSDT:
       exchange: binance
-      path: data/NBISUSDT/NBISUSDT-1m.csv
-      funding_path: data/NBISUSDT/NBISUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/NBISUSDT/NBISUSDT-1m.csv
+      funding_path: data/stocks/tradfi/NBISUSDT/NBISUSDT-funding_rate_daily.csv
     NFPUSDT:
       exchange: binance
       path: data/NFPUSDT/NFPUSDT-1m.csv
       funding_path: data/NFPUSDT/NFPUSDT-funding_rate_daily.csv
     NOKUSDT:
       exchange: binance
-      path: data/NOKUSDT/NOKUSDT-1m.csv
-      funding_path: data/NOKUSDT/NOKUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/NOKUSDT/NOKUSDT-1m.csv
+      funding_path: data/stocks/tradfi/NOKUSDT/NOKUSDT-funding_rate_daily.csv
     NVDAUSDT:
       exchange: binance
-      path: data/NVDAUSDT/NVDAUSDT-1m.csv
-      funding_path: data/NVDAUSDT/NVDAUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/NVDAUSDT/NVDAUSDT-1m.csv
+      funding_path: data/stocks/tradfi/NVDAUSDT/NVDAUSDT-funding_rate_daily.csv
     OPENAIUSDT:
       exchange: binance
       path: data/OPENAIUSDT/OPENAIUSDT-1m.csv
@@ -246,8 +246,8 @@ data:
       funding_path: data/OPUSDT/OPUSDT-funding_rate_daily.csv
     ORCLUSDT:
       exchange: binance
-      path: data/ORCLUSDT/ORCLUSDT-1m.csv
-      funding_path: data/ORCLUSDT/ORCLUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/ORCLUSDT/ORCLUSDT-1m.csv
+      funding_path: data/stocks/tradfi/ORCLUSDT/ORCLUSDT-funding_rate_daily.csv
     ORDIUSDT:
       exchange: binance
       path: data/ORDIUSDT/ORDIUSDT-1m.csv
@@ -258,8 +258,8 @@ data:
       funding_path: data/PHAUSDT/PHAUSDT-funding_rate_daily.csv
     PLTRUSDT:
       exchange: binance
-      path: data/PLTRUSDT/PLTRUSDT-1m.csv
-      funding_path: data/PLTRUSDT/PLTRUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/PLTRUSDT/PLTRUSDT-1m.csv
+      funding_path: data/stocks/tradfi/PLTRUSDT/PLTRUSDT-funding_rate_daily.csv
     POLUSDT:
       exchange: binance
       path: data/POLUSDT/POLUSDT-1m.csv
@@ -274,16 +274,16 @@ data:
       funding_path: data/PYTHUSDT/PYTHUSDT-funding_rate_daily.csv
     QCOMUSDT:
       exchange: binance
-      path: data/QCOMUSDT/QCOMUSDT-1m.csv
-      funding_path: data/QCOMUSDT/QCOMUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/QCOMUSDT/QCOMUSDT-1m.csv
+      funding_path: data/stocks/tradfi/QCOMUSDT/QCOMUSDT-funding_rate_daily.csv
     RENDERUSDT:
       exchange: binance
       path: data/RENDERUSDT/RENDERUSDT-1m.csv
       funding_path: data/RENDERUSDT/RENDERUSDT-funding_rate_daily.csv
     RKLBUSDT:
       exchange: binance
-      path: data/RKLBUSDT/RKLBUSDT-1m.csv
-      funding_path: data/RKLBUSDT/RKLBUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/RKLBUSDT/RKLBUSDT-1m.csv
+      funding_path: data/stocks/tradfi/RKLBUSDT/RKLBUSDT-funding_rate_daily.csv
     SAMSUNGUSDT:
       exchange: binance
       path: data/SAMSUNGUSDT/SAMSUNGUSDT-1m.csv
@@ -302,16 +302,16 @@ data:
       funding_path: data/SKHYNIXUSDT/SKHYNIXUSDT-funding_rate_daily.csv
     SNDKUSDT:
       exchange: binance
-      path: data/SNDKUSDT/SNDKUSDT-1m.csv
-      funding_path: data/SNDKUSDT/SNDKUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/SNDKUSDT/SNDKUSDT-1m.csv
+      funding_path: data/stocks/tradfi/SNDKUSDT/SNDKUSDT-funding_rate_daily.csv
     SOLUSDT:
       exchange: binance
       path: data/SOLUSDT/SOLUSDT-1m.csv
       funding_path: data/SOLUSDT/SOLUSDT-funding_rate_daily.csv
     SOXLUSDT:
       exchange: binance
-      path: data/SOXLUSDT/SOXLUSDT-1m.csv
-      funding_path: data/SOXLUSDT/SOXLUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/SOXLUSDT/SOXLUSDT-1m.csv
+      funding_path: data/stocks/tradfi/SOXLUSDT/SOXLUSDT-funding_rate_daily.csv
     STRKUSDT:
       exchange: binance
       path: data/STRKUSDT/STRKUSDT-1m.csv
@@ -326,12 +326,12 @@ data:
       funding_path: data/TNSRUSDT/TNSRUSDT-funding_rate_daily.csv
     TSLAUSDT:
       exchange: binance
-      path: data/TSLAUSDT/TSLAUSDT-1m.csv
-      funding_path: data/TSLAUSDT/TSLAUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/TSLAUSDT/TSLAUSDT-1m.csv
+      funding_path: data/stocks/tradfi/TSLAUSDT/TSLAUSDT-funding_rate_daily.csv
     TSMUSDT:
       exchange: binance
-      path: data/TSMUSDT/TSMUSDT-1m.csv
-      funding_path: data/TSMUSDT/TSMUSDT-funding_rate_daily.csv
+      path: data/stocks/tradfi/TSMUSDT/TSMUSDT-1m.csv
+      funding_path: data/stocks/tradfi/TSMUSDT/TSMUSDT-funding_rate_daily.csv
     UNIUSDT:
       exchange: binance
       path: data/UNIUSDT/UNIUSDT-1m.csv

@@ -2,7 +2,7 @@
 
 Input layout (written by scripts/download_massive_data.py):
 
-    data/massive_stocks/2021-09-28/2021-09-28.csv.gz
+    data/stocks/flat_files/minute_aggregates/2021/09/2021-09-28.csv.gz
 
 Usage:
 
@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "massive_stocks"
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "stocks" / "flat_files" / "minute_aggregates"
 LOGGER = logging.getLogger("extract_massive_data")
 PROGRESS_EVERY = 25
 BUFFER = 8 * 1024 * 1024
@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     input_dir = Path(args.input_dir)
 
     if args.clean:
-        plains = sorted(list(input_dir.glob("*/*.csv")) + list(input_dir.glob("*/*.csv.part")))
+        plains = sorted(list(input_dir.rglob("*.csv")) + list(input_dir.rglob("*.csv.part")))
         if args.start:
             plains = [p for p in plains if p.parent.name >= args.start]
         if args.end:
@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.info("清理结束：删除 %d 个，失败 %d，释放 %s", removed, failed, _format_bytes(freed))
         return 1 if failed else 0
 
-    archives = sorted(input_dir.glob("*/*.csv.gz"))
+    archives = sorted(input_dir.rglob("*.csv.gz"))
     if args.start:
         archives = [a for a in archives if a.parent.name >= args.start]
     if args.end:

@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SPLITS = PROJECT_ROOT / "data" / "corporate_actions" / "splits.json"
-DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "tradfi"
+DEFAULT_SPLITS = PROJECT_ROOT / "data" / "stocks" / "corporate_actions" / "splits" / "splits.json"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "stocks" / "tradfi"
 DEFAULT_RESEARCH_DIR = PROJECT_ROOT / "research" / f"split_adjustment_{date.today():%Y%m%d}"
 LOGGER = logging.getLogger("apply_tradfi_split_adjustment")
 

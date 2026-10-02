@@ -27,7 +27,7 @@ from pathlib import Path
 import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "massive_stocks"
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "stocks" / "flat_files" / "minute_aggregates"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "reports" / "massive_data_check"
 EXPECTED_MINUTES = 390
 LOGGER = logging.getLogger("check_massive_data")
@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input_dir)
-    files = sorted(input_dir.glob("*/*.csv"))
+    files = sorted(input_dir.rglob("*.csv"))
     if args.start:
         files = [f for f in files if f.parent.name >= args.start]
     if args.end:

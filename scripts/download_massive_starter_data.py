@@ -1,6 +1,6 @@
 """Download all bulk-downloadable datasets available in Massive Stocks Starter.
 
-The script keeps each dataset in its own directory under data/massive/stocks:
+The script keeps each dataset in its own directory under data/stocks:
 
     flat_files/day_aggregates/YYYY/MM/YYYY-MM-DD.csv.gz
     flat_files/minute_aggregates/YYYY/MM/YYYY-MM-DD.csv.gz
@@ -53,7 +53,7 @@ else:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "massive_key.config"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "massive" / "stocks"
+DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "stocks"
 MASSIVE_ENDPOINT = "https://api.massive.com"
 FILES_ENDPOINT = "https://files.massive.com"
 FILES_BUCKET = "flatfiles"

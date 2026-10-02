@@ -1,4 +1,4 @@
-"""检查抽取出来的 tradfi 分钟数据质量（data/<SYMBOL>/<SYMBOL>-1m-massive.csv）。
+"""检查抽取出来的 tradfi 分钟数据质量（data/stocks/tradfi/<SYMBOL>/<SYMBOL>-1m-massive.csv）。
 
 检查项：
   1) 常规交易时段内缺分钟：每天应为 390 分钟（美东 09:30-15:59），逐标的比对，
@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT / "data" / "stocks" / "tradfi"
 OUT_DIR = PROJECT_ROOT / "reports" / "tradfi_massive_check"
 LOGGER = logging.getLogger("check_tradfi")
 SESSION_OPEN = (9, 30)
@@ -341,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             w.writerows(rows)
         written_files += 1
         LOGGER.info("  缺失清单 %-14s %6d 行 -> %s", symbol, len(rows), target.resolve())
-    LOGGER.info("  已写出 %d 个标的的缺失清单（data/<SYMBOL>/<SYMBOL>-1m-massive-missing.csv）", written_files)
+    LOGGER.info("  已写出 %d 个标的的缺失清单（data/stocks/tradfi/<SYMBOL>/<SYMBOL>-1m-massive-missing.csv）", written_files)
 
     gap_path = out_dir / "missing_minutes.csv"
     with gap_path.open("w", newline="", encoding="utf-8") as fh:

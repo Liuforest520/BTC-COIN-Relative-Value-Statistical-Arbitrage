@@ -217,6 +217,7 @@ class MultiPairStrategy(BaseStrategy):
         self._pair_bar_indices: dict[str, int] = {}
         self._pending_open_pair_ids: set[str] = set()
         self._pending_rebalance_pair_ids: set[str] = set()
+        self._quality_diagnostic_warned_pairs: set[str] = set()
 
         self.signal = self
         self.last_state: dict[str, Any] = {}
@@ -516,9 +517,12 @@ class MultiPairStrategy(BaseStrategy):
             self.protection_supported or self.rebalance_cfg.enabled
         ):
             try:
-                estimated_entry_cost = (
-                    abs(raw_target.x_notional) + abs(raw_target.y_notional)
-                ) * (self.fee_rate + self.slippage_rate)
+                quality_x_quantity, quality_y_quantity, quality_gross = (
+                    self._quality_sizing_inputs(raw_target, pair_def, bundle)
+                )
+                estimated_entry_cost = quality_gross * (
+                    self.fee_rate + self.slippage_rate
+                )
                 boundary = solve_zero_net_x_price(
                     self.estimator_cfg.regression_method,
                     result.estimator.alpha,
@@ -529,8 +533,8 @@ class MultiPairStrategy(BaseStrategy):
                     signal.side,
                     bundle.x_bar.close,
                     bundle.y_bar.close,
-                    raw_target.x_quantity,
-                    raw_target.y_quantity,
+                    quality_x_quantity,
+                    quality_y_quantity,
                     estimated_entry_cost,
                     self.fee_rate,
                     self.slippage_rate,
@@ -550,13 +554,13 @@ class MultiPairStrategy(BaseStrategy):
                         bundle.x_bar.close,
                         bundle.y_bar.close,
                         signal.side,
-                        raw_target.x_quantity,
-                        raw_target.y_quantity,
+                        quality_x_quantity,
+                        quality_y_quantity,
                         estimated_entry_cost,
                         self.fee_rate,
                         self.slippage_rate,
                     )
-                    gross = abs(raw_target.x_notional) + abs(raw_target.y_notional)
+                    gross = quality_gross
                     if expected_net_pnl is not None and gross > 1e-12:
                         expected_net_return = float(expected_net_pnl) / gross
                 quality = {
@@ -577,8 +581,14 @@ class MultiPairStrategy(BaseStrategy):
                         "theoretical_zero_return_x_direction": boundary.trigger_direction,
                         "theoretical_zero_return_reason": boundary.reason,
                     }})
-            except (TypeError, ValueError, OverflowError):
-                pass
+            except (TypeError, ValueError, OverflowError) as exc:
+                if pair_id not in self._quality_diagnostic_warned_pairs:
+                    logger.warning(
+                        "rebalance quality calculation failed for pair={} reason={} ",
+                        pair_id,
+                        exc,
+                    )
+                    self._quality_diagnostic_warned_pairs.add(pair_id)
         raw_target.para = _merge_para(raw_target.para, signal_para)
         raw_target.reason = f"{raw_target.reason}; scheduled_{decision['action']}"
         result.raw_target = raw_target
@@ -816,6 +826,75 @@ class MultiPairStrategy(BaseStrategy):
             ),
             payload=candidate,
         )
+
+    def _quality_sizing_inputs(self, raw_target, pair_def, bundle):
+        """Return valid hypothetical sizing inputs for quality-only math.
+
+        Candidate quality is evaluated before portfolio allocation.  Sizing
+        implementations may therefore leave quantities at zero even though
+        the target notional and leg weights are known.  Construct quantities
+        for the quality calculation only; the order allocation still uses the
+        original RawPairTarget and exchange sizing path.
+        """
+        x_price = self._finite_positive(
+            getattr(raw_target, "x_price", None),
+            getattr(bundle.x_bar, "close", None),
+        )
+        y_price = self._finite_positive(
+            getattr(raw_target, "y_price", None),
+            getattr(bundle.y_bar, "close", None),
+        )
+        x_quantity = self._finite_positive(getattr(raw_target, "x_quantity", None))
+        y_quantity = self._finite_positive(getattr(raw_target, "y_quantity", None))
+        gross = self._finite_positive(getattr(raw_target, "gross_notional", None))
+        if gross is None:
+            gross = self._finite_positive(
+                abs(float(getattr(raw_target, "x_notional", 0.0) or 0.0))
+                + abs(float(getattr(raw_target, "y_notional", 0.0) or 0.0))
+            )
+        if gross is None:
+            gross = self._finite_positive(getattr(pair_def, "target_capital", None))
+
+        if x_price is None or y_price is None or gross is None:
+            raise ValueError(
+                "quality sizing requires positive x/y prices and gross notional"
+            )
+
+        if x_quantity is None or y_quantity is None:
+            x_weight = self._finite_positive(getattr(raw_target, "x_weight", None))
+            y_weight = self._finite_positive(getattr(raw_target, "y_weight", None))
+            if x_weight is None or y_weight is None:
+                x_notional = self._finite_positive(
+                    abs(float(getattr(raw_target, "x_notional", 0.0) or 0.0))
+                )
+                y_notional = self._finite_positive(
+                    abs(float(getattr(raw_target, "y_notional", 0.0) or 0.0))
+                )
+                if x_notional is not None and y_notional is not None:
+                    x_weight, y_weight = x_notional / gross, y_notional / gross
+                else:
+                    x_weight = y_weight = 0.5
+            weight_total = x_weight + y_weight
+            if not isfinite(weight_total) or weight_total <= 0:
+                x_weight = y_weight = 0.5
+                weight_total = 1.0
+            x_quantity = gross * x_weight / weight_total / x_price
+            y_quantity = gross * y_weight / weight_total / y_price
+
+        if x_quantity <= 0 or y_quantity <= 0:
+            raise ValueError("quality sizing produced non-positive leg quantity")
+        return float(x_quantity), float(y_quantity), float(gross)
+
+    @staticmethod
+    def _finite_positive(value, fallback=None):
+        for candidate in (value, fallback):
+            try:
+                parsed = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isfinite(parsed) and parsed > 0:
+                return parsed
+        return None
 
     def _pair_unrealized_return(self, pipeline, bundle):
         ledger = pipeline.state.position_ledger
