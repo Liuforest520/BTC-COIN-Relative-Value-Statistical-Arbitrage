@@ -32,9 +32,13 @@ def main():
     for experiment in sweep["experiments"]:
         name = experiment["name"]
         active_setup = experiment["active_setup"]
+        active_market = experiment.get("active_market", base_config.get("active_market"))
+        if active_market is not None:
+            active_market = str(active_market).strip().lower()
         params = experiment.get("params", {})
 
         validate_active_setup(base_config, active_setup)
+        validate_active_market(base_config, active_setup, active_market)
         validate_params(params)
         param_names = list(params)
         combinations = list(product(*(params[item] for item in param_names))) if param_names else [()]
@@ -42,12 +46,16 @@ def main():
         for values in combinations:
             config = deepcopy(base_config)
             config["active_setup"] = active_setup
+            if active_market is not None:
+                config["active_market"] = active_market
 
             row = {
                 "config_id": f"{config_id:06d}",
                 "experiment_name": name,
                 "active_setup": active_setup,
             }
+            if active_market is not None:
+                row["active_market"] = active_market
 
             for key, value in zip(param_names, values):
                 set_by_path(config, key, value)
@@ -121,6 +129,23 @@ def validate_active_setup(config, active_setup):
     if active_setup not in setups:
         available = ", ".join(setups)
         raise ValueError(f"active_setup {active_setup!r} not found, available: {available}")
+
+
+def validate_active_market(config, active_setup, active_market):
+    if active_market is None:
+        return
+    active_market = str(active_market).strip().lower()
+    if str(active_market).lower() not in {"crypto", "tradfi"}:
+        raise ValueError("active_market must be crypto or tradfi")
+    setup = (config.get("setups") or {}).get(active_setup) or {}
+    if active_market is not None and "markets" not in setup:
+        raise ValueError(
+            f"setup {active_setup!r} has no markets block for active_market={active_market!r}"
+        )
+    if "markets" in setup and active_market not in (setup.get("markets") or {}):
+        raise ValueError(
+            f"setup {active_setup!r} does not define active_market {active_market!r}"
+        )
 
 
 def validate_params(params):

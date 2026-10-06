@@ -26,6 +26,8 @@ from pathlib import Path
 import polars as pl
 import yaml
 
+from core.modules.config import select_market_view
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.yaml"
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "stocks" / "flat_files" / "minute_aggregates"
@@ -44,10 +46,16 @@ def _fmt_dur(seconds: float) -> str:
 
 def _tradfi_symbols(config_path: Path) -> tuple[list[str], dict[str, str]]:
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    setup = cfg["setups"][cfg["active_setup"]]
+    raw_setup = (cfg.get("setups") or {}).get(cfg.get("active_setup"), {}) or {}
+    if "markets" in raw_setup:
+        setup = select_market_view(cfg, market="tradfi")
+        tradfi_only = False
+    else:
+        setup = select_market_view(cfg)
+        tradfi_only = True
     symbols: list[str] = []
     for pair in setup["pairs"]:
-        if "tradfi" not in (pair.get("tags") or []):
+        if tradfi_only and "tradfi" not in (pair.get("tags") or []):
             continue
         for key in ("x_symbol", "y_symbol"):
             sym = pair.get(key)

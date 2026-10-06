@@ -164,6 +164,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_manifest(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        LOGGER.warning("cannot read existing manifest {}; rebuilding it", path)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _existing_output_entry(output_path: Path, symbol: str) -> dict:
+    entry = {
+        "symbol": symbol,
+        "output_path": str(output_path),
+        "status": "existing_untracked",
+    }
+    try:
+        frame = pd.read_csv(output_path, usecols=["open_time"])
+        timestamps = pd.to_numeric(frame["open_time"], errors="coerce").dropna()
+        entry["output_rows"] = int(len(timestamps))
+        if len(timestamps):
+            entry["output_first_open_time"] = int(timestamps.min())
+            entry["output_last_open_time"] = int(timestamps.max())
+    except (OSError, ValueError, TypeError, pd.errors.ParserError):
+        entry["output_rows"] = None
+    return entry
+
+
+def _write_manifest(path: Path, manifest: dict, entries: dict[str, dict]) -> None:
+    manifest["symbols"] = [entries[key] for key in sorted(entries)]
+    manifest["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -180,42 +217,70 @@ def main(argv: list[str] | None = None) -> int:
     if not symbols:
         parser.error("no matching symbols found")
 
-    manifest = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.output_dir / "manifest.json"
+    manifest = _load_manifest(manifest_path)
+    manifest.setdefault("created_at_utc", datetime.now(timezone.utc).isoformat())
+    manifest.update({
         "stock_dir": str(args.stock_dir),
         "contract_dir": str(args.contract_dir),
         "cutover_rule": "stock rows strictly before earliest contract open_time; contract rows from cutover onward",
-        "symbols": [],
+    })
+    entries = {
+        str(item.get("symbol")): dict(item)
+        for item in (manifest.get("symbols") or [])
+        if isinstance(item, dict) and item.get("symbol")
     }
+    for symbol, entry in list(entries.items()):
+        recorded_path = Path(str(entry.get("output_path", "")))
+        if not recorded_path.is_absolute():
+            recorded_path = Path(__file__).resolve().parents[1] / recorded_path
+        if not recorded_path.exists():
+            del entries[symbol]
+    for output_path in args.output_dir.glob("*/*-1m-extended.csv"):
+        symbol = output_path.parent.name
+        if symbol not in entries:
+            entries[symbol] = _existing_output_entry(output_path, symbol)
+
+    def persist_manifest() -> None:
+        _write_manifest(manifest_path, manifest, entries)
+
     failures = 0
-    for symbol in sorted(symbols):
-        stock_path = _stock_file(args.stock_dir, symbol)
-        contract_path = _contract_file(args.contract_dir, symbol)
-        if stock_path is None or contract_path is None:
-            LOGGER.warning("%s: missing stock or contract file; skipped", symbol)
-            continue
-        output_path = args.output_dir / symbol / f"{symbol}-1m-extended.csv"
-        if output_path.exists() and not args.overwrite:
-            LOGGER.info("%s: output exists, skipped", symbol)
-            continue
-        try:
-            stats = extend_symbol(stock_path, contract_path, output_path, symbol)
-            manifest["symbols"].append(stats)
-            LOGGER.info(
-                "%s: stock_prefix=%d contract=%d output=%d cutover=%s -> %s",
-                symbol, stats["stock_rows_before_cutover"], stats["contract_rows"],
-                stats["output_rows"],
-                datetime.fromtimestamp(stats["first_contract_open_time"] / 1000, tz=timezone.utc).isoformat(),
-                output_path,
-            )
-        except (OSError, ValueError, pd.errors.ParserError) as exc:
-            failures += 1
-            LOGGER.error("%s: failed: %s", symbol, exc)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    LOGGER.info("complete: symbols=%d failures=%d", len(manifest["symbols"]), failures)
+    try:
+        for symbol in sorted(symbols):
+            stock_path = _stock_file(args.stock_dir, symbol)
+            contract_path = _contract_file(args.contract_dir, symbol)
+            output_path = args.output_dir / symbol / f"{symbol}-1m-extended.csv"
+            if stock_path is None or contract_path is None:
+                LOGGER.warning("%s: missing stock or contract file; skipped", symbol)
+                if output_path.exists() and symbol not in entries:
+                    entries[symbol] = _existing_output_entry(output_path, symbol)
+                persist_manifest()
+                continue
+            if output_path.exists() and not args.overwrite:
+                LOGGER.info("%s: output exists, skipped", symbol)
+                entries.setdefault(symbol, _existing_output_entry(output_path, symbol))
+                persist_manifest()
+                continue
+            try:
+                stats = extend_symbol(stock_path, contract_path, output_path, symbol)
+                stats["status"] = "generated"
+                entries[symbol] = stats
+                LOGGER.info(
+                    "%s: stock_prefix=%d contract=%d output=%d cutover=%s -> %s",
+                    symbol, stats["stock_rows_before_cutover"], stats["contract_rows"],
+                    stats["output_rows"],
+                    datetime.fromtimestamp(stats["first_contract_open_time"] / 1000, tz=timezone.utc).isoformat(),
+                    output_path,
+                )
+                persist_manifest()
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                failures += 1
+                LOGGER.error("%s: failed: %s", symbol, exc)
+                persist_manifest()
+    finally:
+        persist_manifest()
+    LOGGER.info("complete: symbols=%d failures=%d", len(entries), failures)
     return 1 if failures else 0
 
 

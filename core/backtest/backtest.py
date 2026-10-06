@@ -48,6 +48,17 @@ class Backtest:
         progress_interval_bars: int = 100_000,
     ):
         self.config = config
+        estimator_cfg = self.config.strategy.pipeline.get("estimator", {}) or {}
+        logger.info(
+            "backtest config: active_market={} active_setup={} pair_count={} "
+            "model_timeframe={} model_lookback_bars={} model_update_interval_bars={}",
+            self.config.active_market,
+            self.config.active_setup,
+            len(self.config.strategy.pairs),
+            estimator_cfg.get("model_timeframe", "1m"),
+            estimator_cfg.get("model_lookback_bars"),
+            estimator_cfg.get("model_update_interval_bars"),
+        )
         self.strategy = strategy or self._build_strategy()
         # Backtest market iterators already normalize and validate every bar.
         # Keep BaseStrategy validation enabled for direct callers, but avoid

@@ -26,6 +26,9 @@ EXCLUDED_PAIR_IDS = {
 def model_freeze_multiplier(config: dict) -> float:
     setup_name = config.get("active_setup", "multi_pair_beta")
     setup = config["setups"][setup_name]
+    market = str(config.get("active_market", "")).strip().lower()
+    if market:
+        setup = (setup.get("markets") or {}).get(market) or {}
     lookback = float((setup.get("estimator", {}) or {}).get("model_lookback_bars", 0) or 0)
     if lookback == 2 * 24 * 60:
         return 5.0
@@ -42,6 +45,9 @@ def main() -> None:
         config = yaml.safe_load(source.read_text(encoding="utf-8"))
         setup_name = config.get("active_setup", "multi_pair_beta")
         setup = config["setups"][setup_name]
+        market = str(config.get("active_market", "")).strip().lower()
+        if market:
+            setup = (setup.get("markets") or {}).get(market) or {}
         original_pairs = setup.get("pairs", []) or []
         setup["pairs"] = [
             pair for pair in original_pairs

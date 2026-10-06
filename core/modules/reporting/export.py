@@ -8,7 +8,9 @@ import shutil
 import time
 
 import polars as pl
+import yaml
 
+from core.modules.config import select_market_view
 from core.modules.reporting.equity_summary import export_equity_summary_image
 from core.modules.logger import logger
 from core.modules.reporting.pair_summary import (
@@ -198,10 +200,14 @@ def risk_attribution_rows(result):
 
 
 def _write_markdown_summary(path, result, config_path, return_attribution, risk_attribution):
+    active_market, active_setup, pair_count = _report_config_context(config_path)
     lines = [
         "# 单次回测结果报告",
         "",
         f"- 配置文件: `{config_path.name}`",
+        f"- 市场: `{active_market}`",
+        f"- Setup: `{active_setup}`",
+        f"- Pair 数量: `{pair_count}`",
         f"- 最终权益: `{result.metrics.get('final_equity')}`",
         f"- 总收益: `{result.metrics.get('total_return')}`",
         f"- Sharpe: `{result.metrics.get('sharpe')}`",
@@ -240,6 +246,19 @@ def _write_markdown_summary(path, result, config_path, return_attribution, risk_
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _report_config_context(config_path: Path) -> tuple[str, str, int]:
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        setup = select_market_view(raw) if raw.get("setups") else {}
+        return (
+            str(raw.get("active_market", "legacy")),
+            str(raw.get("active_setup", "")),
+            len([item for item in (setup.get("pairs") or []) if item.get("enabled", True)]),
+        )
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return "unknown", "unknown", 0
 
 
 def _per_pair_metrics(result, config_path: Path) -> list[dict]:

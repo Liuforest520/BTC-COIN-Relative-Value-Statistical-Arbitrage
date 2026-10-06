@@ -31,6 +31,7 @@ import numpy as np
 import polars as pl
 import yaml
 
+from core.modules.config import select_market_data, select_market_view
 from core.modules.logger import logger
 
 
@@ -238,19 +239,31 @@ def _config_pair_defs(config_path: Path) -> tuple[list[dict], dict[str, Path]]:
     except Exception as exc:
         logger.warning("curve charts: cannot read {}: {}", config_path, exc)
         return [], {}
+    if not raw.get("setups"):
+        return [], {}
+
+    try:
+        data_view = select_market_data(raw)
+        setup = select_market_view(raw)
+    except (TypeError, ValueError, KeyError):
+        logger.warning("curve charts: invalid market configuration in {}", config_path)
+        return [], {}
 
     symbols: dict[str, Path] = {}
-    for symbol, info in (raw.get("data", {}).get("symbols") or {}).items():
+    for symbol, info in (data_view["symbols"] or {}).items():
         path = (info or {}).get("path")
         if path:
             symbols[str(symbol)] = Path(str(path))
         else:
-            for candidate in (Path("data") / str(symbol) / f"{symbol}-1m.csv",):
+            for candidate in (
+                Path("data") / "crypto_extended" / str(symbol) / f"{symbol}-1m-extended.csv",
+                Path("data") / "crypto" / str(symbol) / f"{symbol}-1m.csv",
+                Path("data") / str(symbol) / f"{symbol}-1m.csv",
+            ):
                 if candidate.exists():
                     symbols[str(symbol)] = candidate
                     break
 
-    setup = (raw.get("setups") or {}).get(raw.get("active_setup")) or {}
     pairs = []
     for item in setup.get("pairs") or []:
         if not item.get("enabled", True):

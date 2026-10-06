@@ -60,16 +60,27 @@ def set_run_name(config: dict, run_name: str) -> None:
     config.setdefault("report", {})["run_name"] = run_name
 
 
+def active_setup_block(config: dict) -> dict:
+    setup = config.setdefault("setups", {}).setdefault(config["active_setup"], {})
+    market = str(config.get("active_market", "")).strip().lower()
+    if market:
+        markets = setup.get("markets") or {}
+        if market not in markets:
+            raise ValueError(f"setup does not define active_market={market!r}")
+        return markets[market]
+    return setup
+
+
 def protection(config: dict) -> dict:
-    return config.setdefault("setups", {})[config["active_setup"]].setdefault("pipeline", {}).setdefault("protection", {})
+    return active_setup_block(config).setdefault("pipeline", {}).setdefault("protection", {})
 
 
 def estimator(config: dict) -> dict:
-    return config["setups"][config["active_setup"]]["pipeline"]["estimator"]
+    return active_setup_block(config)["pipeline"]["estimator"]
 
 
 def signal(config: dict) -> dict:
-    return config["setups"][config["active_setup"]]["pipeline"]["signal"]
+    return active_setup_block(config)["pipeline"]["signal"]
 
 
 def disable_protection(config: dict) -> None:

@@ -11,6 +11,7 @@ from time import perf_counter
 import polars as pl
 import yaml
 
+from core.modules.config import select_market_data, select_market_view
 from core.modules.data import load_csv_data
 from core.modules.reporting.pair_summary import (
     build_pair_summary,
@@ -641,8 +642,7 @@ def threshold_rows(run_dir: Path) -> list[dict]:
         exit_z = default_exit_z
     else:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        active_setup = raw.get("active_setup")
-        setup = raw.get("setups", {}).get(active_setup, {})
+        setup = select_market_view(raw) if raw.get("setups") else {}
         pipeline_signal = (setup.get("pipeline") or {}).get("signal")
         signal = pipeline_signal or {}
         entry_z = float(signal.get("entry_z", default_entry_z))
@@ -877,7 +877,7 @@ def _configured_pairs(run_dir: Path) -> list[dict]:
         return []
 
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    setup = raw.get("setups", {}).get(raw.get("active_setup"), {})
+    setup = select_market_view(raw) if raw.get("setups") else {}
     pairs = []
     for item in setup.get("pairs") or []:
         if not item.get("enabled", True):
@@ -926,7 +926,7 @@ def _estimator_review_parameters(run_dir: Path) -> dict:
             "regression_method": None,
             "exit_z": 0.5,
         }
-    setup = (raw.get("setups") or {}).get(raw.get("active_setup"), {}) or {}
+    setup = select_market_view(raw) if raw.get("setups") else {}
     pipeline = setup.get("pipeline") or {}
     estimator = pipeline.get("estimator") or {}
     signal = pipeline.get("signal") or {}
@@ -1311,7 +1311,7 @@ def _symbol_data_path(run_dir: Path, symbol: str) -> Path | None:
     if not config_path.exists():
         return None
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    path = (raw.get("data", {}).get("symbols", {}).get(symbol, {}) or {}).get("path")
+    path = (select_market_data(raw)["symbols"].get(symbol, {}) or {}).get("path")
     if not path:
         return None
     data_path = Path(path)
@@ -2113,7 +2113,7 @@ def discover_report_runs(results_root: Path) -> list[dict]:
                 config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             except (OSError, ValueError, TypeError, yaml.YAMLError):
                 config = {}
-        setup = (config.get("setups") or {}).get(config.get("active_setup"), {}) or {}
+        setup = select_market_view(config) if config.get("setups") else {}
         pipeline = setup.get("pipeline") or {}
         estimator = pipeline.get("estimator") or {}
         signal = pipeline.get("signal") or {}

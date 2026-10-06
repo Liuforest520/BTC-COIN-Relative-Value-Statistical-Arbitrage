@@ -7,6 +7,7 @@ from typing import Any
 import polars as pl
 import yaml
 
+from core.modules.config import select_market_data, select_market_view
 from core.modules.data.loader import load_csv_data
 from core.modules.reporting.utils import reporting_frame
 
@@ -18,8 +19,13 @@ def pair_defs_from_config(config_path: Path) -> list[dict]:
     if not config_path.exists():
         return []
 
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    setup = raw.get("setups", {}).get(raw.get("active_setup"), {})
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if not raw.get("setups"):
+            return []
+        setup = select_market_view(raw)
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return []
     pairs = []
     for item in setup.get("pairs") or []:
         if not item.get("enabled", True):
@@ -677,12 +683,18 @@ def _timeline_frame(position_curve: pl.DataFrame, timeline: Any) -> pl.DataFrame
 
 
 def _symbol_data_path(config: dict, symbol: str) -> Path | None:
-    path = ((config.get("data", {}).get("symbols", {}).get(symbol, {}) or {}).get("path"))
+    try:
+        symbols = select_market_data(config)["symbols"]
+    except (TypeError, ValueError, KeyError):
+        symbols = (config.get("data", {}).get("symbols", {}) or {})
+    path = ((symbols.get(symbol, {}) or {}).get("path"))
     candidates = []
     if path:
         candidate = Path(path)
         candidates.append(candidate if candidate.is_absolute() else PROJECT_ROOT / candidate)
     candidates.extend([
+        PROJECT_ROOT / "data" / "crypto_extended" / symbol / f"{symbol}-1m-extended.csv",
+        PROJECT_ROOT / "data" / "crypto" / symbol / f"{symbol}-1m.csv",
         PROJECT_ROOT / "data" / symbol / f"{symbol}-1m.csv",
         PROJECT_ROOT / "data" / symbol / f"{symbol}_1m.csv",
     ])
