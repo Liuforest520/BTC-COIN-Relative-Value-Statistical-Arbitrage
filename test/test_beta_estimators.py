@@ -55,7 +55,7 @@ def test_winsorized_estimator_is_registered():
 )
 def test_strategy_factory_constructs_each_beta_estimator(method, estimator_class):
     setup = SimpleNamespace(
-        pairs=[{"pair_id": "pair", "x_symbol": "X", "y_symbol": "Y"}],
+        pairs=[{"pair_id": "pair", "x_symbol": "X", "y_symbol": "Y", "target_capital": 1000}],
         pipeline={
             "estimator": {
                 "method": method, "regression_method": "price",
@@ -63,7 +63,7 @@ def test_strategy_factory_constructs_each_beta_estimator(method, estimator_class
             },
             "signal": {"method": "zscore"},
             "sizing": {"method": "beta_neutral"},
-            "portfolio": {"method": "equal_weight"},
+            "portfolio": {"method": "pair_target_capital"},
             "execution": {},
         },
     )
@@ -75,7 +75,7 @@ def test_strategy_factory_constructs_each_beta_estimator(method, estimator_class
 
 def test_factory_maps_legacy_warmup_bars_to_model_lookback():
     setup = SimpleNamespace(
-        pairs=[{"pair_id": "pair", "x_symbol": "X", "y_symbol": "Y"}],
+        pairs=[{"pair_id": "pair", "x_symbol": "X", "y_symbol": "Y", "target_capital": 1000}],
         pipeline={
             "estimator": {
                 "method": "tls", "regression_method": "price",
@@ -83,7 +83,7 @@ def test_factory_maps_legacy_warmup_bars_to_model_lookback():
             },
             "signal": {"method": "zscore"},
             "sizing": {"method": "beta_neutral"},
-            "portfolio": {"method": "equal_weight"},
+            "portfolio": {"method": "pair_target_capital"},
             "execution": {},
         },
     )
@@ -99,14 +99,14 @@ def test_factory_maps_legacy_warmup_bars_to_model_lookback():
 )
 def test_strategy_factory_constructs_each_additional_estimator(method, estimator_class):
     setup = SimpleNamespace(
-        pairs=[{"pair_id": "pair", "x_symbol": "X", "y_symbol": "Y"}],
+        pairs=[{"pair_id": "pair", "x_symbol": "X", "y_symbol": "Y", "target_capital": 1000}],
         pipeline={
             "estimator": {
                 "method": method, "regression_method": "log_price",
                 "model_lookback_bars": 10,
             },
             "signal": {"method": "zscore"}, "sizing": {"method": "beta_neutral"},
-            "portfolio": {"method": "equal_weight"}, "execution": {},
+            "portfolio": {"method": "pair_target_capital"}, "execution": {},
         },
     )
 

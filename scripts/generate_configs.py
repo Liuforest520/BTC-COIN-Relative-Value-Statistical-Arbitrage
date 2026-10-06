@@ -135,14 +135,18 @@ def validate_active_market(config, active_setup, active_market):
     if active_market is None:
         return
     active_market = str(active_market).strip().lower()
-    if str(active_market).lower() not in {"crypto", "tradfi"}:
-        raise ValueError("active_market must be crypto or tradfi")
     setup = (config.get("setups") or {}).get(active_setup) or {}
+    if setup.get("pipelines") is not None:
+        raise ValueError(
+            "pair-driven configs do not use active_market; put market on each Pair"
+        )
+    if str(active_market).lower() not in {"crypto", "tradfi", "combined"}:
+        raise ValueError("active_market must be crypto, tradfi, or combined")
     if active_market is not None and "markets" not in setup:
         raise ValueError(
             f"setup {active_setup!r} has no markets block for active_market={active_market!r}"
         )
-    if "markets" in setup and active_market not in (setup.get("markets") or {}):
+    if active_market != "combined" and "markets" in setup and active_market not in (setup.get("markets") or {}):
         raise ValueError(
             f"setup {active_setup!r} does not define active_market {active_market!r}"
         )

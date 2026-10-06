@@ -70,6 +70,7 @@ class MultiPairStrategy(BaseStrategy):
         execution_cfg: ExecutionConfig | None = None,
         protection_cfg: ProtectionConfig | None = None,
         rebalance_cfg: RebalanceConfig | None = None,
+        pair_components: dict[str, dict] | None = None,
         fee_rate: float = 0.0005,
         slippage_bps: float = 1.0,
         name: str = "multi_pair",
@@ -78,7 +79,9 @@ class MultiPairStrategy(BaseStrategy):
         self.name = name
         self.pairs = pairs
         self._pair_defs_by_id = {pair_def.pair_id: pair_def for pair_def in pairs}
+        self.pair_components = dict(pair_components or {})
         self.pipelines: dict[str, PairPipeline] = {}
+        self.order_planners: dict[str, OrderPlanner] = {}
         self.portfolio_state = PortfolioState()
         self.order_planner = OrderPlanner(execution_cfg)
         self.estimator_cfg = estimator_cfg
@@ -159,6 +162,8 @@ class MultiPairStrategy(BaseStrategy):
         )
         self.protection_manager = ProtectionManager(self.protection_cfg)
         self.rebalance_manager = RebalanceManager(self.rebalance_cfg)
+        self.protection_managers: dict[str, ProtectionManager] = {}
+        self.rebalance_managers: dict[str, RebalanceManager] = {}
         self.fee_rate = max(0.0, float(fee_rate))
         self.slippage_rate = max(0.0, float(slippage_bps)) / 10000.0
         self.frozen_model_supported = protection_supported(
@@ -186,22 +191,76 @@ class MultiPairStrategy(BaseStrategy):
         for pair_def in pairs:
             if not pair_def.enabled:
                 continue
+            components = self.pair_components.get(pair_def.pair_id, {
+                "estimator_ctor": estimator_ctor,
+                "estimator_cfg": estimator_cfg,
+                "signal_ctor": signal_ctor,
+                "signal_cfg": signal_cfg,
+                "sizing_ctor": sizing_ctor,
+                "sizing_cfg": sizing_cfg,
+                "execution_cfg": execution_cfg,
+                "portfolio_cfg": self.portfolio_cfg,
+                "protection_cfg": self.protection_cfg,
+                "rebalance_cfg": self.rebalance_cfg,
+            })
             self.pipelines[pair_def.pair_id] = PairPipeline(
                 pair_def,
-                estimator_ctor,
-                estimator_cfg,
-                signal_ctor,
-                signal_cfg,
-                sizing_ctor,
-                sizing_cfg,
-                execution_cfg,
+                components["estimator_ctor"],
+                components["estimator_cfg"],
+                components.get("signal_ctor"),
+                components.get("signal_cfg"),
+                components.get("sizing_ctor"),
+                components.get("sizing_cfg"),
+                components.get("execution_cfg"),
             )
+            pipeline = self.pipelines[pair_def.pair_id]
+            pipeline.estimator_cfg = components["estimator_cfg"]
+            pipeline.signal_cfg = components.get("signal_cfg") or SignalConfig()
+            pipeline.sizing_cfg = components.get("sizing_cfg") or SizingConfig()
+            if pair_def.pair_id not in self.pair_components:
+                # Preserve the legacy object identity: callers/tests may
+                # adjust the shared config after construction.
+                pipeline.portfolio_cfg = self.portfolio_cfg
+                pipeline.protection_cfg = self.protection_cfg
+            else:
+                raw_portfolio_cfg = components.get("portfolio_cfg") or self.portfolio_cfg
+                pipeline.portfolio_cfg = replace(
+                    raw_portfolio_cfg,
+                    add_cooldown_bars=_decision_bars(raw_portfolio_cfg.add_cooldown_bars, pipeline.model_timeframe_minutes, "portfolio.add_cooldown_bars"),
+                    min_hold_bars=_decision_bars(raw_portfolio_cfg.min_hold_bars, pipeline.model_timeframe_minutes, "portfolio.min_hold_bars"),
+                )
+                raw_protection_cfg = components.get("protection_cfg") or self.protection_cfg
+                pipeline.protection_cfg = replace(
+                    raw_protection_cfg,
+                    stop_loss_freeze_bars=_decision_bars(raw_protection_cfg.stop_loss_freeze_bars, pipeline.model_timeframe_minutes, "protection.stop_loss_freeze_bars"),
+                    pair_loss_stop_freeze_bars=_decision_bars(raw_protection_cfg.pair_loss_stop_freeze_bars, pipeline.model_timeframe_minutes, "protection.pair_loss_stop_freeze_bars"),
+                    take_profit_freeze_bars=_decision_bars(raw_protection_cfg.take_profit_freeze_bars, pipeline.model_timeframe_minutes, "protection.take_profit_freeze_bars"),
+                    max_holding_time_freeze_bars=_decision_bars(raw_protection_cfg.max_holding_time_freeze_bars, pipeline.model_timeframe_minutes, "protection.max_holding_time_freeze_bars"),
+                )
+            pipeline.rebalance_cfg = components.get("rebalance_cfg") or self.rebalance_cfg
+            self.protection_managers[pair_def.pair_id] = ProtectionManager(pipeline.protection_cfg)
+            self.rebalance_managers[pair_def.pair_id] = RebalanceManager(pipeline.rebalance_cfg)
+            self.order_planners[pair_def.pair_id] = OrderPlanner(components.get("execution_cfg"))
+            pair_frozen_supported = protection_supported(
+                pipeline.estimator_cfg.regression_method,
+                pipeline.estimator_cfg.position_update_policy,
+                True,
+            )
+            if (
+                pipeline.rebalance_cfg.enabled
+                and pipeline.rebalance_cfg.candidate_quality.enabled
+                and not pair_frozen_supported
+            ):
+                raise ValueError(
+                    f"{pair_def.market} Pair {pair_def.pair_id}: rebalance.candidate_quality "
+                    "requires a frozen Price/Log-Price model"
+                )
 
         # Validate the effective estimator lookback up front when the feature
         # is enabled. Pair-level lookback overrides are already applied by
         # PairPipeline, so each pair gets the same semantics as its model.
-        if self.protection_cfg.max_holding_time_enabled:
-            for pipeline in self.pipelines.values():
+        for pipeline in self.pipelines.values():
+            if self._pair_protection_cfg(pipeline).max_holding_time_enabled:
                 self._max_holding_bars_for_pipeline(pipeline)
 
         if portfolio_ctor and portfolio_cfg:
@@ -221,6 +280,27 @@ class MultiPairStrategy(BaseStrategy):
 
         self.signal = self
         self.last_state: dict[str, Any] = {}
+
+    def _pair_estimator_cfg(self, pipeline):
+        return getattr(pipeline, "estimator_cfg", self.estimator_cfg)
+
+    def _pair_portfolio_cfg(self, pipeline):
+        return getattr(pipeline, "portfolio_cfg", self.portfolio_cfg)
+
+    def _pair_protection_cfg(self, pipeline):
+        return getattr(pipeline, "protection_cfg", self.protection_cfg)
+
+    def _pair_rebalance_cfg(self, pipeline):
+        return getattr(pipeline, "rebalance_cfg", self.rebalance_cfg)
+
+    def _pair_protection_supported(self, pipeline):
+        cfg = self._pair_protection_cfg(pipeline)
+        est = self._pair_estimator_cfg(pipeline)
+        return protection_supported(
+            est.regression_method,
+            est.position_update_policy,
+            cfg.enabled or cfg.max_holding_time_enabled or cfg.pair_loss_stop_enabled,
+        )
 
     def snapshot_signal_state(self, ts, compact: bool = False):
         state = {"ts": ts}
@@ -377,15 +457,17 @@ class MultiPairStrategy(BaseStrategy):
             for pair_id, candidate in entry_candidates.items()
             if pair_id in underfunded_ids
         }
-        if self.rebalance_cfg.enabled and underfunded_candidates:
+        if any(self._pair_rebalance_cfg(self.pipelines[pid]).enabled for pid in underfunded_candidates):
             qualified_candidates = {}
             for pair_id, candidate in underfunded_candidates.items():
                 rebalance_candidate = self._rebalance_candidate_from_entry(
                     pair_id, candidate
                 )
+                manager = self.rebalance_managers.get(pair_id, self.rebalance_manager)
                 if (
                     rebalance_candidate is not None
-                    and self.rebalance_manager.quality_allowed(rebalance_candidate)
+                    and manager.config.enabled
+                    and manager.quality_allowed(rebalance_candidate)
                 ):
                     qualified_candidates[pair_id] = candidate
                 else:
@@ -439,6 +521,10 @@ class MultiPairStrategy(BaseStrategy):
         fallback_hedge,
         bundle,
     ) -> dict[str, Any] | None:
+        estimator_cfg = self._pair_estimator_cfg(pipeline)
+        portfolio_cfg = self._pair_portfolio_cfg(pipeline)
+        rebalance_cfg = self._pair_rebalance_cfg(pipeline)
+        pair_protection_supported = self._pair_protection_supported(pipeline)
         bar_index = signal.bar_index
         sizing_state = pipeline.state.sizing_state
         cointegration_decision = self._cointegration_entry_decision(result)
@@ -454,12 +540,12 @@ class MultiPairStrategy(BaseStrategy):
             return None
 
         signal_para = _merge_para(getattr(result, "para", {}), getattr(signal, "para", {}))
-        if self.protection_supported:
+        if pair_protection_supported:
             signal_para = _merge_para(signal_para, {
                 "protection": {
                     "enabled": True,
-                    "regression_method": self.estimator_cfg.regression_method,
-                    "position_update_policy": self.estimator_cfg.position_update_policy,
+                    "regression_method": estimator_cfg.regression_method,
+                    "position_update_policy": estimator_cfg.position_update_policy,
                     "alpha": result.estimator.alpha,
                     "beta": result.estimator.beta,
                     "spread_mean": result.estimator.spread_mean,
@@ -478,8 +564,8 @@ class MultiPairStrategy(BaseStrategy):
                 "scheduled_action": decision["action"],
                 "entry_count_before": sizing_state.entry_count,
                 "max_entries_per_pair": self.max_entries_per_pair,
-                "add_cooldown_bars": self.add_cooldown_bars,
-                "min_hold_bars": self.min_hold_bars,
+                "add_cooldown_bars": int(getattr(portfolio_cfg, "add_cooldown_bars", self.add_cooldown_bars) or 0),
+                "min_hold_bars": int(getattr(portfolio_cfg, "min_hold_bars", self.min_hold_bars) or 0),
                 "current_gross_notional": sizing_state.current_gross_notional,
                 "pair_cap_gross": sizing_state.pair_cap_gross,
                 "entry_gross_cap": sizing_state.entry_gross_cap,
@@ -489,6 +575,7 @@ class MultiPairStrategy(BaseStrategy):
             },
             "pair": {
                 "pair_id": pair_id,
+                    "market": pair_def.market,
                 "x_symbol": pair_def.x_symbol,
                 "y_symbol": pair_def.y_symbol,
                 "x_exchange": pair_def.x_exchange,
@@ -513,8 +600,13 @@ class MultiPairStrategy(BaseStrategy):
         # Compute replacement quality independently from the protection
         # feature switch. Rebalance must behave identically whether protective
         # exits are enabled or disabled.
-        if self.frozen_model_supported and (
-            self.protection_supported or self.rebalance_cfg.enabled
+        frozen_supported = protection_supported(
+            estimator_cfg.regression_method,
+            estimator_cfg.position_update_policy,
+            True,
+        )
+        if frozen_supported and (
+            pair_protection_supported or rebalance_cfg.enabled
         ):
             try:
                 quality_x_quantity, quality_y_quantity, quality_gross = (
@@ -524,7 +616,7 @@ class MultiPairStrategy(BaseStrategy):
                     self.fee_rate + self.slippage_rate
                 )
                 boundary = solve_zero_net_x_price(
-                    self.estimator_cfg.regression_method,
+                    estimator_cfg.regression_method,
                     result.estimator.alpha,
                     result.estimator.beta,
                     result.estimator.spread_mean,
@@ -546,7 +638,7 @@ class MultiPairStrategy(BaseStrategy):
                 expected_net_return = None
                 if boundary.target_residual is not None:
                     expected_net_pnl = net_pnl_at_x(
-                        self.estimator_cfg.regression_method,
+                        estimator_cfg.regression_method,
                         result.estimator.alpha,
                         result.estimator.beta,
                         boundary.target_residual,
@@ -574,7 +666,7 @@ class MultiPairStrategy(BaseStrategy):
                     "signal_strength": float(getattr(signal, "signal_strength", 0.0) or 0.0),
                 }
                 signal_para = _merge_para(signal_para, {"rebalance_quality": quality})
-                if self.protection_supported:
+                if pair_protection_supported:
                     signal_para = _merge_para(signal_para, {"protection": {
                         "theoretical_zero_return_x_move": x_move,
                         "theoretical_zero_return_x_price": boundary.x_price,
@@ -618,6 +710,8 @@ class MultiPairStrategy(BaseStrategy):
         return {"allowed": False, "reason": f"cointegration blocked open: {reason}"}
 
     def _entry_schedule_decision(self, pipeline, signal, bar_index) -> dict[str, Any]:
+        portfolio_cfg = self._pair_portfolio_cfg(pipeline)
+        max_entries = max(1, int(getattr(portfolio_cfg, "max_entries_per_pair", self.max_entries_per_pair) or 1))
         state = pipeline.state.sizing_state
         protection_state = pipeline.state.protection_state
         freeze_until = protection_state.freeze_until_bar
@@ -655,7 +749,7 @@ class MultiPairStrategy(BaseStrategy):
                 "reason": f"opposite entry ignored while holding {state.position_side}",
             }
 
-        if state.entry_count >= self.max_entries_per_pair:
+        if state.entry_count >= max_entries:
             state.pair_full = True
             return {"allowed": False, "action": "none", "reason": "max entries per pair reached"}
 
@@ -676,7 +770,7 @@ class MultiPairStrategy(BaseStrategy):
         available_capital=None,
     ):
         """Plan one replacement target after ordinary allocation is complete."""
-        if not self.rebalance_cfg.enabled or not entry_candidates:
+        if not entry_candidates:
             return [], None
 
         available = max(
@@ -718,7 +812,22 @@ class MultiPairStrategy(BaseStrategy):
                 payload=old_pipeline,
             ))
 
-        plan = self.rebalance_manager.plan(candidates, positions, available)
+        if not candidates:
+            return [], None
+        # The candidate's market policy controls the quality gates and the
+        # replacement thresholds. Candidate ranking remains global because
+        # the account is shared by both markets.
+        candidate_managers = {
+            item.pair_id: self.rebalance_managers.get(
+                item.pair_id, self.rebalance_manager
+            ) for item in candidates
+        }
+        qualified = [item for item in candidates if candidate_managers[item.pair_id].quality_allowed(item)]
+        if not qualified:
+            return [], None
+        best_candidate = min(qualified, key=RebalanceManager._candidate_sort_key)
+        chosen_manager = candidate_managers[best_candidate.pair_id]
+        plan = chosen_manager.plan([best_candidate], positions, available)
         if not plan.ready:
             return [], None
 
@@ -800,6 +909,8 @@ class MultiPairStrategy(BaseStrategy):
             target = float(getattr(raw, "target_capital", 0.0) or 0.0)
         if target <= 0:
             return None
+        pipeline = self.pipelines.get(pair_id)
+        rebalance_cfg = self._pair_rebalance_cfg(pipeline) if pipeline is not None else self.rebalance_cfg
         para = getattr(raw, "para", {}) or {}
         quality = (
             para.get("rebalance_quality", {}) if isinstance(para, dict) else {}
@@ -808,9 +919,7 @@ class MultiPairStrategy(BaseStrategy):
         return RebalanceCandidate(
             pair_id=pair_id,
             target_capital=target,
-            minimum_capital=(
-                target * float(self.rebalance_cfg.minimum_entry_capital_ratio)
-            ),
+            minimum_capital=target,
             adf_pvalue=quality.get(
                 "adf_pvalue", getattr(estimator, "cointegration_pvalue", None)
             ),
@@ -1062,7 +1171,8 @@ class MultiPairStrategy(BaseStrategy):
             target_hedge = alloc_target.hedge_ratio or raw_target.hedge_ratio or candidate["fallback_hedge"]
             if alloc_target.final_x_quantity <= 0 or alloc_target.final_y_quantity <= 0:
                 continue
-            pair_orders = self.order_planner.orders_for_target(
+            planner = self.order_planners.get(pair_id, self.order_planner)
+            pair_orders = planner.orders_for_target(
                 alloc_target,
                 pair_def,
                 x_exchange=pair_def.x_exchange,
@@ -1081,7 +1191,11 @@ class MultiPairStrategy(BaseStrategy):
 
         equity = self._current_equity_value(pipeline)
         pair_cap = self._pair_target_capital(pair_def, pipeline)
-        entry_cap = pair_cap / self.max_entries_per_pair if self.max_entries_per_pair > 0 else pair_cap
+        portfolio_cfg = self._pair_portfolio_cfg(pipeline)
+        max_entries = max(1, int(getattr(portfolio_cfg, "max_entries_per_pair", self.max_entries_per_pair) or 1))
+        add_cooldown = max(0, int(getattr(portfolio_cfg, "add_cooldown_bars", self.add_cooldown_bars) or 0))
+        min_hold = max(0, int(getattr(portfolio_cfg, "min_hold_bars", self.min_hold_bars) or 0))
+        entry_cap = pair_cap / max_entries if max_entries > 0 else pair_cap
 
         x_price = bundle.x_bar.close if bundle.x_bar else 0.0
         y_price = bundle.y_bar.close if bundle.y_bar else 0.0
@@ -1092,8 +1206,8 @@ class MultiPairStrategy(BaseStrategy):
         min_hold_remaining = 0
         if state.position_side is not None and state.last_entry_bar_index is not None:
             elapsed = max(0, bundle.bar_index - state.last_entry_bar_index)
-            cooldown_remaining = max(0, self.add_cooldown_bars - elapsed)
-            min_hold_remaining = max(0, self.min_hold_bars - elapsed)
+            cooldown_remaining = max(0, add_cooldown - elapsed)
+            min_hold_remaining = max(0, min_hold - elapsed)
 
         eps = max(1e-9, pair_cap * 1e-9)
         state.current_gross_notional = current_gross
@@ -1104,7 +1218,7 @@ class MultiPairStrategy(BaseStrategy):
         state.min_hold_remaining_bars = min_hold_remaining
         state.pair_full = (
             state.position_side is not None
-            and (state.entry_count >= self.max_entries_per_pair or remaining <= eps)
+            and (state.entry_count >= max_entries or remaining <= eps)
         )
 
     def _pair_target_capital(self, pair_def, pipeline=None) -> float:
@@ -1115,7 +1229,8 @@ class MultiPairStrategy(BaseStrategy):
         current = float(getattr(state, "pair_cap_gross", 0.0) or 0.0) if state is not None else 0.0
         if current > 0:
             return current
-        return max(0.0, float(getattr(self.sizing_cfg, "notional", 0.0) or 0.0))
+        sizing_cfg = getattr(pipeline, "sizing_cfg", self.sizing_cfg) if pipeline is not None else self.sizing_cfg
+        return max(0.0, float(getattr(sizing_cfg, "notional", 0.0) or 0.0))
 
     def _open_pair_count(self) -> int:
         """Return the number of currently occupied Pair positions for diagnostics."""
@@ -1221,7 +1336,7 @@ class MultiPairStrategy(BaseStrategy):
             return []
 
         exit_class = self._resolve_exit_class(exit_class, exit_reason, protection_trigger)
-        reopen_lock_pending = self._should_wait_after_non_z_exit(exit_class)
+        reopen_lock_pending = self._should_wait_after_non_z_exit(exit_class, pipeline)
         protection_state = pipeline.state.protection_state
         if exit_reason == "rebalance_replacement":
             protection_state.pending_exit = True
@@ -1247,7 +1362,8 @@ class MultiPairStrategy(BaseStrategy):
                 }
             } if exit_reason else {},
         )
-        orders = self.order_planner.orders_for_target(
+        planner = self.order_planners.get(pair_id, self.order_planner)
+        orders = planner.orders_for_target(
             target,
             pair_def,
             x_exchange=pair_def.x_exchange,
@@ -1277,16 +1393,18 @@ class MultiPairStrategy(BaseStrategy):
         return orders
 
     def _protection_exit_decision(self, pipeline, bundle):
-        if not self.protection_supported or bundle is None:
+        if not self._pair_protection_supported(pipeline) or bundle is None:
             return None
         state = pipeline.state.protection_state
         sizing_state = pipeline.state.sizing_state
         if not state.active or state.pending_exit or sizing_state.position_side is None:
             return None
-        decision = self.protection_manager.evaluate(ProtectionContext(
+        manager = self.protection_managers.get(pipeline.pair_def.pair_id, self.protection_manager)
+        config = self._pair_protection_cfg(pipeline)
+        decision = manager.evaluate(ProtectionContext(
             pipeline=pipeline, bundle=bundle, state=state,
             ledger=pipeline.state.position_ledger,
-            sizing_state=sizing_state, config=self.protection_cfg,
+            sizing_state=sizing_state, config=config,
             fee_rate=self.fee_rate, slippage_rate=self.slippage_rate,
         ))
         if decision is None:
@@ -1303,9 +1421,10 @@ class MultiPairStrategy(BaseStrategy):
         return {"reason": decision.exit_reason, "trigger": decision.protection_trigger}
 
     def _pair_loss_stop_freeze_bars_for_pipeline(self, pipeline) -> int:
-        configured = getattr(self.protection_cfg, "pair_loss_stop_freeze_model_lookback_multiplier", None)
+        config = self._pair_protection_cfg(pipeline)
+        configured = getattr(config, "pair_loss_stop_freeze_model_lookback_multiplier", None)
         if configured is None:
-            return max(0, int(self.protection_cfg.pair_loss_stop_freeze_bars))
+            return max(0, int(config.pair_loss_stop_freeze_bars))
         lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
         try:
             lookback = float(lookback)
@@ -1326,9 +1445,10 @@ class MultiPairStrategy(BaseStrategy):
         return self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
 
     def _max_holding_bars_for_pipeline(self, pipeline) -> int | None:
-        if not self.protection_cfg.max_holding_time_enabled:
+        config = self._pair_protection_cfg(pipeline)
+        if not config.max_holding_time_enabled:
             return None
-        configured_lookback = getattr(self.estimator_cfg, "model_lookback_bars", None)
+        configured_lookback = getattr(self._pair_estimator_cfg(pipeline), "model_lookback_bars", None)
         try:
             configured_lookback = float(configured_lookback)
         except (TypeError, ValueError):
@@ -1357,7 +1477,7 @@ class MultiPairStrategy(BaseStrategy):
                 "protection.max_holding_time_enabled requires a valid positive estimator model_lookback_bars"
             )
         product = lookback * float(
-            self.protection_cfg.max_holding_time_model_lookback_multiplier
+            config.max_holding_time_model_lookback_multiplier
         )
         if not isfinite(product):
             raise ValueError(
@@ -1365,7 +1485,7 @@ class MultiPairStrategy(BaseStrategy):
             )
         return max(1, int(ceil(product)))
 
-    def _should_wait_after_non_z_exit(self, exit_class: str | None) -> bool:
+    def _should_wait_after_non_z_exit(self, exit_class: str | None, pipeline=None) -> bool:
         """Only a stop-loss (or max-holding) exit locks the pair.
 
         A take-profit exit deliberately reopens immediately: the frozen model
@@ -1374,7 +1494,10 @@ class MultiPairStrategy(BaseStrategy):
         """
         if exit_class != "stop_loss":
             return False
-        configured = self.protection_cfg.wait_for_model_update_after_non_z_exit
+        configured = (
+            self._pair_protection_cfg(pipeline).wait_for_model_update_after_non_z_exit
+            if pipeline is not None else self.protection_cfg.wait_for_model_update_after_non_z_exit
+        )
         # Missing key means a legacy config. Preserve the historical
         # unconditional protective-exit lock in that case.
         return True if configured is None else bool(configured)
@@ -1504,8 +1627,10 @@ class MultiPairStrategy(BaseStrategy):
         ledger.exit_z = None
 
     def _initialize_or_update_protection(self, pipeline, group, pair_side):
-        if not self.protection_supported:
+        if not self._pair_protection_supported(pipeline):
             return
+        protection_cfg = self._pair_protection_cfg(pipeline)
+        estimator_cfg = self._pair_estimator_cfg(pipeline)
         state = pipeline.state.protection_state
         sizing_state = pipeline.state.sizing_state
         para = self._first_attr(group, "para", {}) or {}
@@ -1539,8 +1664,8 @@ class MultiPairStrategy(BaseStrategy):
             state.spread_mean = protection.get("spread_mean")
             state.spread_std = protection.get("spread_std")
             state.exit_z = protection.get("exit_z")
-            state.take_profit_return = float(self.protection_cfg.take_profit_return)
-            state.pair_loss_stop_return = float(self.protection_cfg.pair_loss_stop_return)
+            state.take_profit_return = float(protection_cfg.take_profit_return)
+            state.pair_loss_stop_return = float(protection_cfg.pair_loss_stop_return)
             state.pair_loss_stop_freeze_bars = self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
             state.max_holding_bars = self._max_holding_bars_for_pipeline(pipeline)
             state.max_holding_deadline_bar = (
@@ -1572,7 +1697,7 @@ class MultiPairStrategy(BaseStrategy):
             + state.entry_y_quantity * float(state.entry_y_price or 0.0)
         )
         boundary = solve_zero_net_x_price(
-            self.estimator_cfg.regression_method,
+            estimator_cfg.regression_method,
             state.alpha,
             state.beta,
             state.spread_mean,
@@ -1617,13 +1742,14 @@ class MultiPairStrategy(BaseStrategy):
 
     def _can_close_pair(self, pipeline, bar_index) -> bool:
         sizing_state = pipeline.state.sizing_state
-        if self.min_hold_bars <= 0 or sizing_state.position_side is None:
+        min_hold_bars = max(0, int(getattr(self._pair_portfolio_cfg(pipeline), "min_hold_bars", self.min_hold_bars) or 0))
+        if min_hold_bars <= 0 or sizing_state.position_side is None:
             return True
         if sizing_state.last_entry_bar_index is None:
             return True
 
         elapsed = max(0, int(bar_index) - int(sizing_state.last_entry_bar_index))
-        remaining = max(0, self.min_hold_bars - elapsed)
+        remaining = max(0, min_hold_bars - elapsed)
         sizing_state.min_hold_remaining_bars = remaining
         if remaining <= 0:
             return True
@@ -1714,7 +1840,8 @@ class MultiPairStrategy(BaseStrategy):
                     self._apply_pair_quantity_delta(pipeline, sizing_state, trade, sign=1.0)
                 sizing_state.entry_count += 1
                 sizing_state.last_entry_bar_index = pipeline.state.last_bar_index
-                sizing_state.pair_full = sizing_state.entry_count >= self.max_entries_per_pair
+                max_entries = max(1, int(getattr(self._pair_portfolio_cfg(pipeline), "max_entries_per_pair", self.max_entries_per_pair) or 1))
+                sizing_state.pair_full = sizing_state.entry_count >= max_entries
                 self._initialize_or_update_position_ledger(
                     pipeline, group, pair_side
                 )
@@ -2006,6 +2133,7 @@ class MultiPairStrategy(BaseStrategy):
                     "portfolio": {"existing_position": True},
                     "pair": {
                         "pair_id": pair_id,
+                        "market": pipeline.pair_def.market,
                         "x_symbol": pipeline.pair_def.x_symbol,
                         "y_symbol": pipeline.pair_def.y_symbol,
                         "x_exchange": pipeline.pair_def.x_exchange,

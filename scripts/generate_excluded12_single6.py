@@ -26,15 +26,37 @@ EXCLUDED_PAIR_IDS = {
 def model_freeze_multiplier(config: dict) -> float:
     setup_name = config.get("active_setup", "multi_pair_beta")
     setup = config["setups"][setup_name]
+    if setup.get("pipelines") is not None:
+        market = _single_pair_market(setup)
+        setup = (setup.get("pipelines") or {}).get(market) or {}
+        lookback = float((setup.get("estimator", {}) or {}).get("model_lookback_bars", 0) or 0)
+        return _freeze_multiplier_for_lookback(lookback)
     market = str(config.get("active_market", "")).strip().lower()
+    if market == "combined":
+        raise ValueError("model_freeze_multiplier requires a single-market source config")
     if market:
         setup = (setup.get("markets") or {}).get(market) or {}
     lookback = float((setup.get("estimator", {}) or {}).get("model_lookback_bars", 0) or 0)
+    return _freeze_multiplier_for_lookback(lookback)
+
+
+def _freeze_multiplier_for_lookback(lookback: float) -> float:
     if lookback == 2 * 24 * 60:
         return 5.0
     if lookback == 10 * 24 * 60:
         return 2.0
     raise ValueError(f"unexpected model lookback for freeze mapping: {lookback}")
+
+
+def _single_pair_market(setup: dict) -> str:
+    markets = {
+        str(pair.get("market", "")).strip().lower()
+        for pair in setup.get("pairs", []) or []
+        if pair.get("enabled", True)
+    }
+    if len(markets) != 1:
+        raise ValueError("this generator requires Pairs from exactly one market profile")
+    return next(iter(markets))
 
 
 def main() -> None:
@@ -45,6 +67,9 @@ def main() -> None:
         config = yaml.safe_load(source.read_text(encoding="utf-8"))
         setup_name = config.get("active_setup", "multi_pair_beta")
         setup = config["setups"][setup_name]
+        profile = setup
+        if setup.get("pipelines") is not None:
+            profile = (setup.get("pipelines") or {}).get(_single_pair_market(setup)) or {}
         market = str(config.get("active_market", "")).strip().lower()
         if market:
             setup = (setup.get("markets") or {}).get(market) or {}
@@ -57,7 +82,7 @@ def main() -> None:
         if removed != len(EXCLUDED_PAIR_IDS):
             raise ValueError(f"{source_name}: removed {removed}, expected {len(EXCLUDED_PAIR_IDS)}")
         multiplier = model_freeze_multiplier(config)
-        setup.setdefault("protection", {})[
+        profile.setdefault("protection", {})[
             "pair_loss_stop_freeze_model_lookback_multiplier"
         ] = multiplier
         stem = source.stem + "_EX12_FREEZE" + str(int(multiplier))

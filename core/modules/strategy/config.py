@@ -22,6 +22,7 @@ class PairDefinition:
     # Target gross capital for the complete Pair (both legs together).
     # ``None`` keeps legacy sizing behavior for old configurations.
     target_capital: float | None = None
+    market: str = "legacy"
 
     def __post_init__(self):
         if self.target_capital is None:
@@ -147,15 +148,15 @@ class PortfolioConfig:
     max_entries_per_pair: int = 1
     add_cooldown_bars: int = 1
     min_hold_bars: int = 0
-    allocation_mode: str = "equal_cap"   # "equal_cap" | "score_weighted"
-    min_signal_score: float = 0.0
-    minimum_entry_capital_ratio: float = 0.5
 
     def __post_init__(self):
-        ratio = float(self.minimum_entry_capital_ratio)
-        if not isfinite(ratio) or ratio <= 0.0 or ratio > 1.0:
-            raise ValueError("portfolio.minimum_entry_capital_ratio must be in (0, 1]")
-        self.minimum_entry_capital_ratio = ratio
+        method = str(self.method or "").strip().lower()
+        if method != "pair_target_capital":
+            raise ValueError(
+                "portfolio.method must be 'pair_target_capital'; "
+                "other allocation methods are not supported"
+            )
+        self.method = method
 
 
 @dataclass
@@ -214,20 +215,12 @@ class RebalanceCandidateQualityConfig:
 @dataclass
 class RebalanceConfig:
     enabled: bool = False
-    minimum_entry_capital_ratio: float = 0.5
     candidate_quality: RebalanceCandidateQualityConfig = field(
         default_factory=RebalanceCandidateQualityConfig
     )
     profitable_position_replacement: ProfitablePositionReplacementConfig = field(
         default_factory=ProfitablePositionReplacementConfig
     )
-
-    def __post_init__(self):
-        ratio = float(self.minimum_entry_capital_ratio)
-        if not isfinite(ratio) or ratio <= 0 or ratio > 1:
-            raise ValueError("rebalance.minimum_entry_capital_ratio must be in (0, 1]")
-        self.minimum_entry_capital_ratio = ratio
-
 
 @dataclass
 class ExecutionConfig:

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 import re
@@ -8,6 +8,7 @@ import yaml
 
 
 SUPPORTED_MARKETS = ("crypto", "tradfi")
+COMBINED_MARKET = "combined"
 
 
 @dataclass
@@ -18,6 +19,10 @@ class SetupConfig:
     pipeline: dict
     rebalance: dict = None
     market: str = "legacy"
+    execution: dict = field(default_factory=dict)
+    # New multi-market schema: every non-empty market keeps its own pipeline
+    # while all pairs still share one strategy/account.
+    market_pipelines: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -36,6 +41,7 @@ class Config:
     backtest_end_time: Any = None
     backtest_end_ts: int | None = None
     active_market: str = "legacy"
+    active_markets: tuple[str, ...] = ()
 
 
 def load_config(path: str | Path = "config/config.yaml") -> Config:
@@ -43,11 +49,7 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         raw = yaml.safe_load(f)
 
     setup_name = raw["active_setup"]
-    active_market = _active_market(raw)
-    setup = _build_setup_config(raw, setup_name, active_market)
-    symbols, benchmarks = _market_data(raw, active_market)
-    _validate_pair_symbols(setup.pairs, symbols, setup_name, active_market)
-    _validate_market_data_paths(symbols, active_market, setup.pairs)
+    setup, symbols, benchmarks, active_markets = _build_combined_setup(raw, setup_name)
     backtest = raw.get("backtest", {})
     start_time = backtest.get("start_time", backtest.get("start_ts"))
     end_time = backtest.get("end_time", backtest.get("end_ts"))
@@ -64,7 +66,8 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         backtest_end_time=end_time,
         backtest_end_ts=end_ts,
         active_setup=setup_name,
-        active_market=active_market,
+        active_market=(active_markets[0] if len(active_markets) == 1 else "combined"),
+        active_markets=tuple(active_markets),
         strategy=setup,
         fee_rate=float(raw["cost"]["fee_rate"]),
         slippage_bps=float(raw["cost"]["slippage_bps"]),
@@ -78,9 +81,9 @@ def _active_market(raw: dict) -> str:
     if value is None or str(value).strip() == "":
         return "legacy"
     market = str(value).strip().lower()
-    if market not in SUPPORTED_MARKETS:
+    if market not in (*SUPPORTED_MARKETS, COMBINED_MARKET):
         raise ValueError(
-            f"active_market must be one of {SUPPORTED_MARKETS}, got {value!r}"
+            f"active_market must be one of {(*SUPPORTED_MARKETS, COMBINED_MARKET)}, got {value!r}"
         )
     return market
 
@@ -94,13 +97,66 @@ def select_market_view(raw: dict, setup_name: str | None = None, market: str | N
     ``market`` keys, so callers do not need to duplicate compatibility logic.
     """
     setup_name = setup_name or raw.get("active_setup")
+    if market == COMBINED_MARKET:
+        market = None
     setups = raw.get("setups") or {}
     if setup_name not in setups:
         available = ", ".join(str(name) for name in setups)
         raise ValueError(f"active_setup {setup_name!r} not found, available: {available}")
     setup = setups[setup_name] or {}
-    active_market = market or _active_market(raw)
+    # Pair-driven schema: the Pair list is authoritative for what runs; the
+    # market label only selects the parameter profile for each Pair.
+    if setup.get("pipelines") is not None:
+        pairs = list(setup.get("pairs") or [])
+        pipelines = setup.get("pipelines") or {}
+        if market in (None, COMBINED_MARKET):
+            selected_pairs = pairs
+            first_market = next(
+                (str(item.get("market", "")).strip().lower() for item in pairs if item.get("enabled", True)),
+                None,
+            )
+            first_pipeline = pipelines.get(first_market, {}) if first_market else {}
+            return {
+                "name": setup_name,
+                "strategy": setup.get("strategy", setup.get("strategy_type", "auto")),
+                "pairs": selected_pairs,
+                "pipeline": first_pipeline,
+                "pipelines": pipelines,
+                "rebalance": setup.get("rebalance", raw.get("rebalance", {})) or {},
+                "market": "combined",
+            }
+        market = str(market).strip().lower()
+        if market not in SUPPORTED_MARKETS:
+            raise ValueError(f"market must be one of {SUPPORTED_MARKETS}, got {market!r}")
+        return {
+            "name": setup_name,
+            "strategy": setup.get("strategy", setup.get("strategy_type", "auto")),
+            "pairs": [item for item in pairs if str(item.get("market", "")).strip().lower() == market],
+            "pipeline": pipelines.get(market),
+            "pipelines": {market: pipelines.get(market)} if market in pipelines else {},
+            "rebalance": setup.get("rebalance", raw.get("rebalance", {})) or {},
+            "market": market,
+        }
     markets = setup.get("markets")
+    requested_market = _active_market(raw)
+    if market is None and markets is not None and requested_market not in SUPPORTED_MARKETS:
+        combined = select_market_views(raw, setup_name)
+        pairs = []
+        for market_name, view in combined.items():
+            for item in view.get("pairs") or []:
+                tagged = dict(item)
+                tagged["market"] = market_name
+                pairs.append(tagged)
+        first = next(iter(combined.values()), {})
+        return {
+            "name": setup_name,
+            "strategy": setup.get("strategy", setup.get("strategy_type", "auto")),
+            "pairs": pairs,
+            "pipeline": first.get("pipeline"),
+            "rebalance": first.get("rebalance", {}),
+            "market": "combined",
+        }
+    active_market = market or requested_market
     if markets is None:
         if active_market != "legacy":
             raise ValueError(
@@ -133,6 +189,34 @@ def select_market_view(raw: dict, setup_name: str | None = None, market: str | N
     }
 
 
+def select_market_views(raw: dict, setup_name: str | None = None) -> dict[str, dict]:
+    """Return all configured market views that contain at least one Pair."""
+    setup_name = setup_name or raw.get("active_setup")
+    setups = raw.get("setups") or {}
+    setup = setups.get(setup_name) or {}
+    if setup.get("pipelines") is not None:
+        pairs = setup.get("pairs") or []
+        result = {}
+        for market in SUPPORTED_MARKETS:
+            if any(
+                item.get("enabled", True)
+                and str(item.get("market", "")).strip().lower() == market
+                for item in pairs
+            ):
+                result[market] = select_market_view(raw, setup_name, market)
+        return result
+    markets = setup.get("markets")
+    if markets is None:
+        return {"legacy": select_market_view(raw, setup_name, "legacy")}
+    result = {}
+    for market in SUPPORTED_MARKETS:
+        view = markets.get(market)
+        if not isinstance(view, dict) or not view.get("pairs"):
+            continue
+        result[market] = select_market_view(raw, setup_name, market)
+    return result
+
+
 def _market_data(raw: dict, active_market: str) -> tuple[dict, dict]:
     data = raw.get("data") or {}
     markets = data.get("markets")
@@ -155,15 +239,286 @@ def _market_data(raw: dict, active_market: str) -> tuple[dict, dict]:
 
 def select_market_data(raw: dict, market: str | None = None) -> dict:
     """Return the effective symbol and benchmark maps for a raw YAML mapping."""
+    if market == COMBINED_MARKET:
+        market = None
+    if market is None and (raw.get("data") or {}).get("markets") is not None:
+        return _combined_market_data(raw)
     active_market = market or _active_market(raw)
     symbols, benchmarks = _market_data(raw, active_market)
     return {"symbols": symbols, "benchmarks": benchmarks, "market": active_market}
 
 
+def _combined_market_data(raw: dict) -> dict:
+    """Merge every market block into one symbol -> data mapping.
+
+    Symbol data is global, so a symbol may only be declared once; the engine keeps
+    exactly one price series per symbol (positions, margin and PnL are all keyed by
+    symbol).  The flat ``data.symbols`` schema of a pair-driven setup therefore does
+    not need this function at all - it is only reached through ``data.markets``.
+    """
+    data = raw.get("data") or {}
+    markets = data.get("markets") or {}
+    symbols: dict = {}
+    benchmarks: dict = dict(data.get("benchmarks") or {})
+    for market in SUPPORTED_MARKETS:
+        market_data = markets.get(market) or {}
+        raw_symbols = market_data.get("symbols")
+        if raw_symbols is not None and not isinstance(raw_symbols, dict):
+            raise ValueError(f"data.markets.{market}.symbols must be a mapping")
+        overlap = set(symbols).intersection(raw_symbols or {})
+        if overlap:
+            raise ValueError(f"symbol(s) configured in multiple markets: {sorted(overlap)}")
+        symbols.update(raw_symbols or {})
+        benchmarks.update(market_data.get("benchmarks") or {})
+    return {"symbols": symbols, "benchmarks": benchmarks, "market": "combined"}
+
+
+def _known_market_symbols(raw: dict) -> dict:
+    """Every symbol declared anywhere in the config, keyed by symbol name.
+
+    Used to resolve Pair legs: with the multi-market schema the declaration is
+    global, while the market block that owns the Pair only selects which
+    pipeline parameters it runs with.
+    """
+    data = raw.get("data") or {}
+    if data.get("markets") is not None:
+        return _combined_market_data(raw)["symbols"]
+    return dict(data.get("symbols") or {})
+
+
+def _build_combined_setup(raw: dict, setup_name: str):
+    """Build one shared-account setup.
+
+    New pair-driven configs keep one flat symbol table and one Pair list.  The
+    Pair's ``market`` selects only its model-parameter profile.  The older
+    ``active_market``/``setup.markets`` schema remains a compatibility path.
+    """
+    setups = raw["setups"]
+    if setup_name not in setups:
+        available = ", ".join(str(name) for name in setups)
+        raise ValueError(f"active_setup {setup_name!r} not found, available: {available}")
+    setup_raw = setups[setup_name] or {}
+    if setup_raw.get("pipelines") is not None:
+        return _build_pair_driven_setup(raw, setup_name, setup_raw)
+    if setup_raw.get("markets") is None:
+        active_market = _active_market(raw)
+        setup = _build_setup_config(raw, setup_name, active_market)
+        symbols, benchmarks = _market_data(raw, active_market)
+        _validate_pair_symbols(setup.pairs, symbols, setup_name, active_market)
+        _validate_market_data_paths(symbols, active_market, setup.pairs)
+        return setup, symbols, benchmarks, ([active_market] if active_market != "legacy" else ["legacy"])
+
+    requested_market = _active_market(raw)
+    if requested_market in SUPPORTED_MARKETS:
+        view = (setup_raw.get("markets") or {}).get(requested_market) or {}
+        market_pairs = list(view.get("pairs") or [])
+        if not market_pairs:
+            raise ValueError(f"setup {setup_name!r} must define pairs for the active market")
+        pipeline = view.get("pipeline")
+        if not pipeline:
+            raise ValueError(f"setup {setup_name!r} market {requested_market!r} must define pipeline")
+        market_symbols = ((raw.get("data") or {}).get("markets") or {}).get(requested_market, {}).get("symbols") or {}
+        symbols = _known_market_symbols(raw)
+        _validate_pair_symbols(market_pairs, symbols, setup_name, requested_market)
+        _validate_market_data_paths(market_symbols, requested_market, market_pairs)
+        tagged_pairs = [dict(pair, market=requested_market) for pair in market_pairs]
+        setup = SetupConfig(
+            name=setup_name,
+            strategy_type=view.get("strategy", setup_raw.get("strategy", setup_raw.get("strategy_type", "auto"))),
+            pairs=tagged_pairs,
+            pipeline=dict(pipeline),
+            rebalance=dict(view.get("rebalance", {})),
+            market=requested_market,
+            market_pipelines={requested_market: dict(view)},
+        )
+        market_block = ((raw.get("data") or {}).get("markets") or {}).get(requested_market) or {}
+        benchmarks = market_block.get("benchmarks") or (raw.get("data") or {}).get("benchmarks") or {}
+        return setup, symbols, dict(benchmarks), [requested_market]
+
+    combined_data = _combined_market_data(raw)
+    pairs: list[dict] = []
+    market_pipelines: dict[str, dict] = {}
+    active_markets: list[str] = []
+    timeframes = set()
+    for market in SUPPORTED_MARKETS:
+        view = (setup_raw.get("markets") or {}).get(market) or {}
+        market_pairs = list(view.get("pairs") or [])
+        if not market_pairs:
+            continue
+        pipeline = view.get("pipeline")
+        if not pipeline:
+            raise ValueError(f"setup {setup_name!r} market {market!r} must define pipeline")
+        market_symbols = ((raw.get("data") or {}).get("markets") or {}).get(market, {}).get("symbols") or {}
+        # Pair legs are resolved against every market block: a tradfi Pair may use a
+        # symbol whose file is declared under crypto (and the other way round).
+        _validate_pair_symbols(market_pairs, combined_data["symbols"], setup_name, market)
+        _validate_market_data_paths(market_symbols, market, market_pairs)
+        estimator = pipeline.get("estimator", {}) or {}
+        timeframes.add(str(estimator.get("model_timeframe", "1m")).strip().lower())
+        market_pipelines[market] = dict(view)
+        active_markets.append(market)
+        for pair in market_pairs:
+            tagged = dict(pair)
+            tagged["market"] = market
+            pairs.append(tagged)
+    if not pairs:
+        raise ValueError(f"setup {setup_name!r} must define at least one Pair in an active market")
+    if len(timeframes) > 1:
+        raise ValueError(
+            "crypto and tradfi must use the same estimator.model_timeframe for a shared backtest; "
+            f"got {sorted(timeframes)}"
+        )
+    first_market = active_markets[0]
+    first_view = market_pipelines[first_market]
+    setup = SetupConfig(
+        name=setup_name,
+        strategy_type=first_view.get("strategy", setup_raw.get("strategy", setup_raw.get("strategy_type", "auto"))),
+        pairs=pairs,
+        pipeline=dict(first_view.get("pipeline") or {}),
+        rebalance=dict(first_view.get("rebalance", {})),
+        market="combined",
+        market_pipelines=market_pipelines,
+    )
+    return setup, combined_data["symbols"], combined_data["benchmarks"], active_markets
+
+
+def _build_pair_driven_setup(raw: dict, setup_name: str, setup_raw: dict):
+    """Normalize the preferred flat-data, Pair-driven configuration schema."""
+    if (raw.get("data") or {}).get("markets") is not None:
+        raise ValueError(
+            "pair-driven setup requires data.symbols; remove data.markets and keep one path per symbol"
+        )
+    if raw.get("active_market") not in (None, ""):
+        raise ValueError(
+            "pair-driven setup does not use active_market; put market on every enabled Pair"
+        )
+
+    data = raw.get("data") or {}
+    symbols_raw = data.get("symbols")
+    if not isinstance(symbols_raw, dict):
+        raise ValueError("pair-driven setup requires data.symbols to be a mapping")
+    symbols_all = {str(symbol): dict(info or {}) for symbol, info in symbols_raw.items()}
+
+    pairs = [dict(item or {}) for item in (setup_raw.get("pairs") or [])]
+    enabled_pairs = [item for item in pairs if item.get("enabled", True)]
+    if not enabled_pairs:
+        raise ValueError(f"setup {setup_name!r} must define at least one enabled Pair")
+    pipelines_raw = setup_raw.get("pipelines") or {}
+    if not isinstance(pipelines_raw, dict):
+        raise ValueError(f"setup {setup_name!r}.pipelines must be a mapping")
+
+    active_markets: list[str] = []
+    normalized_pipelines: dict[str, dict] = {}
+    used_symbols: set[str] = set()
+    timeframes: set[str] = set()
+    for item in enabled_pairs:
+        pair_id = str(item.get("pair_id", "?"))
+        market = str(item.get("market", "")).strip().lower()
+        if market not in SUPPORTED_MARKETS:
+            raise ValueError(
+                f"Pair {pair_id!r} must define market as one of {SUPPORTED_MARKETS}"
+            )
+        if market not in pipelines_raw or not isinstance(pipelines_raw.get(market), dict):
+            raise ValueError(
+                f"setup {setup_name!r} is missing pipelines.{market} for Pair {pair_id!r}"
+            )
+        try:
+            target_capital = float(item.get("target_capital"))
+        except (TypeError, ValueError):
+            target_capital = 0.0
+        if target_capital <= 0:
+            raise ValueError(
+                f"Pair {pair_id!r} must define a positive target_capital"
+            )
+        if market not in active_markets:
+            active_markets.append(market)
+            pipeline = dict(pipelines_raw[market])
+            normalized_pipelines[market] = pipeline
+            estimator = pipeline.get("estimator", {}) or {}
+            timeframes.add(str(estimator.get("model_timeframe", "1m")).strip().lower())
+        x_symbol = item.get("x_symbol", item.get("long_symbol"))
+        y_symbol = item.get("y_symbol", item.get("short_symbol"))
+        for symbol in (x_symbol, y_symbol):
+            if symbol not in symbols_all:
+                raise ValueError(
+                    f"Pair {pair_id!r} references symbol {symbol!r} missing from data.symbols"
+                )
+            if not symbols_all[symbol].get("path"):
+                raise ValueError(f"data.symbols.{symbol}.path is required")
+            used_symbols.add(symbol)
+
+    if len(timeframes) > 1:
+        raise ValueError(
+            "all Pair pipelines in one backtest must use the same estimator.model_timeframe; "
+            f"got {sorted(timeframes)}"
+        )
+
+    # Rebalance and execution are account-level policies in the pair-driven
+    # schema.  Normalize them into every market view so downstream code keeps
+    # its existing PairPipeline interface without selecting one market's copy.
+    global_rebalance = dict(
+        setup_raw.get("rebalance", raw.get("rebalance", {})) or {}
+    )
+    common_execution = setup_raw.get("execution", raw.get("execution"))
+    if common_execution is None:
+        execution_values = [
+            dict((normalized_pipelines[m].get("execution") or {}))
+            for m in active_markets
+        ]
+        common_execution = execution_values[0] if execution_values else {}
+        if any(value != common_execution for value in execution_values[1:]):
+            raise ValueError(
+                "pair-driven setup requires one shared execution configuration; "
+                "put execution at setup.execution"
+            )
+    common_execution = dict(common_execution or {})
+    for market in active_markets:
+        pipeline = dict(normalized_pipelines[market])
+        pipeline.pop("rebalance", None)
+        pipeline["execution"] = dict(common_execution)
+        normalized_pipelines[market] = pipeline
+
+    tagged_pairs = []
+    for item in pairs:
+        tagged = dict(item)
+        if item.get("enabled", True):
+            tagged["market"] = str(item["market"]).strip().lower()
+        tagged_pairs.append(tagged)
+
+    market_pipelines = {
+        market: {"pipeline": normalized_pipelines[market], "rebalance": global_rebalance}
+        for market in active_markets
+    }
+    first_market = active_markets[0]
+    setup = SetupConfig(
+        name=setup_name,
+        strategy_type=setup_raw.get("strategy", setup_raw.get("strategy_type", "auto")),
+        pairs=tagged_pairs,
+        pipeline=dict(normalized_pipelines[first_market]),
+        rebalance=global_rebalance,
+        market="combined" if len(active_markets) > 1 else first_market,
+        execution=common_execution,
+        market_pipelines=market_pipelines,
+    )
+    return (
+        setup,
+        {symbol: symbols_all[symbol] for symbol in sorted(used_symbols)},
+        dict(data.get("benchmarks") or {}),
+        active_markets,
+    )
+
+
 def _validate_pair_symbols(pairs: list[dict], symbols: dict, setup_name: str, market: str) -> None:
+    """Check that every enabled Pair leg is declared somewhere in data.symbols.
+
+    ``symbols`` is the merged symbol table of the whole config (all market
+    blocks), so a Pair may mix legs that are declared under different markets.
+    """
     known_symbols = set(symbols)
     missing: list[tuple[str, str]] = []
     for item in pairs:
+        if not item.get("enabled", True):
+            continue
         pair_id = str(item.get("pair_id", "?"))
         x_symbol = item.get("x_symbol", item.get("long_symbol"))
         y_symbol = item.get("y_symbol", item.get("short_symbol"))
@@ -174,8 +529,8 @@ def _validate_pair_symbols(pairs: list[dict], symbols: dict, setup_name: str, ma
     if missing:
         details = ", ".join(f"{pair_id}:{symbol}" for pair_id, symbol in missing)
         raise ValueError(
-            f"setup {setup_name!r} market {market!r} contains Pair symbols missing "
-            f"from its market data.symbols: {details}"
+            f"setup {setup_name!r} market {market!r} contains Pair symbols that are not declared "
+            f"under data.markets.*.symbols (any market block counts): {details}"
         )
 
 
@@ -197,6 +552,11 @@ def _validate_market_data_paths(symbols: dict, market: str, pairs: list[dict] | 
     invalid = []
     missing = []
     for symbol in sorted(used_symbols):
+        if symbol not in symbols:
+            # Declared by another market block (e.g. a crypto kline file used as
+            # one leg of a tradfi Pair).  That block owns the file, and the merged
+            # -extended.csv rule does not apply to it.
+            continue
         info = symbols.get(symbol) or {}
         path = str((info or {}).get("path", "")).replace("\\", "/").lower()
         if "crypto_extended" not in path and not path.endswith("-extended.csv"):

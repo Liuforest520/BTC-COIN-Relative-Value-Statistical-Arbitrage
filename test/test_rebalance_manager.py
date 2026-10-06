@@ -125,7 +125,7 @@ def _strategy(protection_enabled=False, pair_override=None, model_lookback=10):
         estimator_ctor=TLSEstimator,
         estimator_cfg=EstimatorConfig(regression_method="price", position_update_policy="freeze", model_lookback_bars=model_lookback),
         protection_cfg=ProtectionConfig(enabled=protection_enabled),
-        rebalance_cfg=RebalanceConfig(enabled=True, minimum_entry_capital_ratio=0.5),
+        rebalance_cfg=RebalanceConfig(enabled=True),
     )
 
 
@@ -204,7 +204,7 @@ def test_affordable_qualified_candidates_are_not_limited_to_one():
         estimator_ctor=TLSEstimator,
         estimator_cfg=EstimatorConfig(regression_method="price", position_update_policy="freeze"),
         portfolio_ctor=PairTargetCapitalAllocator,
-        portfolio_cfg=PortfolioConfig(method="pair_target_capital", minimum_entry_capital_ratio=0.5),
+        portfolio_cfg=PortfolioConfig(method="pair_target_capital"),
         rebalance_cfg=RebalanceConfig(enabled=True),
     )
     candidates = {pair_id: _raw_candidate(pair_id, expected_return) for pair_id, expected_return in (("new_a", 0.04), ("new_b", 0.08))}

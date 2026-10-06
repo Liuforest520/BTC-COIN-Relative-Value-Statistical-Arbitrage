@@ -50,9 +50,10 @@ class Backtest:
         self.config = config
         estimator_cfg = self.config.strategy.pipeline.get("estimator", {}) or {}
         logger.info(
-            "backtest config: active_market={} active_setup={} pair_count={} "
+            "backtest config: active_market={} active_markets={} active_setup={} pair_count={} "
             "model_timeframe={} model_lookback_bars={} model_update_interval_bars={}",
             self.config.active_market,
+            getattr(self.config, "active_markets", (self.config.active_market,)),
             self.config.active_setup,
             len(self.config.strategy.pairs),
             estimator_cfg.get("model_timeframe", "1m"),
@@ -226,15 +227,28 @@ class Backtest:
         for symbol, info in self.config.symbols.items():
             if active_symbols and symbol not in active_symbols:
                 continue
-            if info["exchange"] not in exchange_names:
-                exchange_names.append(info["exchange"])
+            exchange = info.get("exchange", "binance")
+            if exchange not in exchange_names:
+                exchange_names.append(exchange)
+        execution_timeouts = []
+        common_execution = getattr(self.config.strategy, "execution", {}) or {}
+        if common_execution.get("pending_timeout_bars") is not None:
+            execution_timeouts.append(int(common_execution.get("pending_timeout_bars") or 0))
+        market_pipelines = getattr(self.config.strategy, "market_pipelines", {}) or {}
+        if not execution_timeouts and market_pipelines:
+            for view in market_pipelines.values():
+                execution = (view.get("pipeline", {}) or {}).get("execution", {}) or {}
+                if execution.get("pending_timeout_bars") is not None:
+                    execution_timeouts.append(int(execution.get("pending_timeout_bars") or 0))
+        if not execution_timeouts:
+            execution_timeouts.append(int((self.config.strategy.pipeline.get("execution", {}) or {}).get("pending_timeout_bars", 0)))
         return ExchangeManager.from_names(
             exchange_names=exchange_names,
             initial_cash=self.config.initial_cash,
             fee_rate=self.config.fee_rate,
             slippage_bps=self.config.slippage_bps,
             max_leverage=self._max_leverage(),
-            pending_timeout_bars=int((self.config.strategy.pipeline.get("execution", {}) or {}).get("pending_timeout_bars", 0)),
+            pending_timeout_bars=max(execution_timeouts),
         )
 
     def _max_leverage(self):
@@ -266,7 +280,7 @@ class Backtest:
                 continue
             path = Path(info["path"])
             data[symbol] = {
-                "exchange": info["exchange"],
+                "exchange": info.get("exchange", "binance"),
                 "path": path,
             }
         return data
@@ -324,11 +338,44 @@ class Backtest:
         for symbol, info in self.config.symbols.items():
             if active_symbols and symbol not in active_symbols:
                 continue
-            path = info.get("funding_path")
-            if not path:
+            path = self._funding_path(symbol, info)
+            if path is None:
                 continue
             frames.append(load_funding_data(Path(path), symbol=symbol))
         return build_funding_map(frames)
+
+    @staticmethod
+    def _funding_path(symbol, info):
+        """Resolve funding data without requiring a second path in config.
+
+        The pair-driven schema intentionally keeps one data path per symbol.
+        Preserve funding costs by accepting the legacy explicit ``funding_path``
+        when present and otherwise looking next to the raw Binance file, then
+        in the standard crypto/legacy locations.
+        """
+        explicit = info.get("funding_path") if isinstance(info, dict) else None
+        candidates = []
+        if explicit:
+            candidates.append(Path(explicit))
+        data_path = info.get("path") if isinstance(info, dict) else None
+        if data_path:
+            candidates.append(Path(data_path).parent / f"{symbol}-funding_rate_daily.csv")
+        candidates.extend(
+            [
+                Path("data") / "crypto" / symbol / f"{symbol}-funding_rate_daily.csv",
+                Path("data") / symbol / f"{symbol}-funding_rate_daily.csv",
+                Path("data") / "stocks" / "tradfi" / symbol / f"{symbol}-funding_rate_daily.csv",
+            ]
+        )
+        seen = set()
+        for candidate in candidates:
+            normalized = str(candidate).replace("\\", "/").lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if candidate.exists():
+                return candidate
+        return None
 
     def _check_funding_alignment(self, funding_data, market_data):
         if not self.config.funding_enabled:

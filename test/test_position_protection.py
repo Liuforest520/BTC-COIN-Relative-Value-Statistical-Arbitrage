@@ -616,10 +616,7 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
         ],
         estimator_ctor=TLSEstimator,
         estimator_cfg=EstimatorConfig(regression_method="price", position_update_policy="freeze"),
-        rebalance_cfg=RebalanceConfig(
-            enabled=True,
-            minimum_entry_capital_ratio=0.5,
-        ),
+        rebalance_cfg=RebalanceConfig(enabled=True),
     )
     for pair_id in ("old_a", "old_b"):
         pp = strategy.pipelines[pair_id]
@@ -655,7 +652,7 @@ def test_rebalance_release_uses_pair_net_liquidation_value():
     }
     raw = RawPairTarget(
         pair_id="new", ready=True, side="long_x", x_weight=0.5, y_weight=0.5,
-        x_price=10.0, y_price=10.0, gross_notional=600.0, target_capital=600.0,
+        x_price=10.0, y_price=10.0, gross_notional=350.0, target_capital=350.0,
         para={"rebalance_quality": {
             "adf_pvalue": 0.1,
             "theoretical_zero_return_x_move": 0.25,

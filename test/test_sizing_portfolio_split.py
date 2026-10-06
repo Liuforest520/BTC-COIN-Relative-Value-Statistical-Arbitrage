@@ -35,22 +35,22 @@ def test_beta_neutral_sizing_outputs_weights_not_amounts():
 
 
 
-def test_pair_target_capital_uses_available_margin_and_preserves_leg_weights():
+def test_pair_target_capital_requires_full_target_and_preserves_leg_weights():
     from core.modules.portfolio.allocator import PairTargetCapitalAllocator
-    allocator = PairTargetCapitalAllocator(equity=3_000_000, minimum_entry_capital_ratio=0.5)
+    allocator = PairTargetCapitalAllocator(equity=3_000_000)
     raw = RawPairTarget(
         pair_id="btc_coin", ready=True, side="long_x", x_weight=0.6, y_weight=0.4,
         x_price=100.0, y_price=50.0, gross_notional=600_000.0, target_capital=600_000.0,
     )
-    state = PortfolioState(ready=True, equity=3_000_000, available_balance=350_000)
+    state = PortfolioState(ready=True, equity=3_000_000, available_balance=600_000)
     target = allocator.allocate(state, {"btc_coin": raw}, 1).pair_targets["btc_coin"]
-    assert target.final_x_notional == 210_000.0
-    assert target.final_y_notional == 140_000.0
+    assert target.final_x_notional == 360_000.0
+    assert target.final_y_notional == 240_000.0
 
 
-def test_pair_target_capital_rejects_below_minimum_ratio_without_equity_fallback():
+def test_pair_target_capital_rejects_below_full_target_without_equity_fallback():
     from core.modules.portfolio.allocator import PairTargetCapitalAllocator
-    allocator = PairTargetCapitalAllocator(equity=3_000_000, minimum_entry_capital_ratio=0.5)
+    allocator = PairTargetCapitalAllocator(equity=3_000_000)
     raw = RawPairTarget(
         pair_id="btc_coin", ready=True, side="long_x", x_weight=0.5, y_weight=0.5,
         x_price=100.0, y_price=50.0, gross_notional=600_000.0, target_capital=600_000.0,
@@ -61,13 +61,11 @@ def test_pair_target_capital_rejects_below_minimum_ratio_without_equity_fallback
     assert allocation.constraint_report["underfunded_pair_ids"] == ["btc_coin"]
 
 
-def test_allocator_marks_only_cash_shortfalls_as_underfunded():
+def test_allocator_does_not_apply_an_implicit_signal_score_gate():
     from core.modules.portfolio.allocator import PairTargetCapitalAllocator
 
     allocator = PairTargetCapitalAllocator(
         equity=1_000.0,
-        minimum_entry_capital_ratio=0.5,
-        min_signal_score=2.0,
     )
     funded = RawPairTarget(
         pair_id="funded", ready=True, signal_strength=3.0,
@@ -77,18 +75,19 @@ def test_allocator_marks_only_cash_shortfalls_as_underfunded():
     underfunded = RawPairTarget(
         pair_id="underfunded", ready=True, signal_strength=3.0,
         x_weight=0.5, y_weight=0.5, x_price=10.0, y_price=10.0,
-        gross_notional=100.0, target_capital=100.0,
+        gross_notional=300.0, target_capital=300.0,
     )
     weak_signal = RawPairTarget(
         pair_id="weak", ready=True, signal_strength=1.0,
         x_weight=0.5, y_weight=0.5, x_price=10.0, y_price=10.0,
         gross_notional=100.0, target_capital=100.0,
     )
-    state = PortfolioState(ready=True, equity=1_000.0, available_balance=100.0)
+    state = PortfolioState(ready=True, equity=1_000.0, available_balance=200.0)
     allocation = allocator.allocate(
         state,
         {"funded": funded, "underfunded": underfunded, "weak": weak_signal},
         1,
     )
-    assert allocation.selected_pair_ids == ["funded"]
+    assert allocation.selected_pair_ids == ["funded", "weak"]
     assert allocation.constraint_report["underfunded_pair_ids"] == ["underfunded"]
+    assert "weak" not in allocation.constraint_report["skipped_pair_ids"]

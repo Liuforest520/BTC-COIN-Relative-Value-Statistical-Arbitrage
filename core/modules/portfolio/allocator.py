@@ -17,24 +17,16 @@ class PairTargetCapitalAllocator:
     Both legs consume gross margin; the exchange performs the final common
     proportional scale at executable prices.
     """
-    def __init__(self, equity=100000.0, minimum_entry_capital_ratio=0.5,
-                 allocation_mode="target_capital", min_signal_score=0.0,
-                 min_pair_weight=0.0, **_kwargs):
+    def __init__(self, equity=100000.0, **_kwargs):
         self.equity = float(equity)
-        self.minimum_entry_capital_ratio = float(minimum_entry_capital_ratio)
-        if not isfinite(self.minimum_entry_capital_ratio) or not 0.0 < self.minimum_entry_capital_ratio <= 1.0:
-            raise ValueError("minimum_entry_capital_ratio must be in (0, 1]")
-        self.allocation_mode = str(allocation_mode or "target_capital")
-        self.min_signal_score = max(0.0, float(min_signal_score or 0.0))
-        self.min_pair_weight = max(0.0, float(min_pair_weight or 0.0))
 
     def allocate(self, state: PortfolioState, targets: dict[str, RawPairTarget], bar_index: int):
-        ready = [(pid, raw) for pid, raw in targets.items()
-                 if raw.ready and _target_score(raw) >= self.min_signal_score]
+        # Every ready candidate is handled according to its configured
+        # target_capital.  There is intentionally no hidden signal-score gate
+        # or score-based reordering in the pair-target-capital allocator.
+        ready = [(pid, raw) for pid, raw in targets.items() if raw.ready]
         if not ready:
             return PortfolioAllocation(bar_index=bar_index, reason="no ready pairs")
-        if self.allocation_mode == "score_weighted":
-            ready.sort(key=lambda item: (-_target_score(item[1]), item[0]))
 
         # Zero available balance is a real account state, not a reason to
         # create buying power from equity.  Fall back only for legacy state
@@ -55,17 +47,12 @@ class PairTargetCapitalAllocator:
             target = _raw_target_capital(raw)
             if target <= 0:
                 target = max(0.0, float(raw.gross_notional or raw.x_notional + raw.y_notional))
-            minimum = target * self.minimum_entry_capital_ratio
-            if target <= 0 or available < minimum - 1e-9:
+            if target <= 0 or available < target - 1e-9:
                 skipped.append(pair_id)
                 if target > 0:
                     underfunded.append(pair_id)
                 continue
-            gross = min(target, available)
-            if gross < minimum - 1e-9:
-                skipped.append(pair_id)
-                underfunded.append(pair_id)
-                continue
+            gross = target
             pair_targets[pair_id] = _allocated_from_gross(
                 pair_id, raw, gross, self.equity,
                 f"pair_target_capital target={target:.2f} allocated={gross:.2f}",
@@ -212,21 +199,6 @@ def _raw_symbol(raw: RawPairTarget, key: str) -> str | None:
     pair_para = para.get("pair", {}) if isinstance(para.get("pair"), dict) else {}
     value = pair_para.get(key)
     return str(value) if value else None
-
-
-def _target_score(raw: RawPairTarget) -> float:
-    score = _float_or_default(getattr(raw, "signal_strength", 0.0), 0.0)
-    if score > 0:
-        return score
-
-    para = raw.para if isinstance(raw.para, dict) else {}
-    signal_para = para.get("signal", {}) if isinstance(para.get("signal"), dict) else {}
-    checks = (
-        signal_para.get("entry_quality_checks", {})
-        if isinstance(signal_para.get("entry_quality_checks"), dict)
-        else {}
-    )
-    return max(_float_or_default(checks.get("score"), 0.0), 0.0)
 
 
 def _float_or_default(value, default: float) -> float:

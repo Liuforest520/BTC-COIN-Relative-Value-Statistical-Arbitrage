@@ -62,7 +62,19 @@ def set_run_name(config: dict, run_name: str) -> None:
 
 def active_setup_block(config: dict) -> dict:
     setup = config.setdefault("setups", {}).setdefault(config["active_setup"], {})
+    if setup.get("pipelines") is not None:
+        markets = {
+            str(pair.get("market", "")).strip().lower()
+            for pair in setup.get("pairs", []) or []
+            if pair.get("enabled", True)
+        }
+        if len(markets) != 1:
+            raise ValueError("this generator requires Pairs from exactly one market profile")
+        market = next(iter(markets))
+        return (setup.get("pipelines") or {}).get(market) or {}
     market = str(config.get("active_market", "")).strip().lower()
+    if market == "combined":
+        raise ValueError("this generator requires a single-market source config")
     if market:
         markets = setup.get("markets") or {}
         if market not in markets:
