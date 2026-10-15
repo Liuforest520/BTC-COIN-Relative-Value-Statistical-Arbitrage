@@ -26,6 +26,12 @@ def main():
         help="Use pair or shared portfolio parameter optimization.",
     )
     parser.add_argument(
+        "--candidate-batch-size",
+        type=int,
+        default=None,
+        help="Override portfolio Numba candidate batch size without editing YAML.",
+    )
+    parser.add_argument(
         "--trade-review",
         action="store_true",
         dest="trade_review",
@@ -56,10 +62,11 @@ def main():
     )
     full_log_path = setup_logger(log_file, rotation=None, retention=None)
     logger.info(
-        "walk-forward command started config={} run_name={} optimizer={} log_file={}",
+        "walk-forward command started config={} run_name={} optimizer={} candidate_batch_size={} log_file={}",
         args.config_path,
         run_name,
         args.optimizer,
+        args.candidate_batch_size,
         full_log_path,
     )
     output_dir, result, _schedule = run_walk_forward(
@@ -69,6 +76,7 @@ def main():
         show_progress=args.show_progress,
         optimizer=args.optimizer,
         optimization_scope=args.optimization_scope,
+        candidate_batch_size=args.candidate_batch_size,
         include_trade_review=args.trade_review,
         include_curve_charts=not args.no_curve_charts,
     )

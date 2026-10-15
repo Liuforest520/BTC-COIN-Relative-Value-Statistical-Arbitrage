@@ -414,6 +414,7 @@ def _run_portfolio_walk_forward(
     optimizer="numba",
     include_trade_review=True,
     include_curve_charts=True,
+    candidate_batch_size=None,
 ):
     """Run the shared-parameter portfolio scope without changing pair scope."""
     if str(optimizer).lower() != "numba":
@@ -448,6 +449,15 @@ def _run_portfolio_walk_forward(
         wf.validation_months, wf.step_months, start, end,
     )
 
+    output_dir = Path(output_root or "results/walk_forward") / (run_name or config_path.stem)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_yaml(output_dir / "walk_forward_config.yaml", {
+        "walk_forward": _dataclass_dict(wf), "optimizer": optimizer,
+        "optimization_scope": "portfolio", "windows": [window.__dict__ for window in windows],
+    })
+    if config_path.exists():
+        (output_dir / "config.yaml").write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+
     schedule = {pair.get("pair_id"): [] for pair in selected_pairs}
     candidate_rows = []
     portfolio_pair_rows = []
@@ -473,6 +483,7 @@ def _run_portfolio_walk_forward(
                     "portfolio candidate progress window={}/{} candidates={}/{} active_pairs={} skipped_pairs={}",
                     window_index, len(windows), done, total, active, skipped,
                 ),
+                candidate_batch_size=candidate_batch_size,
             )
         except Exception:
             logger.exception(
@@ -560,10 +571,21 @@ def _run_portfolio_walk_forward(
             "skipped_pairs": json.dumps(result.get("skipped_pairs", []), ensure_ascii=False),
             "selection_filter_summary": json.dumps(result.get("selection_filter_summary", {}), ensure_ascii=False),
         })
+        _write_json(output_dir / "parameter_schedule.json", schedule)
+        _write_csv(output_dir / "parameter_schedule.csv", _schedule_rows(schedule))
+        _write_csv(output_dir / "window_summary.csv", window_rows)
+        _write_csv(output_dir / "portfolio_window_summary.csv", window_rows)
+        _write_json(output_dir / "walk_forward_checkpoint.json", {
+            "optimization_scope": "portfolio",
+            "completed_windows": window_index,
+            "total_windows": len(windows),
+            "last_completed_window": window.__dict__,
+            "schedule_file": "parameter_schedule.json",
+        })
         logger.info(
-            "portfolio window finished window={}/{} selected_candidate={} score={} active_pairs={} skipped_pairs={} elapsed_seconds={:.3f}",
+            "portfolio window finished window={}/{} selected_candidate={} score={} active_pairs={} skipped_pairs={} elapsed_seconds={:.3f} checkpoint_saved={}",
             window_index, len(windows), global_index, selection_score, active_count,
-            skipped_count, time.perf_counter() - window_started,
+            skipped_count, time.perf_counter() - window_started, output_dir / "parameter_schedule.json",
         )
 
     usable_schedule = {key: value for key, value in schedule.items() if value}
@@ -583,8 +605,6 @@ def _run_portfolio_walk_forward(
         parameter_schedule=usable_schedule, oos_start_ts=first_validation,
     ).run()
 
-    output_dir = Path(output_root or "results/walk_forward") / (run_name or config_path.stem)
-    output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "parameter_schedule.json", usable_schedule)
     _write_yaml(output_dir / "walk_forward_config.yaml", {
         "walk_forward": _dataclass_dict(wf), "optimizer": optimizer,
@@ -627,6 +647,7 @@ def run_walk_forward(
     include_trade_review=True,
     include_curve_charts=True,
     optimization_scope=None,
+    candidate_batch_size=None,
 ):
     config_path = Path(config_path)
     config = load_config(config_path)
@@ -644,6 +665,7 @@ def run_walk_forward(
             optimizer=optimizer,
             include_trade_review=include_trade_review,
             include_curve_charts=include_curve_charts,
+            candidate_batch_size=candidate_batch_size,
         )
     start = wf.start_date or _date_from_ts(config.backtest_start_ts)
     end = wf.end_date or _date_from_ts(config.backtest_end_ts)
@@ -666,6 +688,14 @@ def run_walk_forward(
     total_tasks = len(selected_pairs) * len(windows)
     completed_tasks = 0
     run_started = time.perf_counter()
+    output_dir = Path(output_root or "results/walk_forward") / (run_name or config_path.stem)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_yaml(output_dir / "walk_forward_config.yaml", {
+        "walk_forward": _dataclass_dict(wf), "optimizer": optimizer,
+        "optimization_scope": "pair", "windows": [window.__dict__ for window in windows],
+    })
+    if config_path.exists():
+        (output_dir / "config.yaml").write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
     logger.info(
         "walk-forward run started config={} pairs={} windows={} total_pair_windows={} optimizer={} train_months={} validation_months={} step_months={} date_range=[{}, {})",
         config_path,
@@ -749,8 +779,20 @@ def run_walk_forward(
                 }
                 previous = selected["parameters"]
             pair_schedule.append(entry)
+            schedule[pair_id] = pair_schedule
             candidate_rows.extend(result["candidates"])
             window_rows.append({"pair_id": pair_id, "train_start": window.train_start, "train_end": window.train_end, "validation_start": window.validation_start, "validation_end": window.validation_end, "selected": bool(selected), "selection_score": entry["selection_score"], "fallback": entry["fallback"], "skipped": entry["skipped"]})
+            _write_json(output_dir / "parameter_schedule.json", schedule)
+            _write_csv(output_dir / "parameter_schedule.csv", _schedule_rows(schedule))
+            _write_csv(output_dir / "window_summary.csv", window_rows)
+            _write_json(output_dir / "walk_forward_checkpoint.json", {
+                "optimization_scope": "pair",
+                "completed_pair_windows": completed_tasks + 1,
+                "total_pair_windows": total_tasks,
+                "last_pair_id": pair_id,
+                "last_completed_window": window.__dict__,
+                "schedule_file": "parameter_schedule.json",
+            })
             completed_tasks += 1
             elapsed = time.perf_counter() - run_started
             rate = completed_tasks / elapsed if elapsed > 0 else 0.0
@@ -806,8 +848,6 @@ def run_walk_forward(
         final.metrics.get("total_return"),
     )
 
-    output_dir = Path(output_root or "results/walk_forward") / (run_name or config_path.stem)
-    output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "parameter_schedule.json", schedule)
     _write_yaml(output_dir / "walk_forward_config.yaml", {"walk_forward": _dataclass_dict(wf), "optimizer": optimizer, "windows": [window.__dict__ for window in windows]})
     _write_csv(output_dir / "parameter_schedule.csv", _schedule_rows(schedule))

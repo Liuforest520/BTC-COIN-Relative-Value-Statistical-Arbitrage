@@ -23,6 +23,7 @@ def run_numba_portfolio_optimizer(
     max_bars,
     wf,
     progress_callback=None,
+    candidate_batch_size=None,
 ):
     """Run every candidate against all pairs on one shared account.
 
@@ -59,7 +60,14 @@ def run_numba_portfolio_optimizer(
     pair_metrics = []
     initial_equity = float(config.initial_cash)
     max_leverage = float((config.risk or {}).get("max_leverage", 1.0) or 1.0)
-    batch_size = max(1, int(getattr(wf, "portfolio_candidate_batch_size", 16) or 16))
+    batch_size = max(
+        1,
+        int(
+            candidate_batch_size
+            if candidate_batch_size is not None
+            else getattr(wf, "portfolio_candidate_batch_size", 16)
+        ),
+    )
     logger.info(
         "portfolio synchronized data ready pairs={} skipped={} timestamps={} rows={} candidates={} batch_size={}",
         active_pairs, len(skipped_pairs), len(prepared.timestamps),
