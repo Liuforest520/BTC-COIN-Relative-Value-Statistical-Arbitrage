@@ -87,9 +87,11 @@ class Exchange:
         self.orders = remaining_orders
 
     def cancel_all_orders(self):
+        canceled = list(self.orders)
         for order in self.orders:
             order.status = OrderStatus.CANCELED
         self.orders = []
+        return canceled
 
     def begin_bar(self, bars, funding_rates=None):
         """Mark at the executable open and settle funding once."""

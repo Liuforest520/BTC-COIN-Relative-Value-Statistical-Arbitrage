@@ -38,6 +38,7 @@ class WalkForwardConfig:
     portfolio_require_all_pairs: bool = False
     portfolio_candidate_batch_size: int = 16
     process_workers: int = 1
+    parameter_transition_mode: str = "defer_until_flat"
 
     def __post_init__(self):
         for name in ("train_months", "validation_months", "step_months"):
@@ -63,6 +64,16 @@ class WalkForwardConfig:
         self.portfolio_require_all_pairs = _as_bool(self.portfolio_require_all_pairs)
         self.portfolio_candidate_batch_size = max(1, int(self.portfolio_candidate_batch_size))
         self.process_workers = max(1, int(self.process_workers))
+        self.parameter_transition_mode = str(
+            self.parameter_transition_mode or "defer_until_flat"
+        ).strip().lower()
+        if self.parameter_transition_mode not in {
+            "defer_until_flat", "close_at_boundary", "switch_immediately",
+        }:
+            raise ValueError(
+                "walk_forward.parameter_transition_mode must be "
+                "'defer_until_flat', 'close_at_boundary', or 'switch_immediately'"
+            )
         if self.warmup_max_bars is not None:
             self.warmup_max_bars = max(1, int(self.warmup_max_bars))
 
@@ -168,6 +179,9 @@ def _walk_forward_config(raw: dict) -> WalkForwardConfig:
         portfolio_require_all_pairs=_as_bool(portfolio.get("require_all_pairs", False)),
         portfolio_candidate_batch_size=portfolio.get("candidate_batch_size", 16),
         process_workers=raw.get("process_workers", raw.get("workers", 1)),
+        parameter_transition_mode=raw.get(
+            "parameter_transition_mode", "defer_until_flat"
+        ),
     )
 
 

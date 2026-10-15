@@ -37,8 +37,10 @@ class ExchangeManager:
         }
 
     def cancel_all_orders(self):
+        canceled = []
         for exchange in self.exchanges.values():
-            exchange.cancel_all_orders()
+            canceled.extend(exchange.cancel_all_orders())
+        return canceled
 
     def place_orders(self, orders):
         if orders is None:

@@ -38,6 +38,12 @@ def main():
         help="Walk-Forward training process count; 1 disables process parallelism.",
     )
     parser.add_argument(
+        "--parameter-transition-mode",
+        choices=("defer_until_flat", "close_at_boundary", "switch_immediately"),
+        default=None,
+        help="Override how OOS positions are handled when validation parameters change.",
+    )
+    parser.add_argument(
         "--trade-review",
         action="store_true",
         dest="trade_review",
@@ -68,12 +74,13 @@ def main():
     )
     full_log_path = setup_logger(log_file, rotation=None, retention=None)
     logger.info(
-        "walk-forward command started config={} run_name={} optimizer={} candidate_batch_size={} workers={} log_file={}",
+        "walk-forward command started config={} run_name={} optimizer={} candidate_batch_size={} workers={} parameter_transition_mode={} log_file={}",
         args.config_path,
         run_name,
         args.optimizer,
         args.candidate_batch_size,
         args.workers,
+        args.parameter_transition_mode,
         full_log_path,
     )
     output_dir, result, _schedule = run_walk_forward(
@@ -85,6 +92,7 @@ def main():
         optimization_scope=args.optimization_scope,
         candidate_batch_size=args.candidate_batch_size,
         process_workers=args.workers,
+        parameter_transition_mode=args.parameter_transition_mode,
         include_trade_review=args.trade_review,
         include_curve_charts=not args.no_curve_charts,
     )

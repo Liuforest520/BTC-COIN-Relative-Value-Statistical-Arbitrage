@@ -250,9 +250,19 @@ class MultiPairStrategy(BaseStrategy):
         self._parameter_schedule_cursor: dict[str, int] = {}
         self._pending_parameter_entries: dict[str, dict] = {}
         self._schedule_disabled_pairs: set[str] = set()
+        self._parameter_transition_mode = "defer_until_flat"
 
-    def set_parameter_schedule(self, schedule: dict | None) -> None:
+    def set_parameter_schedule(
+        self, schedule: dict | None, transition_mode: str | None = None,
+    ) -> None:
         """Install a pair-local monthly schedule for the continuous run."""
+        if transition_mode is not None:
+            transition_mode = str(transition_mode).strip().lower()
+            if transition_mode not in {
+                "defer_until_flat", "close_at_boundary", "switch_immediately",
+            }:
+                raise ValueError(f"unsupported parameter transition mode: {transition_mode}")
+            self._parameter_transition_mode = transition_mode
         self._parameter_schedule = dict(schedule or {})
         self._parameter_schedule_cursor = {pair_id: -1 for pair_id in self.pipelines}
         self._pending_parameter_entries = {}
@@ -261,6 +271,48 @@ class MultiPairStrategy(BaseStrategy):
     def apply_parameter_schedule(self, ts: int, schedule: dict | None = None) -> None:
         if schedule is not None:
             self.set_parameter_schedule(schedule)
+        self._apply_due_parameter_entries(ts, close_positions=False)
+
+    def prepare_parameter_boundary(self, ts: int) -> dict:
+        """Apply a due schedule before the boundary bar can fill stale orders."""
+        if self._parameter_transition_mode == "defer_until_flat":
+            return {"transitioned": False, "orders": []}
+        return self._apply_due_parameter_entries(
+            ts,
+            close_positions=self._parameter_transition_mode == "close_at_boundary",
+        )
+
+    def prepare_final_parameter_boundary(self, ts: int) -> dict:
+        """Close the final validation window when boundary-flat mode is active."""
+        if self._parameter_transition_mode != "close_at_boundary":
+            return {"transitioned": False, "orders": []}
+        orders = []
+        for pair_id, pipeline in self.pipelines.items():
+            if not pipeline.has_position():
+                continue
+            pair_def = self._pair_defs_by_id.get(pair_id)
+            if pair_def is None:
+                continue
+            fallback_hedge = (
+                pipeline.state.sizing_state.target_hedge_ratio
+                or pipeline.state.estimator_state.hedge_beta
+                or 1.0
+            )
+            orders.extend(self._close_orders(
+                pair_id,
+                pipeline,
+                pair_def,
+                fallback_hedge,
+                exit_reason="walk_forward_validation_end",
+                exit_class="walk_forward_boundary",
+            ))
+        # Mark the terminal boundary even when only stale pending opens need
+        # cancellation and no live position requires a close.
+        return {"transitioned": True, "orders": orders, "ts": int(ts)}
+
+    def _apply_due_parameter_entries(self, ts: int, close_positions: bool) -> dict:
+        orders = []
+        transitioned = False
         for pair_id, entries in self._parameter_schedule.items():
             pipeline = self.pipelines.get(pair_id)
             if pipeline is None:
@@ -269,30 +321,61 @@ class MultiPairStrategy(BaseStrategy):
                 entries = [dict(value, validation_start=key) for key, value in entries.items()]
             ordered = sorted(entries or [], key=lambda item: _schedule_ts(item.get("validation_start", item.get("validation_start_ts"))))
             cursor = self._parameter_schedule_cursor.get(pair_id, -1)
+            pair_transitioned = False
             for index, entry in enumerate(ordered):
                 start_ts = _schedule_ts(entry.get("validation_start", entry.get("validation_start_ts")))
                 if start_ts is None or start_ts > int(ts) or index <= cursor:
                     continue
                 self._parameter_schedule_cursor[pair_id] = index
+                cursor = index
+                pair_transitioned = True
+                transitioned = True
                 if entry.get("skipped"):
                     self._schedule_disabled_pairs.add(pair_id)
+                    self._pending_parameter_entries.pop(pair_id, None)
                     continue
                 self._schedule_disabled_pairs.discard(pair_id)
-                if pipeline.has_position():
+                if self._parameter_transition_mode == "switch_immediately":
+                    self._pending_parameter_entries.pop(pair_id, None)
+                    self._apply_pair_parameter_entry(
+                        pair_id, entry, defer_if_position=False,
+                    )
+                elif pipeline.has_position():
                     self._pending_parameter_entries[pair_id] = entry
                 else:
                     self._apply_pair_parameter_entry(pair_id, entry)
+            if close_positions and pair_transitioned and pipeline.has_position():
+                pair_def = self._pair_defs_by_id.get(pair_id)
+                if pair_def is not None:
+                    fallback_hedge = (
+                        pipeline.state.sizing_state.target_hedge_ratio
+                        or pipeline.state.estimator_state.hedge_beta
+                        or 1.0
+                    )
+                    orders.extend(self._close_orders(
+                        pair_id,
+                        pipeline,
+                        pair_def,
+                        fallback_hedge,
+                        exit_reason="walk_forward_validation_end",
+                        exit_class="walk_forward_boundary",
+                    ))
             pending = self._pending_parameter_entries.get(pair_id)
             if pending is not None and not pipeline.has_position():
                 self._apply_pair_parameter_entry(pair_id, pending)
                 self._pending_parameter_entries.pop(pair_id, None)
+        return {"transitioned": transitioned, "orders": orders, "ts": int(ts)}
 
-    def _apply_pair_parameter_entry(self, pair_id: str, entry: dict) -> None:
+    def _apply_pair_parameter_entry(
+        self, pair_id: str, entry: dict, defer_if_position: bool = True,
+    ) -> None:
         pipeline = self.pipelines.get(pair_id)
         if pipeline is None:
             return
         parameters = entry.get("parameters", entry.get("params", entry)) or {}
-        if pipeline.apply_parameter_patch(parameters, defer_if_position=True) == "deferred":
+        if pipeline.apply_parameter_patch(
+            parameters, defer_if_position=defer_if_position,
+        ) == "deferred":
             self._pending_parameter_entries[pair_id] = entry
             return
         protection_patch = dict(parameters.get("protection") or {})
@@ -303,6 +386,14 @@ class MultiPairStrategy(BaseStrategy):
             clean = {field.name: values[field.name] for field in dataclasses.fields(ProtectionConfig) if field.name in values}
             pipeline.protection_cfg = ProtectionConfig(**clean)
             self.protection_managers[pair_id] = ProtectionManager(pipeline.protection_cfg)
+            if not defer_if_position and pipeline.has_position():
+                protection_state = pipeline.state.protection_state
+                protection_state.pair_loss_stop_return = float(
+                    pipeline.protection_cfg.pair_loss_stop_return
+                )
+                protection_state.pair_loss_stop_freeze_bars = (
+                    self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
+                )
         pipeline.state.last_block_reason = ""
 
     def _pair_estimator_cfg(self, pipeline):

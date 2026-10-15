@@ -82,7 +82,17 @@ class Backtest:
         self.parameter_schedule = parameter_schedule or {}
         self.oos_start_ts = oos_start_ts
         if self.parameter_schedule and hasattr(self.strategy, "set_parameter_schedule"):
-            self.strategy.set_parameter_schedule(self.parameter_schedule)
+            transition_mode = getattr(
+                self.config.walk_forward,
+                "parameter_transition_mode",
+                "defer_until_flat",
+            )
+            try:
+                self.strategy.set_parameter_schedule(
+                    self.parameter_schedule, transition_mode=transition_mode,
+                )
+            except TypeError:
+                self.strategy.set_parameter_schedule(self.parameter_schedule)
         self.orders = []
         self.trades = []
         self.position_curve = NumericCurveBuffer()
@@ -119,8 +129,9 @@ class Backtest:
                 and processed_bars % self.progress_interval_bars == 0
             ):
                 self.progress_callback(processed_bars)
-            last_bars = bars
             ts = self._bars_ts(bars)
+            self._process_parameter_boundary(ts)
+            last_bars = bars
             if self.config.funding_enabled:
                 new_funding_events, funding_index = self._funding_events_for_bar(
                     funding_data,
@@ -202,6 +213,10 @@ class Backtest:
                 self.strategy.on_orders_accepted(accepted_orders)
                 self.orders.extend(accepted_orders)
 
+        terminal_bars = self._process_final_parameter_boundary()
+        if terminal_bars is not None:
+            last_bars = terminal_bars
+
         metrics = calculate_metrics(
             equity_curve=self._measurement_equity_curve(self.exchange_manager.equity_curve),
             orders=self.orders,
@@ -234,6 +249,119 @@ class Backtest:
             fee_rate=self.config.fee_rate,
             slippage_bps=self.config.slippage_bps,
         )
+
+    def _process_parameter_boundary(self, ts: int | None) -> None:
+        callback = getattr(self.strategy, "prepare_parameter_boundary", None)
+        if ts is None or not callable(callback):
+            return
+        boundary = callback(int(ts)) or {}
+        if not boundary.get("transitioned"):
+            return
+        self._execute_parameter_boundary(boundary, int(ts))
+        apply_schedule = getattr(self.strategy, "apply_parameter_schedule", None)
+        if callable(apply_schedule):
+            apply_schedule(int(ts))
+
+    def _process_final_parameter_boundary(self):
+        callback = getattr(self.strategy, "prepare_final_parameter_boundary", None)
+        if not callable(callback):
+            return None
+        boundary_ts = self._backtest_end_ts()
+        if boundary_ts is None:
+            latest = self._latest_exchange_bar_ts()
+            boundary_ts = latest + 1 if latest is not None else None
+        if boundary_ts is None:
+            return None
+        boundary = callback(int(boundary_ts)) or {}
+        if not boundary.get("transitioned"):
+            return None
+        return self._execute_parameter_boundary(boundary, int(boundary_ts))
+
+    def _execute_parameter_boundary(self, boundary: dict, boundary_ts: int):
+        canceled = self.exchange_manager.cancel_all_orders()
+        if canceled:
+            self.strategy.on_orders_rejected(canceled)
+        orders = list(boundary.get("orders") or [])
+        if not orders:
+            logger.info(
+                "walk-forward parameter boundary applied ts={} mode={} close_orders=0 canceled_orders={}",
+                boundary_ts,
+                getattr(self.config.walk_forward, "parameter_transition_mode", "defer_until_flat"),
+                len(canceled),
+            )
+            return None
+        bars = self._synthetic_boundary_bars(boundary_ts)
+        if not bars:
+            raise RuntimeError(
+                f"cannot execute walk-forward boundary closes at {boundary_ts}: no prior market bars"
+            )
+        accepted = self.exchange_manager.place_orders(orders)
+        rejected_on_submit = [order for order in orders if order not in accepted]
+        if len(accepted) != len(orders):
+            canceled_partial = self.exchange_manager.cancel_all_orders()
+            self.strategy.on_orders_rejected(rejected_on_submit + canceled_partial)
+            raise RuntimeError(
+                f"walk-forward boundary close was not accepted atomically at {boundary_ts}"
+            )
+        self.strategy.on_orders_accepted(accepted)
+        self.orders.extend(accepted)
+        result = self.exchange_manager.on_bar(bars, funding_rates=[])
+        boundary_fill_ts = self._bars_ts(bars)
+        self.position_curve.append(self._position_snapshot(boundary_fill_ts, bars, result))
+        forced_orders = result.get("forced_deleveraging_orders", [])
+        if forced_orders:
+            self.orders.extend(forced_orders)
+        new_trades = result.get("new_trades", [])
+        rejected = result.get("rejected_orders", [])
+        if new_trades:
+            self.trades.extend(new_trades)
+            self.strategy.on_trades_filled(new_trades)
+            self.risk_manager.check_trades(new_trades, result.get("positions", {}), bars)
+        if rejected:
+            self.strategy.on_orders_rejected(rejected)
+        self.strategy.set_portfolio_context(
+            cash=result.get("cash", 0),
+            equity=result.get("equity", 0),
+            available_balance=result.get("available_balance", 0),
+            pair_marked_equity=result.get("pair_marked_equity", {}),
+        )
+        logger.info(
+            "walk-forward validation boundary flattened ts={} fill_ts={} close_orders={} fills={} canceled_orders={}",
+            boundary_ts,
+            boundary_fill_ts,
+            len(accepted),
+            len(new_trades),
+            len(canceled),
+        )
+        return bars
+
+    def _latest_exchange_bar_ts(self):
+        timestamps = []
+        for exchange in self.exchange_manager.exchanges.values():
+            for bar in exchange.last_bars.values():
+                value = bar.get("ts") if isinstance(bar, dict) else bar[0]
+                if value is not None:
+                    timestamps.append(int(value))
+        return max(timestamps) if timestamps else None
+
+    def _synthetic_boundary_bars(self, boundary_ts: int):
+        latest_ts = self._latest_exchange_bar_ts()
+        if latest_ts is None:
+            return {}
+        fill_ts = min(int(boundary_ts) - 1, latest_ts + 1)
+        bars = {}
+        for exchange_name, exchange in self.exchange_manager.exchanges.items():
+            for symbol, bar in exchange.last_bars.items():
+                if isinstance(bar, dict):
+                    close = float(bar["close"])
+                    volume = float(bar.get("volume", 0.0) or 0.0)
+                else:
+                    close = float(bar[3])
+                    volume = float(bar[5]) if len(bar) > 5 else 0.0
+                bars.setdefault(exchange_name, {})[symbol] = [
+                    fill_ts, close, close, close, close, volume,
+                ]
+        return bars
 
     def _build_exchange_manager(self):
         exchange_names = []

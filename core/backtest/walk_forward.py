@@ -781,10 +781,21 @@ def run_walk_forward(
     optimization_scope=None,
     candidate_batch_size=None,
     process_workers=None,
+    parameter_transition_mode=None,
 ):
     config_path = Path(config_path).resolve()
     config = load_config(config_path)
     wf = config.walk_forward
+    if parameter_transition_mode is not None:
+        mode = str(parameter_transition_mode).strip().lower()
+        if mode not in {
+            "defer_until_flat", "close_at_boundary", "switch_immediately",
+        }:
+            raise ValueError(
+                "parameter_transition_mode must be 'defer_until_flat', "
+                "'close_at_boundary', or 'switch_immediately'"
+            )
+        wf.parameter_transition_mode = mode
     optimization_scope = str(optimization_scope or getattr(wf, "optimization_scope", "pair")).lower()
     if optimization_scope not in {"pair", "portfolio"}:
         raise ValueError("optimization_scope must be 'pair' or 'portfolio'")

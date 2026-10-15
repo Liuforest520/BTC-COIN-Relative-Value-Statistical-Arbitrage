@@ -116,9 +116,10 @@ class PairPipeline:
     def apply_parameter_patch(self, patch: dict, defer_if_position: bool = True) -> str:
         """Apply pair-local parameters while preserving estimator history.
 
-        A live position keeps the estimator/signal/protection basis that was
-        active at entry.  ``MultiPairStrategy`` calls this method again after
-        the position is flat when a deferred schedule is pending.
+        When ``defer_if_position`` is true, a live position keeps the
+        estimator/signal basis that was active at entry.  The immediate
+        transition mode passes false and deliberately rebuilds those stages
+        while preserving price history and the live position quantities.
         """
         patch = dict(patch or {})
         if defer_if_position and self.has_position():
