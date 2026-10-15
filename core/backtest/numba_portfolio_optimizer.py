@@ -7,8 +7,8 @@ from loguru import logger
 from core.backtest.numba_pair_optimizer import (
     _slice_grid,
     add_neighbor_scores,
+    apply_relative_metric_scores,
     build_candidate_grid,
-    score_candidate_metrics,
 )
 from core.backtest.numba_shared_portfolio import run_shared_portfolio_batch
 from core.backtest.portfolio_data_stream import PortfolioDataStream
@@ -109,8 +109,6 @@ def run_numba_portfolio_optimizer(
             for local_index, parameters in enumerate(batch.parameters):
                 candidate_index = batch_start + local_index
                 metrics = _portfolio_metrics(result, local_index, initial_equity, wf.subperiod_count)
-                components = score_candidate_metrics(metrics)
-                metrics.update(components)
                 row = {
                     "pair_id": "__portfolio__",
                     "optimization_scope": "portfolio",
@@ -119,8 +117,8 @@ def run_numba_portfolio_optimizer(
                     "candidate_index": candidate_index,
                     "parameters": parameters,
                     "metrics": metrics,
-                    "own_score": components["own_score"],
-                    "selection_score": components["own_score"],
+                    "own_score": 0.0,
+                    "selection_score": 0.0,
                     "eligible": _eligible(metrics, wf),
                     "active_pair_count": active_pairs,
                     "skipped_pair_count": len(skipped_pairs),
@@ -142,6 +140,7 @@ def run_numba_portfolio_optimizer(
     finally:
         prepared.close()
 
+    apply_relative_metric_scores(rows)
     add_neighbor_scores(rows, grid)
     for row in rows:
         row["metrics"]["selection_score"] = row["selection_score"]
@@ -183,6 +182,12 @@ def _portfolio_metrics(result, index, initial, subperiod_count):
         "subperiod_return_std": float(result[14][index]),
         "subperiod_count": int(subperiod_count),
         "rejected_open_count": int(result[23][index]),
+        "holding_time_sum_hours": float(result[24][index]),
+        "holding_trade_count": int(result[25][index]),
+        "average_holding_time_hours": (
+            float(result[24][index]) / int(result[25][index])
+            if int(result[25][index]) > 0 else 0.0
+        ),
     }
 
 
@@ -206,6 +211,13 @@ def _pair_rows(prepared, result, local_index, candidate_index, train_start, trai
                 "max_drawdown_on_target_capital": float(result[20][local_index, pair_index]) / target,
                 "total_fee": float(result[21][local_index, pair_index]),
                 "funding_fee": float(result[22][local_index, pair_index]),
+                "holding_time_sum_hours": float(result[26][local_index, pair_index]),
+                "holding_trade_count": int(result[27][local_index, pair_index]),
+                "average_holding_time_hours": (
+                    float(result[26][local_index, pair_index])
+                    / int(result[27][local_index, pair_index])
+                    if int(result[27][local_index, pair_index]) > 0 else 0.0
+                ),
             },
         })
     return output
@@ -287,8 +299,7 @@ def _eligible(metrics, wf):
         max(0, int(wf.min_active_subperiods)),
     )
     return (
-        int(metrics.get("trade_count", 0)) >= int(wf.min_trades)
-        and int(metrics.get("active_subperiod_count", 0)) >= required_active
+        int(metrics.get("active_subperiod_count", 0)) >= required_active
         and (
             wf.max_drawdown is None
             or metrics.get("max_drawdown_on_target_capital", 0.0) >= -abs(float(wf.max_drawdown))

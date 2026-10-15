@@ -17,6 +17,7 @@ from loguru import logger
 from core.backtest.backtest import Backtest
 from core.backtest.pair_data_cache import NoAlignedPairDataError, load_pair_data
 from core.backtest.numba_pair_optimizer import (
+    apply_relative_metric_scores,
     build_candidate_grid,
     run_numba_pair_optimizer,
     score_candidate_metrics,
@@ -255,6 +256,7 @@ class WalkForwardParameterOptimizer:
                     len(candidates),
                     100.0 * (index + 1) / max(1, len(candidates)),
                 )
+        apply_relative_metric_scores(rows)
         selected = _select_best_eligible(rows)
         logger.info(
             "walk-forward optimize finished pair={} train=[{}, {}) selected_candidate={} selection_score={} elapsed_seconds={:.3f}",
@@ -375,6 +377,7 @@ class WalkForwardParameterOptimizer:
                 "train_end": window.train_end,
                 **row,
             })
+        apply_relative_metric_scores(normalized)
         selected = _select_best_eligible(normalized)
         if selected is None:
             logger.warning(
@@ -1057,18 +1060,62 @@ def _training_metrics(metrics, curve, trades, target_capital, initial_equity, st
         "subperiod_return_std": subperiod_std,
         "subperiod_count": count,
     })
+    holding_minutes = _closed_holding_minutes(trades, start_ts, end_ts)
+    result["holding_time_sum_hours"] = sum(holding_minutes) / 60.0
+    result["holding_trade_count"] = len(holding_minutes)
+    result["average_holding_time_hours"] = (
+        sum(holding_minutes) / len(holding_minutes) / 60.0 if holding_minutes else 0.0
+    )
     result.update(score_candidate_metrics(result))
     return result
 
 
+def _closed_holding_minutes(trades, start_ts, end_ts):
+    """Reconstruct position holding times from fill-level Trade events."""
+    positions = {}
+    for trade in trades or []:
+        if isinstance(trade, dict):
+            action = trade.get("action")
+            timestamp = trade.get("ts")
+            position_id = trade.get("position_id") or trade.get("group_id")
+        else:
+            action = getattr(trade, "action", None)
+            timestamp = getattr(trade, "ts", None)
+            position_id = getattr(trade, "position_id", None) or getattr(trade, "group_id", None)
+        action = getattr(action, "value", action)
+        if timestamp is None or position_id is None:
+            continue
+        try:
+            timestamp = int(timestamp)
+        except (TypeError, ValueError):
+            continue
+        state = positions.setdefault(str(position_id), {"open": None, "close": None})
+        if str(action).lower() == "open":
+            state["open"] = timestamp if state["open"] is None else min(state["open"], timestamp)
+        elif str(action).lower() == "close":
+            state["close"] = timestamp if state["close"] is None else max(state["close"], timestamp)
+
+    result = []
+    for state in positions.values():
+        open_ts = state["open"]
+        close_ts = state["close"]
+        if (
+            open_ts is not None
+            and close_ts is not None
+            and start_ts <= close_ts < end_ts
+            and close_ts >= open_ts
+        ):
+            result.append((close_ts - open_ts) / 60000.0)
+    return result
+
+
 def _eligible(metrics, min_trades, max_drawdown, min_active_subperiods=2, subperiod_count=3):
-    trades = int(_number(metrics.get("trade_count"), 0))
+    del min_trades
     active = int(_number(metrics.get("active_subperiod_count"), 0))
     required_active = min(max(1, int(subperiod_count)), max(0, int(min_active_subperiods)))
     dd = _number(metrics.get("max_drawdown_on_target_capital"), 0)
     return (
-        trades >= int(min_trades)
-        and active >= required_active
+        active >= required_active
         and (max_drawdown is None or dd >= -abs(float(max_drawdown)))
     )
 
@@ -1226,8 +1273,11 @@ def _schedule_rows(schedule):
 
 def _flatten_candidate_rows(rows):
     fields = (
+        "trade_count", "win_rate", "sharpe", "max_drawdown",
         "return_on_target_capital", "max_drawdown_on_target_capital",
-        "return_score", "sharpe_score", "win_rate_score", "drawdown_score",
+        "return_score", "sharpe_score", "calmar", "calmar_score",
+        "average_holding_time_hours", "holding_time_score", "trade_count_score",
+        "win_rate_score", "drawdown_score",
         "subperiod_score", "active_subperiod_count", "profitable_subperiod_count",
         "subperiod_return_std",
     )
@@ -1264,6 +1314,7 @@ def _flatten_candidate_rows(rows):
                 "portfolio_win_rate": metrics.get("win_rate"),
                 "portfolio_max_drawdown": metrics.get("max_drawdown"),
                 "portfolio_trade_count": metrics.get("trade_count"),
+                "portfolio_average_holding_time_hours": metrics.get("average_holding_time_hours"),
                 "portfolio_fee": metrics.get("total_fee"),
                 "portfolio_slippage": metrics.get("total_slippage"),
                 "portfolio_funding": metrics.get("funding_fee"),
@@ -1288,6 +1339,7 @@ def _portfolio_pair_rows(rows):
             "pair_return": metrics.get("return_on_target_capital"),
             "pair_trade_count": metrics.get("trade_count"),
             "pair_win_rate": metrics.get("win_rate"),
+            "pair_average_holding_time_hours": metrics.get("average_holding_time_hours"),
             "pair_max_drawdown": metrics.get("max_drawdown_on_target_capital"),
         })
     return output

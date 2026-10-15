@@ -148,6 +148,12 @@ def run_numba_pair_optimizer(
                 "active_subperiod_count": int(result[15][local_index]),
                 "profitable_subperiod_count": int(result[16][local_index]),
                 "subperiod_return_std": float(result[17][local_index]),
+                "holding_time_sum_hours": float(result[20][local_index]),
+                "holding_trade_count": int(result[21][local_index]),
+                "average_holding_time_hours": (
+                    float(result[20][local_index]) / int(result[21][local_index])
+                    if int(result[21][local_index]) > 0 else 0.0
+                ),
                 "subperiod_count": subperiod_count,
                 "selection_score": 0.0,
             }
@@ -171,6 +177,7 @@ def run_numba_pair_optimizer(
             })
         if progress_callback is not None:
             progress_callback(batch_end, grid.size)
+    apply_relative_metric_scores(rows)
     _apply_neighbor_scores(rows, grid)
     for row in rows:
         row["metrics"]["selection_score"] = row["selection_score"]
@@ -228,6 +235,7 @@ def _run_batch(
     qy = np.zeros(n_candidates, dtype=np.float64)
     entry_x = np.zeros(n_candidates, dtype=np.float64)
     entry_y = np.zeros(n_candidates, dtype=np.float64)
+    entry_timestamp = np.full(n_candidates, -1, dtype=np.int64)
     entry_gross = np.zeros(n_candidates, dtype=np.float64)
     entry_fee = np.zeros(n_candidates, dtype=np.float64)
     position_funding = np.zeros(n_candidates, dtype=np.float64)
@@ -244,6 +252,8 @@ def _run_batch(
     fees = np.zeros(n_candidates, dtype=np.float64)
     slippages = np.zeros(n_candidates, dtype=np.float64)
     funding_total = np.zeros(n_candidates, dtype=np.float64)
+    holding_time_sum_hours = np.zeros(n_candidates, dtype=np.float64)
+    holding_trade_count = np.zeros(n_candidates, dtype=np.int64)
     daily_base = np.full(n_candidates, initial_equity, dtype=np.float64)
     daily_last = np.full(n_candidates, initial_equity, dtype=np.float64)
     daily_sum = np.zeros(n_candidates, dtype=np.float64)
@@ -309,6 +319,7 @@ def _run_batch(
                 qy[c] = pending_qy[c]
                 entry_x[c] = fill_x
                 entry_y[c] = fill_y
+                entry_timestamp[c] = timestamps[i]
                 entry_gross[c] = abs(qx[c] * fill_x) + abs(qy[c] * fill_y)
                 entry_fee[c] = entry_gross[c] * fee_rate
                 fees[c] += entry_fee[c]
@@ -326,6 +337,9 @@ def _run_batch(
                 fees[c] += close_fee
                 slippages[c] += close_slip
                 trades[c] += 1
+                if entry_timestamp[c] >= 0 and timestamps[i] >= entry_timestamp[c]:
+                    holding_time_sum_hours[c] += (timestamps[i] - entry_timestamp[c]) / 3_600_000.0
+                    holding_trade_count[c] += 1
                 if i >= start:
                     subperiod_trades[c, segment] += 1
                 if gross - entry_fee[c] - close_fee - position_funding[c] > 0:
@@ -530,7 +544,7 @@ def _run_batch(
             win_rate, fees, slippages, funding_total, net_pnl, max_dd_cash,
             return_on_target, max_dd_on_target, active_subperiods,
             profitable_subperiods, subperiod_return_std, daily_equity,
-            start_day_key)
+            start_day_key, holding_time_sum_hours, holding_trade_count)
 
 
 @njit(cache=True)
@@ -680,42 +694,99 @@ def _apply_neighbor_scores(rows, grid):
 
 
 def score_candidate_metrics(metrics: dict) -> dict:
-    """Return bounded score components on the pair's deployed capital."""
-    pair_return = _finite_number(metrics.get("return_on_target_capital"), 0.0)
-    sharpe = _finite_number(metrics.get("sharpe"), 0.0)
-    win_rate = _finite_number(metrics.get("win_rate"), 0.0)
-    pair_drawdown = _finite_number(metrics.get("max_drawdown_on_target_capital"), 0.0)
-    subperiod_count = max(1, int(metrics.get("subperiod_count", 1) or 1))
-    profitable_subperiods = max(0, int(metrics.get("profitable_subperiod_count", 0) or 0))
+    """Score the five requested dimensions.
 
-    return_score = _clip(pair_return / 0.20, -1.0, 1.0)
+    Holding time and trade count are supplied by ``apply_relative_metric_scores``
+    after the complete candidate set is available.  A neutral fallback keeps
+    this helper compatible with the legacy Python sweep path.
+    """
+    sharpe = _finite_number(metrics.get("sharpe"), 0.0)
+    annualized = _finite_number(metrics.get("annualized_return"), 0.0)
+    drawdown = _finite_number(metrics.get("max_drawdown"), 0.0)
+    raw_calmar = metrics.get("calmar")
+    calmar = _finite_number(raw_calmar, math.nan)
+    if not math.isfinite(calmar):
+        calmar = annualized / abs(drawdown) if drawdown < -1e-12 else (10.0 if annualized > 0.0 else 0.0)
+    win_rate = _finite_number(metrics.get("win_rate"), 0.0)
     sharpe_score = _clip(sharpe / 3.0, -1.0, 1.0)
+    calmar_score = _clip(calmar / 3.0, -1.0, 1.0)
     win_rate_score = _clip((win_rate - 0.50) / 0.25, -1.0, 1.0)
-    drawdown_score = -_clip(abs(pair_drawdown) / 0.20, 0.0, 1.0)
-    subperiod_score = min(profitable_subperiods, subperiod_count) / subperiod_count
+    holding_time_score = _clip(_finite_number(metrics.get("holding_time_score"), 0.5), 0.0, 1.0)
+    trade_count_score = _clip(_finite_number(metrics.get("trade_count_score"), 0.5), 0.0, 1.0)
     own_score = (
-        0.45 * return_score
-        + 0.15 * sharpe_score
+        0.35 * sharpe_score
+        + 0.25 * calmar_score
+        + 0.20 * holding_time_score
         + 0.10 * win_rate_score
-        + 0.20 * drawdown_score
-        + 0.10 * subperiod_score
+        + 0.10 * trade_count_score
     )
     return {
-        "return_score": float(return_score),
+        # Kept for report/backward compatibility; these are no longer part of
+        # the composite selection score.
+        "return_score": float(_clip(_finite_number(metrics.get("return_on_target_capital"), 0.0) / 0.20, -1.0, 1.0)),
         "sharpe_score": float(sharpe_score),
+        "calmar": float(calmar),
+        "calmar_score": float(calmar_score),
+        "holding_time_score": float(holding_time_score),
+        "trade_count_score": float(trade_count_score),
         "win_rate_score": float(win_rate_score),
-        "drawdown_score": float(drawdown_score),
-        "subperiod_score": float(subperiod_score),
+        "drawdown_score": float(-_clip(abs(_finite_number(metrics.get("max_drawdown_on_target_capital"), 0.0)) / 0.20, 0.0, 1.0)),
+        "subperiod_score": float(
+            min(
+                max(0, int(metrics.get("profitable_subperiod_count", 0) or 0)),
+                max(1, int(metrics.get("subperiod_count", 1) or 1)),
+            ) / max(1, int(metrics.get("subperiod_count", 1) or 1))
+        ),
         "own_score": float(own_score),
     }
 
 
+def apply_relative_metric_scores(rows: list[dict]) -> None:
+    """Add within-window percentile scores and recompute each own score."""
+    metrics_rows = [row.get("metrics") or {} for row in rows if not row.get("error")]
+    holding_values = [
+        _finite_number(item.get("average_holding_time_hours"), math.nan)
+        for item in metrics_rows
+    ]
+    trade_values = [
+        _finite_number(item.get("trade_count"), math.nan)
+        for item in metrics_rows
+    ]
+    valid_holding = [value for value in holding_values if math.isfinite(value) and value > 0.0]
+    valid_trades = [value for value in trade_values if math.isfinite(value)]
+    for row in rows:
+        metrics = row.setdefault("metrics", {})
+        holding = _finite_number(metrics.get("average_holding_time_hours"), math.nan)
+        trades = _finite_number(metrics.get("trade_count"), math.nan)
+        if math.isfinite(holding) and holding > 0.0 and valid_holding:
+            holding_score = 1.0 - _percentile_rank(valid_holding, holding)
+        else:
+            holding_score = 0.0
+        trade_score = _percentile_rank(valid_trades, trades) if valid_trades and math.isfinite(trades) else 0.0
+        metrics["holding_time_score"] = float(holding_score)
+        metrics["trade_count_score"] = float(trade_score)
+        components = score_candidate_metrics(metrics)
+        metrics.update(components)
+        row["own_score"] = components["own_score"]
+        row["selection_score"] = components["own_score"]
+
+
+def _percentile_rank(values, value):
+    if not values or not math.isfinite(value):
+        return 0.0
+    less = sum(1 for item in values if item < value)
+    equal = sum(1 for item in values if item == value)
+    if len(values) <= 1:
+        return 0.5
+    return _clip((less + 0.5 * max(1, equal) - 0.5) / (len(values) - 1), 0.0, 1.0)
+
+
 def _eligible(metrics, min_trades, max_drawdown, min_active_subperiods, subperiod_count):
+    del min_trades
     required_active = min(max(1, int(subperiod_count)), max(0, int(min_active_subperiods)))
     drawdown = _finite_number(metrics.get("max_drawdown_on_target_capital"), 0.0)
     return (
-        int(metrics.get("trade_count", 0) or 0) >= int(min_trades)
-        and int(metrics.get("active_subperiod_count", 0) or 0) >= required_active
+        int(metrics.get("active_subperiod_count", 0) or 0) >= required_active
         and (max_drawdown is None or drawdown >= -abs(float(max_drawdown)))
     )
 

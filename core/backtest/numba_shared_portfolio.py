@@ -46,6 +46,7 @@ def run_shared_portfolio_batch(
     qy = np.zeros((n_candidates, n_pairs))
     entry_x = np.zeros((n_candidates, n_pairs))
     entry_y = np.zeros((n_candidates, n_pairs))
+    entry_timestamp = np.full((n_candidates, n_pairs), -1, dtype=np.int64)
     entry_gross = np.zeros((n_candidates, n_pairs))
     entry_fee = np.zeros((n_candidates, n_pairs))
     entry_reserve = np.zeros((n_candidates, n_pairs))
@@ -75,6 +76,8 @@ def run_shared_portfolio_batch(
     slippages = np.zeros(n_candidates)
     funding_total = np.zeros(n_candidates)
     rejected_opens = np.zeros(n_candidates, dtype=np.int64)
+    holding_time_sum_hours = np.zeros(n_candidates)
+    holding_trade_count = np.zeros(n_candidates, dtype=np.int64)
 
     pair_realized = np.zeros((n_candidates, n_pairs))
     pair_trades = np.zeros((n_candidates, n_pairs), dtype=np.int64)
@@ -83,6 +86,8 @@ def run_shared_portfolio_batch(
     pair_max_dd = np.zeros((n_candidates, n_pairs))
     pair_fees = np.zeros((n_candidates, n_pairs))
     pair_funding = np.zeros((n_candidates, n_pairs))
+    pair_holding_time_sum_hours = np.zeros((n_candidates, n_pairs))
+    pair_holding_trade_count = np.zeros((n_candidates, n_pairs), dtype=np.int64)
 
     start_day = int(train_start_ts // 86400000)
     end_day = int((train_end_ts - 1) // 86400000)
@@ -166,6 +171,12 @@ def run_shared_portfolio_batch(
                 if measuring:
                     trades[c] += 1
                     pair_trades[c, p] += 1
+                    if entry_timestamp[c, p] >= 0 and ts >= entry_timestamp[c, p]:
+                        holding_hours = (ts - entry_timestamp[c, p]) / 3_600_000.0
+                        holding_time_sum_hours[c] += holding_hours
+                        holding_trade_count[c] += 1
+                        pair_holding_time_sum_hours[c, p] += holding_hours
+                        pair_holding_trade_count[c, p] += 1
                     sub_trades[c, segment] += 1
                     if gross - entry_fee[c, p] - close_fee - position_funding[c, p] > 0.0:
                         wins[c] += 1
@@ -206,6 +217,7 @@ def run_shared_portfolio_batch(
                 qx[c, p] = pending_qx[c, p] * scale
                 qy[c, p] = pending_qy[c, p] * scale
                 entry_x[c, p], entry_y[c, p] = fill_x, fill_y
+                entry_timestamp[c, p] = ts
                 gross = requested_gross * scale
                 reserve = requested_reserve * scale
                 open_fee = gross * fee_rate
@@ -329,6 +341,8 @@ def run_shared_portfolio_batch(
         daily_sum, daily_sum2, daily_count, current_day, start_day, sub_start,
         sub_end, sub_trades, pair_trades, pair_wins, pair_max_dd, pair_fees,
         pair_funding,
+        holding_time_sum_hours, holding_trade_count,
+        pair_holding_time_sum_hours, pair_holding_trade_count,
     )
 
 
@@ -495,6 +509,8 @@ def _finish_results(
     daily_sum, daily_sum2, daily_count, current_day, start_day, sub_start,
     sub_end, sub_trades, pair_trades, pair_wins, pair_max_dd, pair_fees,
     pair_funding,
+    holding_time_sum_hours, holding_trade_count,
+    pair_holding_time_sum_hours, pair_holding_trade_count,
 ):
     n_candidates, n_pairs = position.shape
     total_return = np.zeros(n_candidates)
@@ -562,6 +578,8 @@ def _finish_results(
         active_subperiods, profitable_subperiods, subperiod_std, daily_equity,
         start_day, pair_net, pair_trades, pair_wins, pair_max_dd, pair_fees,
         pair_funding, rejected_opens,
+        holding_time_sum_hours, holding_trade_count,
+        pair_holding_time_sum_hours, pair_holding_trade_count,
     )
 
 
