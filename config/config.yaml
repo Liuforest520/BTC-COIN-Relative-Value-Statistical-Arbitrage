@@ -521,7 +521,6 @@ setups:
       y_symbol: BEUSDT
       market: tradfi
     execution:
-      pending_timeout_bars: 1440
       order_type: market
     rebalance:
       enabled: true
@@ -549,7 +548,6 @@ setups:
           method: zscore_reversion_ma
           entry_z: 3.0
           exit_z: 0.5
-          entry_rule_method: fixed_z
           reversion_ma_lookback_bars: 120
           reversion_ma_short_lookback_bars: 30
           reversion_min_samples: 120
@@ -559,22 +557,12 @@ setups:
           hedge_beta_min_samples: 1440
         portfolio:
           method: pair_target_capital
-          max_entries_per_pair: 1
-          add_cooldown_bars: 720
-          min_hold_bars: 0
         protection:
           enabled: true
-          stop_loss_enabled: true
-          stop_loss_freeze_bars: 0
           pair_loss_stop_enabled: true
           pair_loss_stop_return: 0.05
           pair_loss_stop_freeze_bars: 0
           pair_loss_stop_freeze_model_lookback_multiplier: 1.0
-          take_profit_enabled: true
-          take_profit_return: 0.03
-          max_holding_time_enabled: true
-          max_holding_time_model_lookback_multiplier: 2.0
-          max_holding_time_freeze_bars: 0
           wait_for_model_update_after_non_z_exit: true
       tradfi:
         estimator:
@@ -590,7 +578,6 @@ setups:
           method: zscore_reversion_ma
           entry_z: 3.0
           exit_z: 0.5
-          entry_rule_method: fixed_z
           reversion_ma_lookback_bars: 120
           reversion_ma_short_lookback_bars: 30
           reversion_min_samples: 120
@@ -600,22 +587,12 @@ setups:
           hedge_beta_min_samples: 1440
         portfolio:
           method: pair_target_capital
-          max_entries_per_pair: 1
-          add_cooldown_bars: 720
-          min_hold_bars: 0
         protection:
           enabled: true
-          stop_loss_enabled: true
-          stop_loss_freeze_bars: 0
           pair_loss_stop_enabled: true
           pair_loss_stop_return: 0.05
           pair_loss_stop_freeze_bars: 0
           pair_loss_stop_freeze_model_lookback_multiplier: 1.0
-          take_profit_enabled: true
-          take_profit_return: 0.03
-          max_holding_time_enabled: true
-          max_holding_time_model_lookback_multiplier: 2.0
-          max_holding_time_freeze_bars: 0
           wait_for_model_update_after_non_z_exit: true
 cost:
   fee_rate: 0.0005

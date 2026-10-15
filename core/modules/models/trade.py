@@ -27,12 +27,6 @@ class Trade:
     reopen_lock_pending: bool | None = None
     para: dict | None = None
     rebalance_batch_id: str | None = None
-    protection_stop_x_price: float | None = None
-    protection_take_profit_return: float | None = None
-    protection_target_residual: float | None = None
-    protection_stop_reason: str | None = None
-    protection_max_holding_bars: int | None = None
-    protection_max_holding_deadline_bar: int | None = None
     protection_pair_loss_stop_return: float | None = None
     protection_pair_loss_stop_freeze_bars: int | None = None
     protection_pair_loss_stop_freeze_until_bar: int | None = None

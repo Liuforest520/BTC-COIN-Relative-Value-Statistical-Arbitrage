@@ -28,16 +28,13 @@ REPORT_STRING_COLUMNS = {
     "exit_reason",
     "protection_trigger",
     "exit_class",
-    "protection_stop_reason",
     "protection_rule",
 }
 REPORT_BOOL_COLUMNS = {"reopen_lock_pending"}
 REPORT_INT_COLUMNS = {
     "ts",
-    "protection_max_holding_bars",
     "protection_freeze_bars",
     "protection_freeze_until_bar",
-    "protection_max_holding_deadline_bar",
     "entry_count",
     "last_entry_bar_index",
     "add_cooldown_remaining_bars",

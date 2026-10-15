@@ -42,6 +42,8 @@ class SweepBacktest(Backtest):
         show_progress: bool = False,
         progress_callback=None,
         progress_interval_bars: int = 100_000,
+        parameter_schedule: dict | None = None,
+        oos_start_ts: int | None = None,
     ):
         super().__init__(
             config=config,
@@ -49,6 +51,8 @@ class SweepBacktest(Backtest):
             risk_manager=risk_manager,
             exchange_manager=exchange_manager,
             show_progress=show_progress,
+            parameter_schedule=parameter_schedule,
+            oos_start_ts=oos_start_ts,
         )
         self.position_curve = DiscardList()
         self.signal_curve = DiscardList()
@@ -141,6 +145,9 @@ class SweepBacktest(Backtest):
                 orders = self.strategy(model_bars)
                 if not orders:
                     continue
+                measurement_start = self._measurement_start_ts()
+                if measurement_start is not None and self._bars_ts(model_bars) < measurement_start:
+                    continue
 
                 risk_results = self.risk_manager.check_orders(orders, bars)
                 if not self.risk_manager.passed(risk_results):
@@ -157,7 +164,7 @@ class SweepBacktest(Backtest):
                 self.orders.extend(accepted_orders)
 
         metrics = calculate_metrics(
-            equity_curve=self.exchange_manager.equity_curve,
+            equity_curve=self._measurement_equity_curve(self.exchange_manager.equity_curve),
             orders=self.orders,
             trades=self.trades,
             funding_payments=self.exchange_manager.funding_payments,
@@ -226,6 +233,8 @@ def run_sweep_backtest(
     show_progress: bool = False,
     progress_callback=None,
     progress_interval_bars: int = 100_000,
+    parameter_schedule: dict | None = None,
+    oos_start_ts: int | None = None,
 ) -> BacktestResult:
     config = load_config(config_path)
     backtest = SweepBacktest(
@@ -233,6 +242,8 @@ def run_sweep_backtest(
         show_progress=show_progress,
         progress_callback=progress_callback,
         progress_interval_bars=progress_interval_bars,
+        parameter_schedule=parameter_schedule,
+        oos_start_ts=oos_start_ts,
     )
     return backtest.run()
 

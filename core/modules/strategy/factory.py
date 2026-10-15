@@ -34,35 +34,6 @@ def _resolve_registry(name: str, registry: dict, default_label: str):
     )
 
 
-def _warn_signal_method_conflicts(sig_cfg: dict) -> None:
-    """Warn once per run when a config still carries the other variant's switch.
-
-    The dedicated signal classes force their own flags, so a leftover
-    ``two_stage_enabled`` / ``reversion_filter_enabled`` from an older config is
-    ignored.  Only *explicitly present* keys are reported: the dataclass
-    defaults must not produce a warning.
-    """
-    method = str((sig_cfg or {}).get("method", "")).strip().lower()
-    if method == "zscore_reversion_two_stage":
-        if sig_cfg.get("two_stage_enabled") is False or sig_cfg.get("reversion_filter_enabled") is True:
-            from core.modules.logger import logger
-
-            logger.warning(
-                "signal.method {} ignores two_stage_enabled/reversion_filter_enabled "
-                "from the config (two_stage is always on, MA filter always off)",
-                method,
-            )
-    elif method == "zscore_reversion_ma":
-        if sig_cfg.get("two_stage_enabled") is True or sig_cfg.get("reversion_filter_enabled") is False:
-            from core.modules.logger import logger
-
-            logger.warning(
-                "signal.method {} ignores two_stage_enabled/reversion_filter_enabled "
-                "from the config (MA filter is always on, two_stage always off)",
-                method,
-            )
-
-
 def _filter_kwargs(dc_class, raw_dict, label="config"):
     import dataclasses
     raw_dict = dict(raw_dict or {})
@@ -115,7 +86,6 @@ def _build_market_components(pipeline, setup_rebalance, market):
             "a Pair must be fully funded to its target_capital"
         )
     estimator_cfg = EstimatorConfig(**_filter_kwargs(EstimatorConfig, est_cfg, f"{market}.estimator"))
-    _warn_signal_method_conflicts(sig_cfg)
     signal_cfg = SignalConfig(**_filter_kwargs(SignalConfig, sig_cfg, f"{market}.signal")) if sig_cfg else SignalConfig()
     sizing_cfg = SizingConfig(**_filter_kwargs(SizingConfig, siz_cfg, f"{market}.sizing")) if siz_cfg else SizingConfig()
     portfolio_cfg = PortfolioConfig(**_filter_kwargs(PortfolioConfig, pf_cfg, f"{market}.portfolio")) if pf_cfg else PortfolioConfig()
@@ -133,7 +103,7 @@ def _build_market_components(pipeline, setup_rebalance, market):
         profitable_position_replacement=ProfitablePositionReplacementConfig(**replacement_raw),
         **_filter_kwargs(RebalanceConfig, clean_rebalance, f"{market}.rebalance"),
     )
-    if (protection_cfg_obj.enabled or protection_cfg_obj.max_holding_time_enabled or rebalance_cfg_obj.enabled) and (estimator_cfg.position_update_policy != "freeze" or estimator_cfg.regression_method not in {"price", "log_price"}):
+    if (protection_cfg_obj.enabled or rebalance_cfg_obj.enabled) and (estimator_cfg.position_update_policy != "freeze" or estimator_cfg.regression_method not in {"price", "log_price"}):
         raise ValueError(f"{market}: pipeline protection/rebalance is supported only for freeze Price/Log-Price models")
     estimator_ctor = _resolve_registry(estimator_cfg.method, ESTIMATOR_REGISTRY, "estimator")
     signal_ctor = _resolve_registry(signal_cfg.method, SIGNAL_REGISTRY, "signal") if sig_cfg else None
@@ -149,11 +119,28 @@ def _build_market_components(pipeline, setup_rebalance, market):
     }
 
 
+def _override_components(components, overrides):
+    """Create pair-local typed configs without mutating the market defaults."""
+    if not overrides:
+        return components
+    import dataclasses
+    result = dict(components)
+    for stage, key in (("estimator", "estimator_cfg"), ("signal", "signal_cfg"), ("sizing", "sizing_cfg"), ("portfolio", "portfolio_cfg"), ("execution", "execution_cfg"), ("protection", "protection_cfg")):
+        patch = dict(overrides.get(stage) or {})
+        if not patch or result.get(key) is None:
+            continue
+        values = dataclasses.asdict(result[key])
+        values.update(patch)
+        valid = {field.name for field in dataclasses.fields(type(result[key]))}
+        result[key] = type(result[key])(**{name: value for name, value in values.items() if name in valid})
+    return result
+
+
 def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_bps=1.0):
     """Build one shared-account strategy with optional market-specific pipelines."""
     # Import implementations once to trigger registry registration.
     from core.modules.estimator import (DOLSEstimator, EWLSEstimator, HuberEstimator, KalmanEstimator, PeriodicOLSEstimator, RLSEstimator, RollingOLSEstimator, TLSEstimator, WinsorizedOLSEstimator)  # noqa: F401
-    from core.modules.signals import (MAReversionSignal, SimpleZScoreSignal, TwoStageReversionSignal, ZScoreReversionSignal, ZScoreSignal)  # noqa: F401
+    from core.modules.signals import SimpleZScoreSignal, MAReversionSignal, ZScoreReversionSignal  # noqa: F401
     from core.modules.sizing import (BetaNeutralSizing, FixedNotionalSizing, VolatilityNeutralSizing)  # noqa: F401
     from core.modules.portfolio import (ConstrainedQPAllocator, EquitySlotAllocator, EqualWeightAllocator, MaxSharpeAllocator, PairTargetCapitalAllocator, MinVarianceAllocator, RiskParityAllocator)  # noqa: F401
 
@@ -186,6 +173,8 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
             enabled=pdict.get("enabled", True), tags=list(pdict.get("tags", [])),
             model_lookback_bars_override=pdict.get("model_lookback_bars_override"), notes=pdict.get("notes", ""),
             target_capital=(float(pdict["target_capital"]) if pdict.get("target_capital") is not None else None),
+            parameter_grid=dict(pdict.get("parameter_grid") or {}),
+            parameters=dict(pdict.get("parameters") or {}),
         ))
     for market, components in components_by_market.items():
         pf_cfg = components["portfolio_cfg"]
@@ -204,10 +193,11 @@ def _build_multi_pair_strategy(setup_config, symbols, fee_rate=0.0005, slippage_
             "enabled Pair(s) reference a market without a pipeline profile: "
             f"{missing_profiles}"
         )
-    pair_components = {
-        p.pair_id: components_by_market.get(p.market, default_components)
-        for p in pair_defs
-    }
+    pair_components = {}
+    for p, raw_pair in zip(pair_defs, setup_config.pairs):
+        base_components = components_by_market.get(p.market, default_components)
+        overrides = dict(raw_pair.get("parameters") or {})
+        pair_components[p.pair_id] = _override_components(base_components, overrides)
     return MultiPairStrategy(
         pairs=pair_defs,
         estimator_ctor=default_components["estimator_ctor"], estimator_cfg=default_components["estimator_cfg"],

@@ -1,14 +1,24 @@
-"""Download Massive daily US stock minute-aggregate flat files.
+"""Download Massive daily flat files for stocks or US futures.
 
 Massive publishes the stock minute aggregate dataset as one gzip-compressed
 CSV per UTC date. Each daily file already contains all available tickers, so
 this downloader intentionally does not accept a symbol filter.
 
-Output layout:
+Stock output layout:
 
     data/stocks/flat_files/minute_aggregates/
       2025/01/2025-01-01.csv.gz
       2025/01/2025-01-02.csv.gz
+
+Futures output layout:
+
+    data/futures/flat_files/minute_aggregates/cme/2025/01/2025-01-02.csv.gz
+
+The futures downloader supports the four exchange families exposed by
+Massive Futures Flat Files (CBOT, CME, NYMEX, and COMEX) and the four daily
+datasets: minute aggregates, session aggregates, trades, and quotes. The
+default futures selection is minute/session aggregates because trades and
+quotes are tick-level files and can be very large.
 
 Credentials can be supplied through config/massive_key.config, environment
 variables, command-line options, or the empty constants below. Never commit
@@ -51,8 +61,18 @@ MASSIVE_ENDPOINT = "https://files.massive.com"
 MASSIVE_BUCKET = "flatfiles"
 DEFAULT_DATASET_PREFIX = "us_stocks_sip/minute_aggs_v1"
 DEFAULT_OUTPUT_DIR = Path("data/stocks/flat_files/minute_aggregates")
+DEFAULT_FUTURES_OUTPUT_DIR = Path("data/futures")
 DEFAULT_CREDENTIALS_FILE = Path("config/massive_key.config")
 LOGGER = logging.getLogger("download_massive_data")
+
+FUTURES_EXCHANGES = ("cbot", "cme", "nymex", "comex")
+FUTURES_DATASET_SUFFIXES = {
+    "minute_aggregates": "minute_aggs_v1",
+    "session_aggregates": "session_aggs_v1",
+    "trades": "trades_v1",
+    "quotes": "quotes_v1",
+}
+DEFAULT_FUTURES_DATASETS = ("minute_aggregates", "session_aggregates")
 
 
 @dataclass(frozen=True)
@@ -358,16 +378,207 @@ def download_massive_data(
     return summary
 
 
+def download_massive_futures_data(
+    start: date,
+    end: date,
+    *,
+    output_dir: str | Path = DEFAULT_FUTURES_OUTPUT_DIR,
+    workers: int = 8,
+    access_key: str | None = None,
+    secret_key: str | None = None,
+    credentials_file: str | Path = DEFAULT_CREDENTIALS_FILE,
+    exchanges: Iterable[str] | None = None,
+    datasets: Iterable[str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, int]:
+    """Download Massive Futures daily flat files.
+
+    ``start`` and ``end`` are inclusive UTC dates. The S3 layout follows the
+    official Massive prefixes, for example
+    ``us_futures_cme/minute_aggs_v1/YYYY/MM/YYYY-MM-DD.csv.gz``.
+    """
+    if end < start:
+        raise ValueError("end date must be on or after start date")
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+
+    selected_exchanges = _normalize_futures_choices(
+        exchanges, FUTURES_EXCHANGES, "exchange", allowed=FUTURES_EXCHANGES
+    )
+    selected_datasets = _normalize_futures_choices(
+        datasets, DEFAULT_FUTURES_DATASETS, "dataset", allowed=FUTURES_DATASET_SUFFIXES
+    )
+    access_key, secret_key, credential_source = _resolve_credentials(
+        access_key, secret_key, credentials_file
+    )
+
+    output_path = Path(output_dir)
+    days = list(_date_range(start, end))
+    jobs = [
+        (dataset, exchange, day)
+        for dataset in selected_datasets
+        for exchange in selected_exchanges
+        for day in days
+    ]
+    counts = {"downloaded": 0, "skipped": 0, "missing_or_closed": 0, "failed": 0}
+    total_bytes = 0
+    started_at = time.perf_counter()
+
+    LOGGER.info("=" * 96)
+    LOGGER.info("Massive Futures 行情数据下载开始")
+    LOGGER.info("  日期范围   : %s → %s（共 %d 天）", start, end, len(days))
+    LOGGER.info("  交易所     : %s", ", ".join(selected_exchanges))
+    LOGGER.info("  数据集     : %s", ", ".join(selected_datasets))
+    LOGGER.info("  输出根目录 : %s", output_path.resolve())
+    LOGGER.info("  并发线程   : %d   覆盖已有: %s", workers, "是" if overwrite else "否（已存在则跳过）")
+    LOGGER.info("  凭据来源   : %s", credential_source)
+    LOGGER.info("  任务总数   : %d", len(jobs))
+    LOGGER.info("=" * 96)
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="massive-futures") as pool:
+        futures = {
+            pool.submit(
+                _download_one_futures_file,
+                dataset,
+                exchange,
+                day,
+                output_path,
+                access_key,
+                secret_key,
+                overwrite,
+            ): (dataset, exchange, day)
+            for dataset, exchange, day in jobs
+        }
+        for done, future in enumerate(as_completed(futures), start=1):
+            dataset, exchange, day = futures[future]
+            try:
+                result = future.result()
+            except BaseException as exc:
+                counts["failed"] += 1
+                LOGGER.error(
+                    "期货文件下载失败 dataset=%s exchange=%s day=%s: %s",
+                    dataset, exchange, day, exc,
+                )
+            else:
+                if result is None:
+                    counts["missing_or_closed"] += 1
+                elif result.downloaded:
+                    counts["downloaded"] += 1
+                    try:
+                        total_bytes += result.path.stat().st_size
+                    except OSError:
+                        pass
+                else:
+                    counts["skipped"] += 1
+                    try:
+                        total_bytes += result.path.stat().st_size
+                    except OSError:
+                        pass
+            if done % PROGRESS_EVERY == 0 or done == len(jobs):
+                LOGGER.info(
+                    "期货下载进度 %d/%d (%.1f%%) counts=%s total=%s elapsed=%s",
+                    done,
+                    len(jobs),
+                    100.0 * done / max(1, len(jobs)),
+                    counts,
+                    _format_bytes(total_bytes),
+                    _format_duration(time.perf_counter() - started_at),
+                )
+
+    LOGGER.info("-" * 96)
+    LOGGER.info("Massive Futures 行情数据下载结束 counts=%s total=%s", counts, _format_bytes(total_bytes))
+    LOGGER.info("  输出目录 : %s", output_path.resolve())
+    LOGGER.info("-" * 96)
+    if counts["failed"]:
+        raise MassiveDownloadError(
+            f"{counts['failed']} of {len(jobs)} futures file downloads failed"
+        )
+    return counts
+
+
+def _normalize_futures_choices(
+    values: Iterable[str] | None,
+    defaults: Iterable[str],
+    label: str,
+    *,
+    allowed: dict[str, str] | Iterable[str] | None = None,
+) -> list[str]:
+    selected = list(defaults if values is None else values)
+    selected = [str(value).strip().lower() for value in selected if str(value).strip()]
+    allowed_values = set(allowed or ())
+    if not selected:
+        raise ValueError(f"at least one futures {label} is required")
+    invalid = sorted(set(selected) - allowed_values) if allowed_values else []
+    if invalid:
+        raise ValueError(
+            f"unsupported futures {label}(s): {', '.join(invalid)}; "
+            f"allowed: {', '.join(sorted(allowed_values))}"
+        )
+    return list(dict.fromkeys(selected))
+
+
+def _resolve_credentials(
+    access_key: str | None,
+    secret_key: str | None,
+    credentials_file: str | Path,
+) -> tuple[str, str, str]:
+    file_access_key, file_secret_key = _load_credentials_file(credentials_file)
+    credential_source = "命令行参数"
+    if not (access_key and secret_key):
+        if os.getenv("MASSIVE_ACCESS_KEY") and os.getenv("MASSIVE_SECRET_KEY"):
+            credential_source = "环境变量 MASSIVE_ACCESS_KEY / MASSIVE_SECRET_KEY"
+        elif file_access_key and file_secret_key:
+            credential_source = f"配置文件 {Path(credentials_file).resolve()}"
+        elif MASSIVE_ACCESS_KEY and MASSIVE_SECRET_KEY:
+            credential_source = "模块内常量"
+    access_key = access_key or os.getenv("MASSIVE_ACCESS_KEY") or file_access_key or MASSIVE_ACCESS_KEY
+    secret_key = secret_key or os.getenv("MASSIVE_SECRET_KEY") or file_secret_key or MASSIVE_SECRET_KEY
+    if not access_key or not secret_key:
+        raise ValueError(
+            "Massive credentials are missing. Set MASSIVE_ACCESS_KEY and "
+            "MASSIVE_SECRET_KEY, or fill config/massive_key.config."
+        )
+    return access_key, secret_key, credential_source
+
+
+def _download_one_futures_file(
+    dataset: str,
+    exchange: str,
+    day: date,
+    output_dir: Path,
+    access_key: str,
+    secret_key: str,
+    overwrite: bool,
+) -> DownloadedDay | None:
+    prefix = f"us_futures_{exchange}/{FUTURES_DATASET_SUFFIXES[dataset]}"
+    target_root = output_dir / "flat_files" / dataset / exchange
+    return _download_one_day(
+        day,
+        target_root,
+        access_key,
+        secret_key,
+        prefix,
+        overwrite,
+        progress=f"[futures {exchange}/{dataset} {day}]",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download daily all-symbol Massive stock minute aggregates."
+        description="Download daily Massive stock or futures flat files."
+    )
+    parser.add_argument(
+        "--asset-class",
+        choices=("stocks", "futures"),
+        default="stocks",
+        help="asset class to download (default: stocks)",
     )
     parser.add_argument("--start", required=True, type=_parse_day, help="inclusive UTC date, YYYY-MM-DD")
     parser.add_argument("--end", required=True, type=_parse_day, help="inclusive UTC date, YYYY-MM-DD")
     parser.add_argument(
         "--output-dir",
-        default=str(DEFAULT_OUTPUT_DIR),
-        help=f"daily output root (default: {DEFAULT_OUTPUT_DIR})",
+        default=None,
+        help=f"output root (stocks default: {DEFAULT_OUTPUT_DIR}; futures default: {DEFAULT_FUTURES_OUTPUT_DIR})",
     )
     parser.add_argument("--workers", type=int, default=8, help="parallel daily downloads (default: 8)")
     parser.add_argument("--access-key", help="Massive access key; prefer the local config file or MASSIVE_ACCESS_KEY")
@@ -383,6 +594,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"S3 object prefix (default: {DEFAULT_DATASET_PREFIX})",
     )
     parser.add_argument(
+        "--exchanges",
+        nargs="+",
+        choices=FUTURES_EXCHANGES,
+        default=None,
+        help="futures exchange families; default: cbot cme nymex comex",
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=tuple(FUTURES_DATASET_SUFFIXES),
+        default=None,
+        help="futures datasets; default: minute_aggregates session_aggregates",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="redownload and replace existing daily .csv.gz files",
@@ -394,17 +619,31 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
     try:
-        download_massive_data(
-            args.start,
-            args.end,
-            output_dir=args.output_dir,
-            workers=args.workers,
-            access_key=args.access_key,
-            secret_key=args.secret_key,
-            credentials_file=args.credentials_file,
-            dataset_prefix=args.dataset_prefix,
-            overwrite=args.overwrite,
-        )
+        if args.asset_class == "futures":
+            download_massive_futures_data(
+                args.start,
+                args.end,
+                output_dir=args.output_dir or DEFAULT_FUTURES_OUTPUT_DIR,
+                workers=args.workers,
+                access_key=args.access_key,
+                secret_key=args.secret_key,
+                credentials_file=args.credentials_file,
+                exchanges=args.exchanges,
+                datasets=args.datasets,
+                overwrite=args.overwrite,
+            )
+        else:
+            download_massive_data(
+                args.start,
+                args.end,
+                output_dir=args.output_dir or DEFAULT_OUTPUT_DIR,
+                workers=args.workers,
+                access_key=args.access_key,
+                secret_key=args.secret_key,
+                credentials_file=args.credentials_file,
+                dataset_prefix=args.dataset_prefix,
+                overwrite=args.overwrite,
+            )
     except (ValueError, MassiveDownloadError, RuntimeError, OSError) as exc:
         LOGGER.error("Massive download failed: %s", exc)
         return 1

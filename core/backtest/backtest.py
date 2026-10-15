@@ -46,6 +46,8 @@ class Backtest:
         show_progress: bool = True,
         progress_callback=None,
         progress_interval_bars: int = 100_000,
+        parameter_schedule: dict | None = None,
+        oos_start_ts: int | None = None,
     ):
         self.config = config
         estimator_cfg = self.config.strategy.pipeline.get("estimator", {}) or {}
@@ -74,6 +76,13 @@ class Backtest:
         self.show_progress = show_progress
         self.progress_callback = progress_callback
         self.progress_interval_bars = max(1, int(progress_interval_bars))
+        if isinstance(parameter_schedule, (str, Path)):
+            import json
+            parameter_schedule = json.loads(Path(parameter_schedule).read_text(encoding="utf-8"))
+        self.parameter_schedule = parameter_schedule or {}
+        self.oos_start_ts = oos_start_ts
+        if self.parameter_schedule and hasattr(self.strategy, "set_parameter_schedule"):
+            self.strategy.set_parameter_schedule(self.parameter_schedule)
         self.orders = []
         self.trades = []
         self.position_curve = NumericCurveBuffer()
@@ -168,6 +177,11 @@ class Backtest:
                 self._record_pair_state(model_ts, should_record_diagnostics)
                 if not orders:
                     continue
+                measurement_start = self._measurement_start_ts()
+                if measurement_start is not None and model_ts < measurement_start:
+                    # Warmup/training preamble updates estimator state but is
+                    # intentionally excluded from trading and OOS accounting.
+                    continue
 
                 # Orders are generated from the completed model bar, but risk
                 # checks use the current raw 1-minute market snapshot. The
@@ -189,7 +203,7 @@ class Backtest:
                 self.orders.extend(accepted_orders)
 
         metrics = calculate_metrics(
-            equity_curve=self.exchange_manager.equity_curve,
+            equity_curve=self._measurement_equity_curve(self.exchange_manager.equity_curve),
             orders=self.orders,
             trades=self.trades,
             funding_payments=self.exchange_manager.funding_payments,
@@ -230,25 +244,12 @@ class Backtest:
             exchange = info.get("exchange", "binance")
             if exchange not in exchange_names:
                 exchange_names.append(exchange)
-        execution_timeouts = []
-        common_execution = getattr(self.config.strategy, "execution", {}) or {}
-        if common_execution.get("pending_timeout_bars") is not None:
-            execution_timeouts.append(int(common_execution.get("pending_timeout_bars") or 0))
-        market_pipelines = getattr(self.config.strategy, "market_pipelines", {}) or {}
-        if not execution_timeouts and market_pipelines:
-            for view in market_pipelines.values():
-                execution = (view.get("pipeline", {}) or {}).get("execution", {}) or {}
-                if execution.get("pending_timeout_bars") is not None:
-                    execution_timeouts.append(int(execution.get("pending_timeout_bars") or 0))
-        if not execution_timeouts:
-            execution_timeouts.append(int((self.config.strategy.pipeline.get("execution", {}) or {}).get("pending_timeout_bars", 0)))
         return ExchangeManager.from_names(
             exchange_names=exchange_names,
             initial_cash=self.config.initial_cash,
             fee_rate=self.config.fee_rate,
             slippage_bps=self.config.slippage_bps,
             max_leverage=self._max_leverage(),
-            pending_timeout_bars=max(execution_timeouts),
         )
 
     def _max_leverage(self):
@@ -509,7 +510,7 @@ class Backtest:
                 row_ts = self._row_ts(row)
                 if start_ts is not None and row_ts < start_ts:
                     continue
-                if end_ts is not None and row_ts > end_ts:
+                if end_ts is not None and ((self._backtest_end_exclusive() and row_ts >= end_ts) or (not self._backtest_end_exclusive() and row_ts > end_ts)):
                     break
                 yield row
             return
@@ -521,7 +522,7 @@ class Backtest:
             row_ts = self._row_ts(bar)
             if start_ts is not None and row_ts < start_ts:
                 continue
-            if end_ts is not None and row_ts > end_ts:
+            if end_ts is not None and ((self._backtest_end_exclusive() and row_ts >= end_ts) or (not self._backtest_end_exclusive() and row_ts > end_ts)):
                 break
             yield bar
 
@@ -553,10 +554,24 @@ class Backtest:
         return None
 
     def _backtest_start_ts(self):
-        return getattr(self.config, "backtest_start_ts", None)
+        return getattr(self.config, "data_start_ts", None) or getattr(self.config, "backtest_start_ts", None)
+
+    def _measurement_start_ts(self):
+        return self.oos_start_ts or getattr(self.config, "measurement_start_ts", None)
+
+    def _measurement_equity_curve(self, curve):
+        start = self._measurement_start_ts()
+        if start is None:
+            return curve
+        if isinstance(curve, dict):
+            return {key: [value for ts, value in zip(curve.get("ts", []), curve.get("equity", [])) if ts >= start] if key == "equity" else [ts for ts in curve.get("ts", []) if ts >= start] for key in curve}
+        return [row for row in curve if int(row.get("ts", 0)) >= start]
 
     def _backtest_end_ts(self):
         return getattr(self.config, "backtest_end_ts", None)
+
+    def _backtest_end_exclusive(self):
+        return bool(getattr(self.config, "backtest_end_exclusive", False))
 
     def _final_position_valuation(self, bars):
         if not bars:
@@ -837,6 +852,8 @@ def run_backtest(
     show_progress: bool = True,
     progress_callback=None,
     progress_interval_bars: int = 100_000,
+    parameter_schedule: dict | None = None,
+    oos_start_ts: int | None = None,
 ) -> BacktestResult:
     config = load_config(config_path)
     backtest = Backtest(
@@ -844,5 +861,7 @@ def run_backtest(
         show_progress=show_progress,
         progress_callback=progress_callback,
         progress_interval_bars=progress_interval_bars,
+        parameter_schedule=parameter_schedule,
+        oos_start_ts=oos_start_ts,
     )
     return backtest.run()

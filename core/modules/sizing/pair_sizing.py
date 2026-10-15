@@ -52,64 +52,18 @@ class FixedNotionalSizing:
 
 @register_sizing("beta_neutral")
 class BetaNeutralSizing:
-    """Allocate gross exposure split by beta.
+    """Beta-neutral sizing for one fixed-capital entry per Pair."""
 
-    Supports open and add actions. Add sizing can be scaled by multiplier,
-    reduced by exposure cap, or stepped by z-score deviation.
-    """
-
-    def __init__(self, notional: float = 10000.0, equity: float = 100000.0,
-                 gross_exposure_ratio: float = 0.2, max_gross_exposure_ratio: float = 1.0,
-                 min_notional: float = 0.0,
-                 # Add-on params
-                 max_add_times: int = 0,
-                 add_interval_bars: int = 1,
-                 add_z_step: float = 0.0,
-                 add_gross_exposure_ratio: float | None = None,
-                 add_size_multiplier: float | None = None,
-                 require_add_reversion_vs_last_entry: bool = False,
-                 add_reversion_buffer: float = 0.0,
-                 hedge_beta_lookback_bars: int = 1440,
-                 hedge_beta_min_samples: int = 30,
-                 # Volatility neutral params
-                 half_life_add_interval_multiplier: float = 1.0,
-                 add_interval_mode: str = "fixed",
-                 **kwargs):
-        self.notional = float(notional)
-        self.equity = float(equity)
-        self.gross_exposure_ratio = float(gross_exposure_ratio)
-        self.max_gross_exposure_ratio = float(max_gross_exposure_ratio)
-        self.min_notional = float(min_notional)
-        self.max_add_times = int(max_add_times)
-        self.add_interval_bars = int(add_interval_bars)
-        self.add_z_step = float(add_z_step)
-        self.add_gross_exposure_ratio = (
-            float(add_gross_exposure_ratio) if add_gross_exposure_ratio else self.gross_exposure_ratio
-        )
-        self.add_size_multiplier = float(add_size_multiplier) if add_size_multiplier else 1.0
-        self.require_add_reversion_vs_last_entry = bool(require_add_reversion_vs_last_entry)
-        self.add_reversion_buffer = float(add_reversion_buffer)
+    def __init__(self, hedge_beta_lookback_bars: int = 1440, hedge_beta_min_samples: int = 30, **kwargs):
         self.hedge_beta_lookback_bars = int(hedge_beta_lookback_bars)
         self.hedge_beta_min_samples = int(hedge_beta_min_samples)
-        self.half_life_add_interval_multiplier = float(half_life_add_interval_multiplier)
-        self.add_interval_mode = add_interval_mode
 
     def compute(self, state: SizingState, signal: SignalOutput,
                 estimator: EstimatorOutput, x_price: float, y_price: float,
                 long_vol: float | None = None, short_vol: float | None = None,
-                x_history=None,
-                y_history=None,
-                para: dict | None = None) -> RawPairTarget:
-        if not signal.side:
-            return RawPairTarget(pair_id=signal.pair_id, ready=False, reason="no signal")
-
-        if signal.action == "open":
-            return self._open_sizing(state, signal, estimator, x_price, y_price, x_history, y_history)
-        if signal.action == "add":
-            return self._add_sizing(state, signal, estimator, x_price, y_price, x_history, y_history)
-        return RawPairTarget(pair_id=signal.pair_id, ready=False, reason="action not supported")
-
-    def _open_sizing(self, state, signal, estimator, x_price, y_price, x_history=None, y_history=None):
+                x_history=None, y_history=None, para: dict | None = None) -> RawPairTarget:
+        if signal.action != "open" or not signal.side:
+            return RawPairTarget(pair_id=signal.pair_id, ready=False, reason="no open signal")
         returns_beta, beta_samples = self._returns_beta(x_history, y_history)
         beta_source = "returns_on_signal" if returns_beta is not None else "estimator"
         hedge_beta = returns_beta if returns_beta is not None else (estimator.hedge_beta or 1.0)
@@ -121,7 +75,6 @@ class BetaNeutralSizing:
         x_weight = beta / (1 + beta)
         y_weight = 1.0 / (1 + beta)
         target_hedge_ratio = _long_short_target_ratio(signal.side, x_weight, y_weight)
-
         return RawPairTarget(
             pair_id=signal.pair_id, ready=True, side=signal.side,
             x_weight=x_weight, y_weight=y_weight,
@@ -142,38 +95,6 @@ class BetaNeutralSizing:
             }),
         )
 
-    def _add_sizing(self, state, signal, estimator, x_price, y_price, x_history=None, y_history=None):
-        """Add to existing position with scaling."""
-        if self.max_add_times > 0 and state.entry_count >= self.max_add_times:
-            return RawPairTarget(pair_id=signal.pair_id, ready=False, reason="max add reached")
-
-        # Scale add size by multiplier
-        base = self._open_sizing(state, signal, estimator, x_price, y_price, x_history, y_history)
-        scale = self.add_size_multiplier
-
-        # If add_z_step is set, scale by z-score depth
-        if self.add_z_step > 0 and signal.zscore is not None:
-            base_z = 2.0  # nominal base z
-            depth = abs(signal.zscore) / base_z
-            scale *= depth
-
-        return RawPairTarget(
-            pair_id=signal.pair_id, ready=True, side=signal.side,
-            x_weight=base.x_weight,
-            y_weight=base.y_weight,
-            x_price=base.x_price,
-            y_price=base.y_price,
-            hedge_ratio=base.hedge_ratio,
-            signal_strength=signal.signal_strength,
-            reason=f"add #{state.entry_count + 1} scale={scale:.2f}",
-            para=_sizing_para(signal, {
-                **(base.para.get("sizing", {}) if isinstance(base.para, dict) else {}),
-                "method": "beta_neutral",
-                "action": "add",
-                "scale": scale,
-            }),
-        )
-
     def _returns_beta(self, x_history, y_history):
         if x_history is None or y_history is None:
             return None, 0
@@ -182,18 +103,15 @@ class BetaNeutralSizing:
         samples_available = max(0, price_window - 1)
         if samples_available < self.hedge_beta_min_samples:
             return None, samples_available
-
         x_arr = np.array(tail_values(x_history, price_window), dtype=float)
         y_arr = np.array(tail_values(y_history, price_window), dtype=float)
         x_ret = np.diff(np.log(np.clip(x_arr, 1e-12, None)))
         y_ret = np.diff(np.log(np.clip(y_arr, 1e-12, None)))
         mask = np.isfinite(x_ret) & np.isfinite(y_ret)
-        x_ret = x_ret[mask]
-        y_ret = y_ret[mask]
+        x_ret, y_ret = x_ret[mask], y_ret[mask]
         samples = len(x_ret)
         if samples < self.hedge_beta_min_samples:
             return None, samples
-
         var_x = float(np.var(x_ret, ddof=1))
         if not isfinite(var_x) or var_x <= 1e-12:
             return None, samples

@@ -47,6 +47,7 @@ def export_backtest_report(
     review_max_points=2000,
     review_max_pairs=20,
     include_curve_charts=True,
+    release_result_memory=True,
 ):
     config_path = Path(config_path)
     run_name = run_name or _run_name(result)
@@ -105,7 +106,8 @@ def export_backtest_report(
             )
 
     _write_markdown_summary(output_dir / "summary.md", result, config_output, return_attribution, risk_attribution)
-    _release_minute_curve_memory(result)
+    if release_result_memory:
+        _release_minute_curve_memory(result)
     logger.info(
         "报告步骤 2/4：基础产物完成，耗时 {:.1f} 秒",
         time.perf_counter() - started,

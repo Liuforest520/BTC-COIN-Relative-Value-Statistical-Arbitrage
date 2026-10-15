@@ -6,16 +6,14 @@ from core.modules.models import (
 
 
 class ExchangeManager:
-    def __init__(self, exchanges: dict[str, Exchange], pending_timeout_bars: int = 0):
+    def __init__(self, exchanges: dict[str, Exchange]):
         self.exchanges = exchanges
         self.initial_cash = sum(exchange.initial_cash for exchange in exchanges.values())
         self.equity_curve = []
         self.funding_payments = []
         self.compact_equity_curve = False
         self.include_trade_history_on_bar = True
-        self.pending_timeout_bars = max(0, int(pending_timeout_bars))
         self._bar_index = 0
-        self._group_first_seen: dict[str, int] = {}
         self._rebalance_batch_status: dict[str, dict[str, int | bool]] = {}
 
     def rebalance_metrics(self) -> dict:
@@ -205,11 +203,9 @@ class ExchangeManager:
             rejected_orders.extend(rejected)
             for order in rejected:
                 per_exchange[order.exchange]["rejected_orders"].append(order)
-                self._group_first_seen.pop(order.group_id or order.order_id, None)
             self._rebalance_batch_status.setdefault(batch_id, {})["failed"] = True
             failed_rebalance_batches.add(batch_id)
         for group_id, group_orders in pending_groups.items():
-            self._group_first_seen.setdefault(group_id, self._bar_index)
             actions = {getattr(o.action, "value", o.action) for o in group_orders}
             batch_ids = {
                 str(getattr(o, "rebalance_batch_id", None))
@@ -220,26 +216,6 @@ class ExchangeManager:
                 for batch_id in batch_ids.intersection(invalid_rebalance_batches):
                     reject_rebalance_batch(batch_id)
                 continue
-            if self.pending_timeout_bars and self._bar_index - self._group_first_seen[group_id] >= self.pending_timeout_bars:
-                if batch_ids:
-                    for batch_id in batch_ids:
-                        reject_rebalance_batch(batch_id)
-                    continue
-                rejected = self._reject_group_orders({group_id})
-                rejected_orders.extend(rejected)
-                for order in rejected:
-                    per_exchange[order.exchange]["rejected_orders"].append(order)
-                self._group_first_seen.pop(group_id, None)
-                if any(getattr(o, "protection_trigger", None) == "rebalance_replacement" for o in group_orders):
-                    batch_ids_for_group = {
-                        batch_id
-                        for batch_id in (getattr(o, "rebalance_batch_id", None) for o in group_orders)
-                        if batch_id is not None
-                    }
-                    failed_rebalance_batches.update(batch_ids_for_group)
-                    for batch_id in batch_ids_for_group:
-                        self._rebalance_batch_status.setdefault(str(batch_id), {})["failed"] = True
-                continue
             actions = {getattr(o.action, "value", o.action) for o in group_orders}
             batch_ids = {str(getattr(o, "rebalance_batch_id", None)) for o in group_orders if getattr(o, "rebalance_batch_id", None)}
             if actions == {"open"} and batch_ids.intersection(failed_rebalance_batches):
@@ -247,7 +223,6 @@ class ExchangeManager:
                 rejected_orders.extend(rejected)
                 for order in rejected:
                     per_exchange[order.exchange]["rejected_orders"].append(order)
-                self._group_first_seen.pop(group_id, None)
                 continue
             if batch_ids.intersection(waiting_rebalance_batches):
                 continue
@@ -340,7 +315,6 @@ class ExchangeManager:
                 raise RuntimeError(f"atomic order group {group_id} failed after pre-validation")
 
             self._remove_group_orders(group_id)
-            self._group_first_seen.pop(group_id, None)
             rebalance_ids = {
                 str(getattr(o, "rebalance_batch_id", None))
                 for o in group_orders
@@ -420,7 +394,7 @@ class ExchangeManager:
         }
 
     @classmethod
-    def from_names(cls, exchange_names, initial_cash=100000.0, fee_rate=0.0005, slippage_bps=1.0, max_leverage=1.0, pending_timeout_bars=0):
+    def from_names(cls, exchange_names, initial_cash=100000.0, fee_rate=0.0005, slippage_bps=1.0, max_leverage=1.0):
         exchange_names = list(exchange_names)
         if not exchange_names:
             raise ValueError("exchange_names cannot be empty")
@@ -434,7 +408,7 @@ class ExchangeManager:
                 slippage_bps=slippage_bps,
                 max_leverage=max_leverage,
             )
-        return cls(exchanges, pending_timeout_bars=pending_timeout_bars)
+        return cls(exchanges)
 
     def _portfolio_state(self, results):
         wallet_balance = sum(float(result["wallet_balance"]) for result in results.values())

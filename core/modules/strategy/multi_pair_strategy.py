@@ -4,6 +4,8 @@ from __future__ import annotations
 from math import ceil, isfinite
 from uuid import uuid4
 from dataclasses import replace
+import dataclasses
+from datetime import datetime, timezone
 from typing import Any
 
 from core.modules.data.resampler import timeframe_bars, timeframe_to_minutes
@@ -124,40 +126,13 @@ class MultiPairStrategy(BaseStrategy):
                     "model timeframe={} uses ceil conversion for a non-divisible source-minute window",
                     getattr(estimator_cfg, "model_timeframe", "1m"),
                 )
-        self.portfolio_cfg = replace(
-            self.portfolio_cfg,
-            add_cooldown_bars=_decision_bars(
-                self.portfolio_cfg.add_cooldown_bars,
-                self.model_timeframe_minutes,
-                "portfolio.add_cooldown_bars",
-            ),
-            min_hold_bars=_decision_bars(
-                self.portfolio_cfg.min_hold_bars,
-                self.model_timeframe_minutes,
-                "portfolio.min_hold_bars",
-            ),
-        )
+        self.portfolio_cfg = self.portfolio_cfg
         self.protection_cfg = replace(
             self.protection_cfg,
-            stop_loss_freeze_bars=_decision_bars(
-                self.protection_cfg.stop_loss_freeze_bars,
-                self.model_timeframe_minutes,
-                "protection.stop_loss_freeze_bars",
-            ),
             pair_loss_stop_freeze_bars=_decision_bars(
                 self.protection_cfg.pair_loss_stop_freeze_bars,
                 self.model_timeframe_minutes,
                 "protection.pair_loss_stop_freeze_bars",
-            ),
-            take_profit_freeze_bars=_decision_bars(
-                self.protection_cfg.take_profit_freeze_bars,
-                self.model_timeframe_minutes,
-                "protection.take_profit_freeze_bars",
-            ),
-            max_holding_time_freeze_bars=_decision_bars(
-                self.protection_cfg.max_holding_time_freeze_bars,
-                self.model_timeframe_minutes,
-                "protection.max_holding_time_freeze_bars",
             ),
         )
         self.protection_manager = ProtectionManager(self.protection_cfg)
@@ -175,7 +150,6 @@ class MultiPairStrategy(BaseStrategy):
             self.estimator_cfg.regression_method,
             self.estimator_cfg.position_update_policy,
             self.protection_cfg.enabled
-            or self.protection_cfg.max_holding_time_enabled
             or self.protection_cfg.pair_loss_stop_enabled,
         )
         if (
@@ -223,19 +197,15 @@ class MultiPairStrategy(BaseStrategy):
                 pipeline.portfolio_cfg = self.portfolio_cfg
                 pipeline.protection_cfg = self.protection_cfg
             else:
-                raw_portfolio_cfg = components.get("portfolio_cfg") or self.portfolio_cfg
-                pipeline.portfolio_cfg = replace(
-                    raw_portfolio_cfg,
-                    add_cooldown_bars=_decision_bars(raw_portfolio_cfg.add_cooldown_bars, pipeline.model_timeframe_minutes, "portfolio.add_cooldown_bars"),
-                    min_hold_bars=_decision_bars(raw_portfolio_cfg.min_hold_bars, pipeline.model_timeframe_minutes, "portfolio.min_hold_bars"),
-                )
+                pipeline.portfolio_cfg = components.get("portfolio_cfg") or self.portfolio_cfg
                 raw_protection_cfg = components.get("protection_cfg") or self.protection_cfg
                 pipeline.protection_cfg = replace(
                     raw_protection_cfg,
-                    stop_loss_freeze_bars=_decision_bars(raw_protection_cfg.stop_loss_freeze_bars, pipeline.model_timeframe_minutes, "protection.stop_loss_freeze_bars"),
-                    pair_loss_stop_freeze_bars=_decision_bars(raw_protection_cfg.pair_loss_stop_freeze_bars, pipeline.model_timeframe_minutes, "protection.pair_loss_stop_freeze_bars"),
-                    take_profit_freeze_bars=_decision_bars(raw_protection_cfg.take_profit_freeze_bars, pipeline.model_timeframe_minutes, "protection.take_profit_freeze_bars"),
-                    max_holding_time_freeze_bars=_decision_bars(raw_protection_cfg.max_holding_time_freeze_bars, pipeline.model_timeframe_minutes, "protection.max_holding_time_freeze_bars"),
+                    pair_loss_stop_freeze_bars=_decision_bars(
+                        raw_protection_cfg.pair_loss_stop_freeze_bars,
+                        pipeline.model_timeframe_minutes,
+                        "protection.pair_loss_stop_freeze_bars",
+                    ),
                 )
             pipeline.rebalance_cfg = components.get("rebalance_cfg") or self.rebalance_cfg
             self.protection_managers[pair_def.pair_id] = ProtectionManager(pipeline.protection_cfg)
@@ -259,10 +229,6 @@ class MultiPairStrategy(BaseStrategy):
         # Validate the effective estimator lookback up front when the feature
         # is enabled. Pair-level lookback overrides are already applied by
         # PairPipeline, so each pair gets the same semantics as its model.
-        for pipeline in self.pipelines.values():
-            if self._pair_protection_cfg(pipeline).max_holding_time_enabled:
-                self._max_holding_bars_for_pipeline(pipeline)
-
         if portfolio_ctor and portfolio_cfg:
             self.portfolio = portfolio_ctor(**_dataclass_to_dict(self.portfolio_cfg))
             if hasattr(self.portfolio, "total_pair_count"):
@@ -270,9 +236,9 @@ class MultiPairStrategy(BaseStrategy):
         else:
             self.portfolio = None
 
-        self.max_entries_per_pair = max(1, int(getattr(self.portfolio_cfg, "max_entries_per_pair", 1) or 1))
-        self.add_cooldown_bars = max(0, int(getattr(self.portfolio_cfg, "add_cooldown_bars", 0) or 0))
-        self.min_hold_bars = max(0, int(getattr(self.portfolio_cfg, "min_hold_bars", 0) or 0))
+        self.max_entries_per_pair = 1
+        self.add_cooldown_bars = 0
+        self.min_hold_bars = 0
         self._pair_bar_indices: dict[str, int] = {}
         self._pending_open_pair_ids: set[str] = set()
         self._pending_rebalance_pair_ids: set[str] = set()
@@ -280,6 +246,64 @@ class MultiPairStrategy(BaseStrategy):
 
         self.signal = self
         self.last_state: dict[str, Any] = {}
+        self._parameter_schedule = {}
+        self._parameter_schedule_cursor: dict[str, int] = {}
+        self._pending_parameter_entries: dict[str, dict] = {}
+        self._schedule_disabled_pairs: set[str] = set()
+
+    def set_parameter_schedule(self, schedule: dict | None) -> None:
+        """Install a pair-local monthly schedule for the continuous run."""
+        self._parameter_schedule = dict(schedule or {})
+        self._parameter_schedule_cursor = {pair_id: -1 for pair_id in self.pipelines}
+        self._pending_parameter_entries = {}
+        self._schedule_disabled_pairs = set()
+
+    def apply_parameter_schedule(self, ts: int, schedule: dict | None = None) -> None:
+        if schedule is not None:
+            self.set_parameter_schedule(schedule)
+        for pair_id, entries in self._parameter_schedule.items():
+            pipeline = self.pipelines.get(pair_id)
+            if pipeline is None:
+                continue
+            if isinstance(entries, dict):
+                entries = [dict(value, validation_start=key) for key, value in entries.items()]
+            ordered = sorted(entries or [], key=lambda item: _schedule_ts(item.get("validation_start", item.get("validation_start_ts"))))
+            cursor = self._parameter_schedule_cursor.get(pair_id, -1)
+            for index, entry in enumerate(ordered):
+                start_ts = _schedule_ts(entry.get("validation_start", entry.get("validation_start_ts")))
+                if start_ts is None or start_ts > int(ts) or index <= cursor:
+                    continue
+                self._parameter_schedule_cursor[pair_id] = index
+                if entry.get("skipped"):
+                    self._schedule_disabled_pairs.add(pair_id)
+                    continue
+                self._schedule_disabled_pairs.discard(pair_id)
+                if pipeline.has_position():
+                    self._pending_parameter_entries[pair_id] = entry
+                else:
+                    self._apply_pair_parameter_entry(pair_id, entry)
+            pending = self._pending_parameter_entries.get(pair_id)
+            if pending is not None and not pipeline.has_position():
+                self._apply_pair_parameter_entry(pair_id, pending)
+                self._pending_parameter_entries.pop(pair_id, None)
+
+    def _apply_pair_parameter_entry(self, pair_id: str, entry: dict) -> None:
+        pipeline = self.pipelines.get(pair_id)
+        if pipeline is None:
+            return
+        parameters = entry.get("parameters", entry.get("params", entry)) or {}
+        if pipeline.apply_parameter_patch(parameters, defer_if_position=True) == "deferred":
+            self._pending_parameter_entries[pair_id] = entry
+            return
+        protection_patch = dict(parameters.get("protection") or {})
+        if protection_patch:
+            current = self._pair_protection_cfg(pipeline)
+            values = dataclasses.asdict(current)
+            values.update(protection_patch)
+            clean = {field.name: values[field.name] for field in dataclasses.fields(ProtectionConfig) if field.name in values}
+            pipeline.protection_cfg = ProtectionConfig(**clean)
+            self.protection_managers[pair_id] = ProtectionManager(pipeline.protection_cfg)
+        pipeline.state.last_block_reason = ""
 
     def _pair_estimator_cfg(self, pipeline):
         return getattr(pipeline, "estimator_cfg", self.estimator_cfg)
@@ -299,7 +323,7 @@ class MultiPairStrategy(BaseStrategy):
         return protection_supported(
             est.regression_method,
             est.position_update_policy,
-            cfg.enabled or cfg.max_holding_time_enabled or cfg.pair_loss_stop_enabled,
+            cfg.enabled and cfg.pair_loss_stop_enabled,
         )
 
     def snapshot_signal_state(self, ts, compact: bool = False):
@@ -336,8 +360,6 @@ class MultiPairStrategy(BaseStrategy):
             state[prefix + "remaining_pair_gross"] = runtime_state.sizing_state.remaining_pair_gross
             state[prefix + "add_cooldown_remaining_bars"] = runtime_state.sizing_state.add_cooldown_remaining_bars
             state[prefix + "min_hold_remaining_bars"] = runtime_state.sizing_state.min_hold_remaining_bars
-            state[prefix + "max_holding_bars"] = runtime_state.protection_state.max_holding_bars
-            state[prefix + "max_holding_deadline_bar"] = runtime_state.protection_state.max_holding_deadline_bar
             state[prefix + "reopen_lock_pending"] = runtime_state.protection_state.reopen_lock_pending
             state[prefix + "pair_loss_stop_freeze_until_bar"] = runtime_state.protection_state.pair_loss_stop_freeze_until_bar
             state[prefix + "protection_rule"] = runtime_state.protection_state.protection_rule
@@ -354,6 +376,7 @@ class MultiPairStrategy(BaseStrategy):
 
     def on_bar(self, bars: dict):
         ts = self._extract_ts(bars)
+        self.apply_parameter_schedule(ts)
         self._sync_account_context()
         bar_index = getattr(self, "_global_bar_index", 0) + 1
         self._global_bar_index = bar_index
@@ -424,6 +447,10 @@ class MultiPairStrategy(BaseStrategy):
                 if self._can_close_pair(pipeline, signal.bar_index):
                     orders.extend(self._close_orders(pair_id, pipeline, pair_def, fallback_hedge))
             elif signal.action in ("open", "add") and signal.side:
+                if pair_id in self._schedule_disabled_pairs:
+                    pipeline.state.sizing_state.last_schedule_reason = "no valid walk-forward parameters"
+                    pipeline.state.last_block_reason = "no valid walk-forward parameters"
+                    continue
                 already_holding = self._pair_holds_position(pipeline)
                 if pair_id in self._pending_open_pair_ids:
                     reason = "open order pending fill"
@@ -1374,8 +1401,6 @@ class MultiPairStrategy(BaseStrategy):
             protection_trigger=protection_trigger,
             exit_class=exit_class,
             reopen_lock_pending=reopen_lock_pending,
-            protection_max_holding_bars=protection_state.max_holding_bars,
-            protection_max_holding_deadline_bar=protection_state.max_holding_deadline_bar,
             protection_pair_loss_stop_return=protection_state.pair_loss_stop_return,
             protection_pair_loss_stop_freeze_bars=protection_state.pair_loss_stop_freeze_bars,
             protection_pair_loss_stop_freeze_until_bar=protection_state.pair_loss_stop_freeze_until_bar,
@@ -1443,47 +1468,6 @@ class MultiPairStrategy(BaseStrategy):
         one configuration controls both protective exits consistently.
         """
         return self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
-
-    def _max_holding_bars_for_pipeline(self, pipeline) -> int | None:
-        config = self._pair_protection_cfg(pipeline)
-        if not config.max_holding_time_enabled:
-            return None
-        configured_lookback = getattr(self._pair_estimator_cfg(pipeline), "model_lookback_bars", None)
-        try:
-            configured_lookback = float(configured_lookback)
-        except (TypeError, ValueError):
-            configured_lookback = 0.0
-        if not isfinite(configured_lookback) or configured_lookback <= 0.0:
-            raise ValueError(
-                "protection.max_holding_time_enabled requires a valid positive estimator model_lookback_bars"
-            )
-        override = getattr(pipeline.pair_def, "model_lookback_bars_override", None)
-        if override is not None:
-            try:
-                override = float(override)
-            except (TypeError, ValueError):
-                override = 0.0
-            if not isfinite(override) or override <= 0.0:
-                raise ValueError(
-                    "protection.max_holding_time_enabled requires a valid positive pair model_lookback_bars_override"
-                )
-        lookback = getattr(pipeline.estimator, "model_lookback_bars", None)
-        try:
-            lookback = float(lookback)
-        except (TypeError, ValueError):
-            lookback = 0.0
-        if not isfinite(lookback) or lookback <= 0.0:
-            raise ValueError(
-                "protection.max_holding_time_enabled requires a valid positive estimator model_lookback_bars"
-            )
-        product = lookback * float(
-            config.max_holding_time_model_lookback_multiplier
-        )
-        if not isfinite(product):
-            raise ValueError(
-                "protection.max_holding_time_model_lookback_multiplier produces an invalid max holding period"
-            )
-        return max(1, int(ceil(product)))
 
     def _should_wait_after_non_z_exit(self, exit_class: str | None, pipeline=None) -> bool:
         """Only a stop-loss (or max-holding) exit locks the pair.
@@ -1664,15 +1648,8 @@ class MultiPairStrategy(BaseStrategy):
             state.spread_mean = protection.get("spread_mean")
             state.spread_std = protection.get("spread_std")
             state.exit_z = protection.get("exit_z")
-            state.take_profit_return = float(protection_cfg.take_profit_return)
             state.pair_loss_stop_return = float(protection_cfg.pair_loss_stop_return)
             state.pair_loss_stop_freeze_bars = self._pair_loss_stop_freeze_bars_for_pipeline(pipeline)
-            state.max_holding_bars = self._max_holding_bars_for_pipeline(pipeline)
-            state.max_holding_deadline_bar = (
-                state.entry_bar_index + state.max_holding_bars
-                if state.entry_bar_index is not None and state.max_holding_bars is not None
-                else None
-            )
 
         old_x_qty = state.entry_x_quantity
         old_y_qty = state.entry_y_quantity
@@ -1696,36 +1673,8 @@ class MultiPairStrategy(BaseStrategy):
             state.entry_x_quantity * float(state.entry_x_price or 0.0)
             + state.entry_y_quantity * float(state.entry_y_price or 0.0)
         )
-        boundary = solve_zero_net_x_price(
-            estimator_cfg.regression_method,
-            state.alpha,
-            state.beta,
-            state.spread_mean,
-            state.spread_std,
-            state.exit_z,
-            state.side,
-            state.entry_x_price,
-            state.entry_y_price,
-            state.entry_x_quantity,
-            state.entry_y_quantity,
-            # The stored entry prices include execution slippage. Subtract
-            # only the separately charged entry fee here; otherwise the
-            # theoretical stop would double-count entry slippage.
-            state.entry_fee,
-            self.fee_rate,
-            self.slippage_rate,
-        )
-        state.stop_loss_x_price = boundary.x_price
-        state.stop_loss_direction = boundary.trigger_direction
-        state.stop_loss_net_pnl = 0.0 if boundary.x_price is not None else None
-        state.stop_loss_reason = boundary.reason
         for trade in group:
-            trade.protection_stop_x_price = state.stop_loss_x_price
-            trade.protection_take_profit_return = state.take_profit_return
-            trade.protection_target_residual = boundary.target_residual
-            trade.protection_stop_reason = boundary.reason
-            trade.protection_max_holding_bars = state.max_holding_bars
-            trade.protection_max_holding_deadline_bar = state.max_holding_deadline_bar
+            trade.protection_stop_x_price = None
             trade.protection_pair_loss_stop_return = state.pair_loss_stop_return
             trade.protection_pair_loss_stop_freeze_bars = state.pair_loss_stop_freeze_bars
 
@@ -1741,23 +1690,7 @@ class MultiPairStrategy(BaseStrategy):
             state.reopen_lock_pending = False
 
     def _can_close_pair(self, pipeline, bar_index) -> bool:
-        sizing_state = pipeline.state.sizing_state
-        min_hold_bars = max(0, int(getattr(self._pair_portfolio_cfg(pipeline), "min_hold_bars", self.min_hold_bars) or 0))
-        if min_hold_bars <= 0 or sizing_state.position_side is None:
-            return True
-        if sizing_state.last_entry_bar_index is None:
-            return True
-
-        elapsed = max(0, int(bar_index) - int(sizing_state.last_entry_bar_index))
-        remaining = max(0, min_hold_bars - elapsed)
-        sizing_state.min_hold_remaining_bars = remaining
-        if remaining <= 0:
-            return True
-
-        reason = f"min hold {remaining} bars remaining"
-        sizing_state.last_schedule_reason = reason
-        pipeline.state.last_block_reason = reason
-        return False
+        return True
 
     def _compute_direct_target(
         self,
@@ -1932,7 +1865,6 @@ class MultiPairStrategy(BaseStrategy):
                     protection_state.entry_y_quantity = 0.0
                     protection_state.entry_x_price = None
                     protection_state.entry_y_price = None
-                    protection_state.stop_loss_direction = None
                     protection_state.entry_gross_notional = 0.0
                     protection_state.entry_fee = 0.0
                     protection_state.entry_slippage = 0.0
@@ -2177,3 +2109,18 @@ class MultiPairStrategy(BaseStrategy):
                 if isinstance(bar, list) and bar:
                     return bar[0]
         return 0
+
+
+def _schedule_ts(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        dt = datetime.strptime(text[:10], "%Y-%m-%d")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)

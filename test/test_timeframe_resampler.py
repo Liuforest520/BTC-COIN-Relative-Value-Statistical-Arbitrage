@@ -148,11 +148,7 @@ def test_pipeline_converts_legacy_source_minute_windows_once():
                 "reversion_ma_short_lookback_bars": 15,
             },
             "sizing": {"method": "beta_neutral"},
-            "portfolio": {
-                "method": "pair_target_capital",
-                "add_cooldown_bars": 30,
-                "min_hold_bars": 45,
-            },
+            "portfolio": {"method": "pair_target_capital"},
             "protection": {
                 "enabled": True,
                 "pair_loss_stop_enabled": True,
@@ -168,9 +164,6 @@ def test_pipeline_converts_legacy_source_minute_windows_once():
     # MA signal keeps its existing minimum long window of 5 model bars.
     assert pipeline.signal.reversion_ma_lookback_bars == 5
     assert pipeline.signal.reversion_ma_short_lookback_bars == 1
-    assert pipeline.signal.pair_quality_min_samples == 2
-    assert strategy.add_cooldown_bars == 2
-    assert strategy.min_hold_bars == 3
     assert strategy.protection_cfg.pair_loss_stop_freeze_bars == 96
     assert not hasattr(strategy.rebalance_cfg, "eviction_min_holding_model_lookback_multiplier")
 

@@ -12,6 +12,7 @@ dependencies = [
     "pyyaml",
     "loguru",
     "numpy>=1.24",
+    "numba>=0.59",
     "tqdm>=4.66",
     "mysql-connector-python>=9.0",
     "boto3>=1.34",

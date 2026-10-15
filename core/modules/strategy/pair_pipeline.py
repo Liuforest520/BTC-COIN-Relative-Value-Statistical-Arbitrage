@@ -27,6 +27,12 @@ class PairPipeline:
     ):
         from core.modules.models import OrderType
         self.pair_def = pair_def
+        self._estimator_ctor = estimator_ctor
+        self._signal_ctor = signal_ctor
+        self._sizing_ctor = sizing_ctor
+        self.estimator_cfg = estimator_cfg
+        self.signal_cfg = signal_cfg or SignalConfig()
+        self.sizing_cfg = sizing_cfg or SizingConfig()
         self.state = PairRuntimeState(pair_id=pair_def.pair_id)
         self.model_timeframe_minutes = timeframe_to_minutes(
             getattr(estimator_cfg, "model_timeframe", "1m")
@@ -49,9 +55,7 @@ class PairPipeline:
             est_kwargs,
             {
                 "ewls_half_life_bars",
-                "beta_stability_lookback_bars",
-                "beta_stability_min_samples",
-                "hedge_model_lookback_bars",
+                                "hedge_model_lookback_bars",
                 "hedge_model_update_interval_bars",
             },
             self.model_timeframe_minutes,
@@ -65,15 +69,10 @@ class PairPipeline:
             _scale_bar_fields(
                 sig_kwargs,
                 {
-                    "entry_rule_lookback_bars",
-                    "entry_rule_update_interval_bars",
-                    "entry_rule_min_samples",
-                    "reversion_ma_lookback_bars",
+                                        "reversion_ma_lookback_bars",
                     "reversion_ma_short_lookback_bars",
                     "reversion_min_samples",
-                    "pair_quality_min_samples",
-                    "two_stage_max_wait_bars",
-                },
+                                    },
                 self.model_timeframe_minutes,
                 "signal",
             )
@@ -87,10 +86,7 @@ class PairPipeline:
             _scale_bar_fields(
                 siz_kwargs,
                 {
-                    "add_interval_bars",
-                    "min_add_interval_bars",
-                    "max_add_interval_bars",
-                    "hedge_beta_lookback_bars",
+                                        "hedge_beta_lookback_bars",
                     "hedge_beta_min_samples",
                 },
                 self.model_timeframe_minutes,
@@ -109,6 +105,83 @@ class PairPipeline:
         self._last_zscore = None
         self._last_action = None
         self.collect_diagnostics = True
+
+    def has_position(self) -> bool:
+        sizing_state = self.state.sizing_state
+        return bool(
+            sizing_state.position_side is not None
+            and (sizing_state.x_quantity > 0 or sizing_state.y_quantity > 0)
+        )
+
+    def apply_parameter_patch(self, patch: dict, defer_if_position: bool = True) -> str:
+        """Apply pair-local parameters while preserving estimator history.
+
+        A live position keeps the estimator/signal/protection basis that was
+        active at entry.  ``MultiPairStrategy`` calls this method again after
+        the position is flat when a deferred schedule is pending.
+        """
+        patch = dict(patch or {})
+        if defer_if_position and self.has_position():
+            self.state.last_block_reason = "parameter switch deferred while position is open"
+            return "deferred"
+        import dataclasses
+        from collections import deque
+        from core.modules.models.pipeline_types import EstimatorState, SignalState
+
+        stage_patch = {name: dict(patch.get(name) or {}) for name in ("estimator", "signal", "sizing")}
+        if not any(stage_patch.values()):
+            return "unchanged"
+
+        def merged(dc, values):
+            raw = dataclasses.asdict(dc)
+            raw.update(values)
+            return type(dc)(**_filter_dataclass_kwargs(type(dc), raw))
+
+        if stage_patch["estimator"]:
+            self.estimator_cfg = merged(self.estimator_cfg, stage_patch["estimator"])
+            self.estimator = self._make_estimator(self.estimator_cfg)
+            old_state = self.state.estimator_state
+            self.state.estimator_state = EstimatorState(
+                x_close_history=deque(old_state.x_close_history),
+                y_close_history=deque(old_state.y_close_history),
+            )
+            self.state.is_ready = False
+            # Z-score thresholds and reversion memory depend on the fitted model.
+            self.state.signal_state = SignalState()
+        if stage_patch["signal"] and self._signal_ctor is not None:
+            self.signal_cfg = merged(self.signal_cfg or SignalConfig(), stage_patch["signal"])
+            self.signal = self._make_signal(self.signal_cfg)
+            # Old armed/reversion state belongs to the old signal parameters.
+            self.state.signal_state = SignalState()
+        if stage_patch["sizing"] and self._sizing_ctor is not None:
+            self.sizing_cfg = merged(self.sizing_cfg or SizingConfig(), stage_patch["sizing"])
+            self.sizing = self._make_sizing(self.sizing_cfg)
+        self.pair_def.parameter_grid = dict(getattr(self.pair_def, "parameter_grid", {}) or {})
+        self.state.last_block_reason = ""
+        return "applied"
+
+    def _make_estimator(self, estimator_cfg):
+        est_kwargs = _dataclass_to_dict(estimator_cfg)
+        est_kwargs["pair_id"] = self.pair_def.pair_id
+        raw_lookback = est_kwargs.get("model_lookback_bars", 10080)
+        if self.pair_def.model_lookback_bars_override:
+            raw_lookback = min(raw_lookback, self.pair_def.model_lookback_bars_override)
+        est_kwargs["model_lookback_bars"] = timeframe_bars(raw_lookback, self.model_timeframe_minutes, label="model_lookback_bars")
+        est_kwargs["model_update_interval_bars"] = timeframe_bars(est_kwargs.get("model_update_interval_bars", 240), self.model_timeframe_minutes, label="model_update_interval_bars")
+        _scale_bar_fields(est_kwargs, {"ewls_half_life_bars", "hedge_model_lookback_bars", "hedge_model_update_interval_bars"}, self.model_timeframe_minutes, "estimator")
+        return self._estimator_ctor(**est_kwargs)
+
+    def _make_signal(self, signal_cfg):
+        sig_kwargs = _dataclass_to_dict(signal_cfg)
+        sig_kwargs["pair_id"] = self.pair_def.pair_id
+        _scale_bar_fields(sig_kwargs, {"reversion_ma_lookback_bars", "reversion_ma_short_lookback_bars", "reversion_min_samples"}, self.model_timeframe_minutes, "signal")
+        return self._signal_ctor(**sig_kwargs)
+
+    def _make_sizing(self, sizing_cfg):
+        siz_kwargs = _dataclass_to_dict(sizing_cfg)
+        siz_kwargs["pair_id"] = self.pair_def.pair_id
+        _scale_bar_fields(siz_kwargs, {"hedge_beta_lookback_bars", "hedge_beta_min_samples"}, self.model_timeframe_minutes, "sizing")
+        return self._sizing_ctor(**siz_kwargs)
 
     def on_bar(self, bundle, compute_sizing: bool = True) -> PairPipelineResult:
         """Process one bar for this pair."""
@@ -220,6 +293,12 @@ def _dataclass_to_dict(dc) -> dict:
         if v is not None:
             result[f.name] = v
     return result
+
+
+def _filter_dataclass_kwargs(dc_class, values: dict) -> dict:
+    import dataclasses
+    valid = {field.name for field in dataclasses.fields(dc_class)}
+    return {key: value for key, value in values.items() if key in valid}
 
 
 def _merge_para(base: dict | None, extra: dict | None) -> dict:

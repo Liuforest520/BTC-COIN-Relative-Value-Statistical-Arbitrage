@@ -233,11 +233,6 @@ class PositionProtectionState:
     spread_mean: float | None = None
     spread_std: float | None = None
     exit_z: float | None = None
-    stop_loss_x_price: float | None = None
-    stop_loss_direction: str | None = None
-    stop_loss_net_pnl: float | None = None
-    stop_loss_reason: str | None = None
-    take_profit_return: float | None = None
     pair_loss_stop_return: float | None = None
     pair_loss_stop_freeze_bars: int = 0
     pair_loss_stop_freeze_until_bar: int | None = None
@@ -245,8 +240,6 @@ class PositionProtectionState:
     freeze_rule: str | None = None
     freeze_bars: int = 0
     freeze_until_bar: int | None = None
-    max_holding_bars: int | None = None
-    max_holding_deadline_bar: int | None = None
     close_bar_index: int | None = None
     reopen_lock_pending: bool = False
     last_trigger: str | None = None

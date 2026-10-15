@@ -12,6 +12,60 @@ COMBINED_MARKET = "combined"
 
 
 @dataclass
+class WalkForwardConfig:
+    """Configuration for natural-month rolling walk-forward runs."""
+
+    enabled: bool = False
+    train_months: int = 2
+    validation_months: int = 1
+    step_months: int = 1
+    start_date: str | None = None
+    end_date: str | None = None
+    warmup_enabled: bool = True
+    warmup_max_bars: int | None = None
+    objective: str = "stable_score"
+    min_trades: int = 20
+    max_drawdown: float | None = None
+    subperiod_count: int = 3
+    min_active_subperiods: int = 2
+    exclude_top_fraction: float = 0.02
+    min_valid_neighbors: int = 2
+    max_own_neighbor_gap: float | None = 0.15
+    parameter_grid: dict = field(default_factory=dict)
+    pair_ids: list[str] = field(default_factory=list)
+    optimization_scope: str = "pair"
+    portfolio_min_active_pairs: int = 1
+    portfolio_require_all_pairs: bool = False
+    portfolio_candidate_batch_size: int = 16
+
+    def __post_init__(self):
+        for name in ("train_months", "validation_months", "step_months"):
+            value = int(getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"walk_forward.{name} must be positive")
+            setattr(self, name, value)
+        self.min_trades = max(0, int(self.min_trades))
+        self.subperiod_count = max(1, int(self.subperiod_count))
+        self.min_active_subperiods = max(0, int(self.min_active_subperiods))
+        self.exclude_top_fraction = float(self.exclude_top_fraction or 0.0)
+        if not 0.0 <= self.exclude_top_fraction < 1.0:
+            raise ValueError("walk_forward.selection.exclude_top_fraction must be in [0, 1)")
+        self.min_valid_neighbors = max(0, int(self.min_valid_neighbors))
+        if self.max_own_neighbor_gap is not None:
+            self.max_own_neighbor_gap = float(self.max_own_neighbor_gap)
+            if self.max_own_neighbor_gap < 0.0:
+                raise ValueError("walk_forward.selection.max_own_neighbor_gap must be nonnegative or null")
+        self.optimization_scope = str(self.optimization_scope or "pair").strip().lower()
+        if self.optimization_scope not in {"pair", "portfolio"}:
+            raise ValueError("walk_forward.optimization_scope must be 'pair' or 'portfolio'")
+        self.portfolio_min_active_pairs = max(1, int(self.portfolio_min_active_pairs))
+        self.portfolio_require_all_pairs = _as_bool(self.portfolio_require_all_pairs)
+        self.portfolio_candidate_batch_size = max(1, int(self.portfolio_candidate_batch_size))
+        if self.warmup_max_bars is not None:
+            self.warmup_max_bars = max(1, int(self.warmup_max_bars))
+
+
+@dataclass
 class SetupConfig:
     name: str
     strategy_type: str
@@ -36,10 +90,14 @@ class Config:
     slippage_bps: float
     funding_enabled: bool
     risk: dict
+    walk_forward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
     backtest_start_time: Any = None
     backtest_start_ts: int | None = None
     backtest_end_time: Any = None
     backtest_end_ts: int | None = None
+    data_start_ts: int | None = None
+    measurement_start_ts: int | None = None
+    backtest_end_exclusive: bool = False
     active_market: str = "legacy"
     active_markets: tuple[str, ...] = ()
 
@@ -55,6 +113,7 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
     end_time = backtest.get("end_time", backtest.get("end_ts"))
     start_ts = _parse_optional_timestamp(start_time)
     end_ts = _parse_optional_timestamp(end_time)
+    walk_forward = _walk_forward_config(raw.get("walk_forward") or {})
     if start_ts is not None and end_ts is not None and end_ts < start_ts:
         raise ValueError("backtest end_time must be greater than or equal to start_time")
     return Config(
@@ -73,6 +132,39 @@ def load_config(path: str | Path = "config/config.yaml") -> Config:
         slippage_bps=float(raw["cost"]["slippage_bps"]),
         funding_enabled=_as_bool(raw["cost"].get("funding_enabled", True)),
         risk=dict(raw.get("risk", {})),
+        walk_forward=walk_forward,
+        data_start_ts=start_ts,
+        measurement_start_ts=None,
+    )
+
+
+def _walk_forward_config(raw: dict) -> WalkForwardConfig:
+    warmup = raw.get("warmup") or {}
+    selection = raw.get("selection") or {}
+    portfolio = raw.get("portfolio") or {}
+    return WalkForwardConfig(
+        enabled=_as_bool(raw.get("enabled", False)),
+        train_months=raw.get("train_months", 2),
+        validation_months=raw.get("validation_months", 1),
+        step_months=raw.get("step_months", 1),
+        start_date=raw.get("start_date"),
+        end_date=raw.get("end_date"),
+        warmup_enabled=_as_bool(warmup.get("enabled", True)),
+        warmup_max_bars=warmup.get("max_bars"),
+        objective=selection.get("objective", "stable_score"),
+        min_trades=selection.get("min_trades", 20),
+        max_drawdown=selection.get("max_drawdown"),
+        subperiod_count=selection.get("subperiod_count", 3),
+        min_active_subperiods=selection.get("min_active_subperiods", 2),
+        exclude_top_fraction=selection.get("exclude_top_fraction", 0.02),
+        min_valid_neighbors=selection.get("min_valid_neighbors", 2),
+        max_own_neighbor_gap=selection.get("max_own_neighbor_gap", 0.15),
+        parameter_grid=dict(raw.get("parameter_grid") or {}),
+        pair_ids=[str(value) for value in (raw.get("pair_ids") or [])],
+        optimization_scope=raw.get("optimization_scope", "pair"),
+        portfolio_min_active_pairs=portfolio.get("min_active_pairs", 1),
+        portfolio_require_all_pairs=_as_bool(portfolio.get("require_all_pairs", False)),
+        portfolio_candidate_batch_size=portfolio.get("candidate_batch_size", 16),
     )
 
 

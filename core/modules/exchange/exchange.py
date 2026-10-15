@@ -465,8 +465,6 @@ class Exchange:
             protection_trigger=order.protection_trigger,
             exit_class=order.exit_class,
             reopen_lock_pending=order.reopen_lock_pending,
-            protection_max_holding_bars=order.protection_max_holding_bars,
-            protection_max_holding_deadline_bar=order.protection_max_holding_deadline_bar,
             protection_pair_loss_stop_return=order.protection_pair_loss_stop_return,
             protection_pair_loss_stop_freeze_bars=order.protection_pair_loss_stop_freeze_bars,
             protection_pair_loss_stop_freeze_until_bar=order.protection_pair_loss_stop_freeze_until_bar,

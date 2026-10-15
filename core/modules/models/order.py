@@ -51,8 +51,6 @@ class Order:
     protection_trigger: str | None = None
     exit_class: str | None = None
     reopen_lock_pending: bool | None = None
-    protection_max_holding_bars: int | None = None
-    protection_max_holding_deadline_bar: int | None = None
     protection_pair_loss_stop_return: float | None = None
     protection_pair_loss_stop_freeze_bars: int | None = None
     protection_pair_loss_stop_freeze_until_bar: int | None = None
