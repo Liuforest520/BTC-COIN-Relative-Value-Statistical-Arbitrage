@@ -32,6 +32,12 @@ def main():
         help="Override portfolio Numba candidate batch size without editing YAML.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Walk-Forward training process count; 1 disables process parallelism.",
+    )
+    parser.add_argument(
         "--trade-review",
         action="store_true",
         dest="trade_review",
@@ -62,11 +68,12 @@ def main():
     )
     full_log_path = setup_logger(log_file, rotation=None, retention=None)
     logger.info(
-        "walk-forward command started config={} run_name={} optimizer={} candidate_batch_size={} log_file={}",
+        "walk-forward command started config={} run_name={} optimizer={} candidate_batch_size={} workers={} log_file={}",
         args.config_path,
         run_name,
         args.optimizer,
         args.candidate_batch_size,
+        args.workers,
         full_log_path,
     )
     output_dir, result, _schedule = run_walk_forward(
@@ -77,6 +84,7 @@ def main():
         optimizer=args.optimizer,
         optimization_scope=args.optimization_scope,
         candidate_batch_size=args.candidate_batch_size,
+        process_workers=args.workers,
         include_trade_review=args.trade_review,
         include_curve_charts=not args.no_curve_charts,
     )

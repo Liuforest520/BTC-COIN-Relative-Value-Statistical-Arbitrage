@@ -12,6 +12,7 @@ def main():
     parser.add_argument("--config-dir", default="config/winrate_experiments")
     parser.add_argument("--output-root", default="results/walk_forward")
     parser.add_argument("--optimizer", choices=("numba", "sweep"), default="numba")
+    parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--with-reports", action="store_true")
     args = parser.parse_args()
 
@@ -35,6 +36,8 @@ def main():
         ]
         if not args.with_reports:
             command.extend(["--no-trade-review", "--no-curve-charts"])
+        if args.workers is not None:
+            command.extend(["--workers", str(args.workers)])
         print(f"[{index}/{len(config_paths)}] starting {run_name}", flush=True)
         completed = subprocess.run(command, check=False)
         if completed.returncode != 0:

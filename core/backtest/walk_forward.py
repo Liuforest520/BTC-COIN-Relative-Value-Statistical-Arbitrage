@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import itertools
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -12,6 +14,7 @@ from pathlib import Path
 
 import yaml
 import numpy as np
+from numba import set_num_threads
 from loguru import logger
 
 from core.backtest.backtest import Backtest
@@ -408,6 +411,112 @@ class WalkForwardParameterOptimizer:
         }
 
 
+
+def _configure_worker_numba_threads(process_workers):
+    """Avoid oversubscribing CPU and memory when workers run Numba kernels."""
+    workers = max(1, int(process_workers or 1))
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    set_num_threads(max(1, cpu_count // workers))
+
+def _run_portfolio_window_worker(payload):
+    """Compute one portfolio training window in a fresh process."""
+    config_path, pairs, window_payload, candidates, max_bars, candidate_batch_size, window_index, process_workers = payload
+    _configure_worker_numba_threads(process_workers)
+    config = load_config(config_path)
+    window = WalkForwardWindow(**window_payload)
+    logger.info(
+        "portfolio window worker started window={} train=[{}, {}) candidates={} pid={}",
+        window_index, window.train_start, window.train_end, len(candidates), os.getpid(),
+    )
+    warmup_start_ts = window.train_start_ts
+    if config.walk_forward.warmup_enabled:
+        warmup_start_ts -= int(max_bars * 60_000)
+    result = run_numba_portfolio_optimizer(
+        config, pairs, window, candidates, warmup_start_ts, max_bars,
+        config.walk_forward, candidate_batch_size=candidate_batch_size,
+    )
+    logger.info(
+        "portfolio window worker finished window={} train=[{}, {}) candidates={} selected={}",
+        window_index, window.train_start, window.train_end, len(candidates),
+        (result.get("selected") or {}).get("candidate_index"),
+    )
+    return window_index, result
+
+
+def _run_pair_window_worker(payload):
+    """Compute one pair/window task in a fresh process."""
+    config_path, pair, window_payload, optimizer, window_index, process_workers = payload
+    _configure_worker_numba_threads(process_workers)
+    config = load_config(config_path)
+    window = WalkForwardWindow(**window_payload)
+    pair_id = pair.get("pair_id")
+    logger.info(
+        "pair window worker started pair={} window={} train=[{}, {}) pid={}",
+        pair_id, window_index, window.train_start, window.train_end, os.getpid(),
+    )
+    result = WalkForwardParameterOptimizer(
+        config, pair, config.walk_forward, optimizer=optimizer,
+    ).optimize(window)
+    logger.info(
+        "pair window worker finished pair={} window={} selected={}",
+        pair_id, window_index, (result.get("selected") or {}).get("candidate_index"),
+    )
+    return pair_id, window_index, result
+
+
+def _submit_parallel_portfolio_window_futures(
+    config_path, selected_pairs, windows, public_candidates, max_bars,
+    candidate_batch_size, workers,
+):
+    payloads = [
+        (
+            str(config_path),
+            [dict(pair) for pair in selected_pairs],
+            window.__dict__,
+            public_candidates,
+            max_bars,
+            candidate_batch_size,
+            window_index,
+            workers,
+        )
+        for window_index, window in enumerate(windows, start=1)
+    ]
+    logger.info(
+        "portfolio process parallelism enabled workers={} windows={}",
+        workers, len(payloads),
+    )
+    executor = ProcessPoolExecutor(max_workers=workers)
+    futures = [executor.submit(_run_portfolio_window_worker, payload) for payload in payloads]
+    return executor, futures
+
+
+def _parallel_pair_window_results(config_path, selected_pairs, windows, optimizer, workers):
+    payloads = [
+        (str(config_path), dict(pair), window.__dict__, optimizer, window_index, workers)
+        for pair in selected_pairs
+        for window_index, window in enumerate(windows, start=1)
+    ]
+    results = {}
+    logger.info(
+        "pair process parallelism enabled workers={} tasks={}",
+        workers, len(payloads),
+    )
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_run_pair_window_worker, payload):
+            (payload[1].get("pair_id"), payload[-1])
+            for payload in payloads
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            pair_id, window_index, result = future.result()
+            results[(pair_id, window_index)] = result
+            logger.info(
+                "pair window process completed pair={} window={} workers={}",
+                key[0], key[1], workers,
+            )
+    return results
+
 def _run_portfolio_walk_forward(
     config_path,
     config,
@@ -418,11 +527,13 @@ def _run_portfolio_walk_forward(
     include_trade_review=True,
     include_curve_charts=True,
     candidate_batch_size=None,
+    process_workers=None,
 ):
     """Run the shared-parameter portfolio scope without changing pair scope."""
     if str(optimizer).lower() != "numba":
         raise ValueError("portfolio optimization currently requires --optimizer numba")
     wf = config.walk_forward
+    process_workers = max(1, int(process_workers if process_workers is not None else getattr(wf, "process_workers", 1)))
     start = wf.start_date or _date_from_ts(config.backtest_start_ts)
     end = wf.end_date or _date_from_ts(config.backtest_end_ts)
     if start is None or end is None:
@@ -468,6 +579,13 @@ def _run_portfolio_walk_forward(
     previous = None
     previous_candidate_index = None
     run_started = time.perf_counter()
+    parallel_executor = None
+    parallel_futures = None
+    if process_workers > 1:
+        parallel_executor, parallel_futures = _submit_parallel_portfolio_window_futures(
+            config_path, selected_pairs, windows, public_candidates, max_bars,
+            candidate_batch_size, process_workers,
+        )
     for window_index, window in enumerate(windows, start=1):
         window_started = time.perf_counter()
         warmup_start_ts = window.train_start_ts
@@ -479,16 +597,24 @@ def _run_portfolio_walk_forward(
             window.validation_start, window.validation_end, len(public_candidates), warmup_start_ts,
         )
         try:
-            result = run_numba_portfolio_optimizer(
-                config, selected_pairs, window, public_candidates,
-                warmup_start_ts, max_bars, wf,
-                progress_callback=lambda done, total, active, skipped: logger.info(
-                    "portfolio candidate progress window={}/{} candidates={}/{} active_pairs={} skipped_pairs={}",
-                    window_index, len(windows), done, total, active, skipped,
-                ),
-                candidate_batch_size=candidate_batch_size,
-            )
+            if parallel_futures is not None:
+                completed_index, result = parallel_futures[window_index - 1].result()
+                if completed_index != window_index:
+                    raise RuntimeError(f"portfolio worker returned window {completed_index}, expected {window_index}")
+            else:
+                result = run_numba_portfolio_optimizer(
+                    config, selected_pairs, window, public_candidates,
+                    warmup_start_ts, max_bars, wf,
+                    progress_callback=lambda done, total, active, skipped: logger.info(
+                        "portfolio candidate progress window={}/{} candidates={}/{} active_pairs={} skipped_pairs={}",
+                        window_index, len(windows), done, total, active, skipped,
+                    ),
+                    candidate_batch_size=candidate_batch_size,
+                )
         except Exception:
+            if parallel_executor is not None:
+                parallel_executor.shutdown(wait=True, cancel_futures=True)
+                parallel_executor = None
             logger.exception(
                 "portfolio window failed window={}/{} train=[{}, {}) validation=[{}, {})",
                 window_index, len(windows), window.train_start, window.train_end,
@@ -591,6 +717,9 @@ def _run_portfolio_walk_forward(
             skipped_count, time.perf_counter() - window_started, output_dir / "parameter_schedule.json",
         )
 
+    if parallel_executor is not None:
+        parallel_executor.shutdown(wait=True)
+        parallel_executor = None
     usable_schedule = {key: value for key, value in schedule.items() if value}
     first_validation = windows[0].validation_start_ts
     final_config = copy.deepcopy(config)
@@ -651,8 +780,9 @@ def run_walk_forward(
     include_curve_charts=True,
     optimization_scope=None,
     candidate_batch_size=None,
+    process_workers=None,
 ):
-    config_path = Path(config_path)
+    config_path = Path(config_path).resolve()
     config = load_config(config_path)
     wf = config.walk_forward
     optimization_scope = str(optimization_scope or getattr(wf, "optimization_scope", "pair")).lower()
@@ -669,6 +799,7 @@ def run_walk_forward(
             include_trade_review=include_trade_review,
             include_curve_charts=include_curve_charts,
             candidate_batch_size=candidate_batch_size,
+            process_workers=process_workers,
         )
     start = wf.start_date or _date_from_ts(config.backtest_start_ts)
     end = wf.end_date or _date_from_ts(config.backtest_end_ts)
@@ -712,6 +843,12 @@ def run_walk_forward(
         start,
         end,
     )
+    parallel_pair_results = None
+    effective_workers = max(1, int(process_workers if process_workers is not None else getattr(wf, "process_workers", 1)))
+    if effective_workers > 1:
+        parallel_pair_results = _parallel_pair_window_results(
+            config_path, selected_pairs, windows, optimizer, effective_workers,
+        )
     for pair_index, pair in enumerate(selected_pairs, start=1):
         pair_id = pair.get("pair_id")
         pair_started = time.perf_counter()
@@ -741,7 +878,10 @@ def run_walk_forward(
                 total_tasks,
             )
             try:
-                result = pair_optimizer.optimize(window)
+                if parallel_pair_results is not None:
+                    result = parallel_pair_results[(pair_id, window_index)]
+                else:
+                    result = pair_optimizer.optimize(window)
             except Exception:
                 logger.exception(
                     "walk-forward window failed pair={}:{} train=[{}, {}) validation=[{}, {})",

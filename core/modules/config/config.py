@@ -37,6 +37,7 @@ class WalkForwardConfig:
     portfolio_min_active_pairs: int = 1
     portfolio_require_all_pairs: bool = False
     portfolio_candidate_batch_size: int = 16
+    process_workers: int = 1
 
     def __post_init__(self):
         for name in ("train_months", "validation_months", "step_months"):
@@ -61,6 +62,7 @@ class WalkForwardConfig:
         self.portfolio_min_active_pairs = max(1, int(self.portfolio_min_active_pairs))
         self.portfolio_require_all_pairs = _as_bool(self.portfolio_require_all_pairs)
         self.portfolio_candidate_batch_size = max(1, int(self.portfolio_candidate_batch_size))
+        self.process_workers = max(1, int(self.process_workers))
         if self.warmup_max_bars is not None:
             self.warmup_max_bars = max(1, int(self.warmup_max_bars))
 
@@ -165,6 +167,7 @@ def _walk_forward_config(raw: dict) -> WalkForwardConfig:
         portfolio_min_active_pairs=portfolio.get("min_active_pairs", 1),
         portfolio_require_all_pairs=_as_bool(portfolio.get("require_all_pairs", False)),
         portfolio_candidate_batch_size=portfolio.get("candidate_batch_size", 16),
+        process_workers=raw.get("process_workers", raw.get("workers", 1)),
     )
 
 

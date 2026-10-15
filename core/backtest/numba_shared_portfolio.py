@@ -4,13 +4,13 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 from core.modules.estimator.adf_numba import adf_pvalue_c_lag1
 
 
 @njit(cache=True)
-def run_shared_portfolio_batch(
+def _run_shared_portfolio_batch_core(
     timestamps, bar_indices, values, offsets,
     target_capital, beta_lookback, beta_min_samples, reversion_min_samples,
     stop_freeze_multiplier, wait_after_stop,
@@ -234,7 +234,7 @@ def run_shared_portfolio_batch(
                 slippages[c] += slip_cost
                 pending_action[c, p] = 0
 
-        # Mark the real shared account after every timestamp.
+        # Capital competition and order execution remain deliberately serial.
         for c in range(n_candidates):
             marked = available[c]
             for p in range(n_pairs):
@@ -332,7 +332,7 @@ def run_shared_portfolio_batch(
                     else:
                         next_update[c, p] = local + update_interval[c]
 
-    return _finish_results(
+    return (
         timestamps, measurement_start, measurement_end, subperiod_count,
         initial_equity, target_capital, equity, position, qx, qy, entry_x,
         entry_y, entry_reserve, position_capital, pair_realized, last_x_close,
@@ -499,7 +499,7 @@ def _add_return(total, total2, count, last, base):
     return total, total2, count
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _finish_results(
     timestamps, measurement_start, measurement_end, subperiod_count,
     initial_equity, target_capital, equity, position, qx, qy, entry_x,
@@ -581,6 +581,12 @@ def _finish_results(
         holding_time_sum_hours, holding_trade_count,
         pair_holding_time_sum_hours, pair_holding_trade_count,
     )
+
+
+def run_shared_portfolio_batch(*args, **kwargs):
+    """Run the serial state kernel and parallelize independent result reduction."""
+    raw_state = _run_shared_portfolio_batch_core(*args, **kwargs)
+    return _finish_results(*raw_state)
 
 
 __all__ = ["run_shared_portfolio_batch"]
