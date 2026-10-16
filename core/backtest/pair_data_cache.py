@@ -1,13 +1,13 @@
 """Compact, pair-local 1-minute data cache for fast walk-forward sweeps."""
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import polars as pl
 
-from core.modules.data import load_csv_data, load_funding_data
+from core.modules.data import iter_csv_bars, load_funding_data
 
 
 class NoAlignedPairDataError(ValueError):
@@ -78,29 +78,18 @@ def load_pair_data(
     """
     if not _is_1m_path(x_path) or not _is_1m_path(y_path):
         raise ValueError("Numba pair cache requires 1m OHLCV inputs")
-    use_bar_warmup = measurement_start_ts is not None and int(warmup_bars or 0) > 0
-    load_start_ts = None if use_bar_warmup else start_ts
-    x = _load_ohlcv(x_path, "x", load_start_ts, end_ts)
-    y = _load_ohlcv(y_path, "y", load_start_ts, end_ts)
-    frame = x.join(y, on="ts", how="inner", coalesce=True).sort("ts")
-    if use_bar_warmup and not frame.is_empty():
-        measurement_start_ts = int(measurement_start_ts)
-        train_index = int(frame["ts"].search_sorted(measurement_start_ts, side="left"))
-        slice_start = max(0, train_index - int(warmup_bars))
-        frame = frame.slice(slice_start)
-    if frame.is_empty():
+    timestamps, values = _stream_aligned_ohlcv(
+        x_path,
+        y_path,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        measurement_start_ts=measurement_start_ts,
+        warmup_bars=warmup_bars,
+    )
+    if timestamps.size == 0:
         raise NoAlignedPairDataError(
             "X/Y files have no overlapping 1-minute rows in requested range"
         )
-
-    timestamps = np.ascontiguousarray(frame["ts"].to_numpy(), dtype=np.int64)
-    values = {
-        name: np.ascontiguousarray(frame[name].to_numpy(), dtype=np.float64)
-        for name in (
-            "x_open", "x_high", "x_low", "x_close",
-            "y_open", "y_high", "y_low", "y_close",
-        )
-    }
     if np.any(~np.isfinite(values["x_close"])) or np.any(~np.isfinite(values["y_close"])):
         raise ValueError("pair cache contains non-finite close values")
 
@@ -124,23 +113,124 @@ def _is_1m_path(path: str | Path) -> bool:
     return True
 
 
-def _load_ohlcv(path: str | Path, prefix: str, start_ts: int | None, end_ts: int | None) -> pl.DataFrame:
-    frame = load_csv_data(Path(path))
-    frame = frame.select(["ts", "open", "high", "low", "close"])
-    frame = frame.filter(
-        (pl.col("ts") >= int(start_ts)) if start_ts is not None else pl.lit(True)
+def _stream_aligned_ohlcv(
+    x_path: str | Path,
+    y_path: str | Path,
+    *,
+    start_ts: int | None,
+    end_ts: int | None,
+    measurement_start_ts: int | None,
+    warmup_bars: int,
+):
+    """Merge two sorted CSV streams while retaining only the requested rows."""
+    warmup_bars = max(0, int(warmup_bars or 0))
+    measurement_start_ts = (
+        int(measurement_start_ts) if measurement_start_ts is not None else None
     )
-    if end_ts is not None:
-        frame = frame.filter(pl.col("ts") < int(end_ts))
-    frame = frame.with_columns(
-        pl.col("ts").cast(pl.Int64),
-        *[pl.col(c).cast(pl.Float64, strict=False) for c in ("open", "high", "low", "close")],
-    ).drop_nulls()
-    # A source file may contain duplicate timestamps after a merge.  The
-    # normal loader keeps the last row, so retain that behavior here.
-    return frame.unique(subset=["ts"], keep="last", maintain_order=True).sort("ts").rename({
-        column: f"{prefix}_{column}" for column in ("open", "high", "low", "close")
-    })
+    start_ts = int(start_ts) if start_ts is not None else None
+    end_ts = int(end_ts) if end_ts is not None else None
+    x_iter = iter_csv_bars(x_path, end_ts=end_ts, strict_memory=True)
+    y_iter = iter_csv_bars(y_path, end_ts=end_ts, strict_memory=True)
+    x_bar = next(x_iter, None)
+    y_bar = next(y_iter, None)
+    output = _CompactAlignedRows()
+    warmup = _WarmupRing(warmup_bars)
+
+    while x_bar is not None and y_bar is not None:
+        x_ts = int(x_bar[0])
+        y_ts = int(y_bar[0])
+        if end_ts is not None and min(x_ts, y_ts) >= end_ts:
+            break
+        if x_ts < y_ts:
+            x_bar = next(x_iter, None)
+            continue
+        if y_ts < x_ts:
+            y_bar = next(y_iter, None)
+            continue
+
+        values = (
+            float(x_bar[1]), float(x_bar[2]), float(x_bar[4]), float(x_bar[3]),
+            float(y_bar[1]), float(y_bar[2]), float(y_bar[4]), float(y_bar[3]),
+        )
+        if measurement_start_ts is not None:
+            if x_ts < measurement_start_ts:
+                warmup.append(x_ts, values)
+            else:
+                output.append(x_ts, values)
+        elif start_ts is None or x_ts >= start_ts:
+            output.append(x_ts, values)
+
+        x_bar = next(x_iter, None)
+        y_bar = next(y_iter, None)
+
+    warm_ts, warm_values = warmup.to_numpy()
+    train_ts, train_values = output.to_numpy()
+    if warm_ts.size:
+        timestamps = np.ascontiguousarray(np.concatenate((warm_ts, train_ts)), dtype=np.int64)
+        matrix = np.ascontiguousarray(np.vstack((warm_values, train_values)), dtype=np.float64)
+    else:
+        timestamps = train_ts
+        matrix = train_values
+    names = (
+        "x_open", "x_high", "x_low", "x_close",
+        "y_open", "y_high", "y_low", "y_close",
+    )
+    return timestamps, {
+        name: np.ascontiguousarray(matrix[:, index], dtype=np.float64)
+        for index, name in enumerate(names)
+    }
+
+
+class _CompactAlignedRows:
+    def __init__(self):
+        self.timestamps = array("q")
+        self.values = [array("d") for _ in range(8)]
+
+    def append(self, timestamp, values):
+        self.timestamps.append(int(timestamp))
+        for column, value in zip(self.values, values):
+            column.append(float(value))
+
+    def to_numpy(self):
+        timestamps = np.asarray(self.timestamps, dtype=np.int64)
+        if not self.timestamps:
+            return timestamps, np.empty((0, 8), dtype=np.float64)
+        matrix = np.column_stack([
+            np.asarray(column, dtype=np.float64) for column in self.values
+        ])
+        return np.ascontiguousarray(timestamps), np.ascontiguousarray(matrix)
+
+
+class _WarmupRing:
+    def __init__(self, capacity):
+        self.capacity = max(0, int(capacity))
+        self.timestamps = np.empty(self.capacity, dtype=np.int64)
+        self.values = np.empty((self.capacity, 8), dtype=np.float64)
+        self.count = 0
+        self.next_index = 0
+
+    def append(self, timestamp, values):
+        if self.capacity == 0:
+            return
+        self.timestamps[self.next_index] = int(timestamp)
+        self.values[self.next_index] = values
+        self.next_index = (self.next_index + 1) % self.capacity
+        self.count = min(self.capacity, self.count + 1)
+
+    def to_numpy(self):
+        if self.count == 0:
+            return np.empty(0, dtype=np.int64), np.empty((0, 8), dtype=np.float64)
+        if self.count < self.capacity:
+            indices = np.arange(self.count)
+        else:
+            indices = np.concatenate((
+                np.arange(self.next_index, self.capacity),
+                np.arange(0, self.next_index),
+            ))
+        return (
+            np.ascontiguousarray(self.timestamps[indices], dtype=np.int64),
+            np.ascontiguousarray(self.values[indices], dtype=np.float64),
+        )
 
 
 def _funding_array(path: str | Path | None, timestamps: np.ndarray, prefix: str):

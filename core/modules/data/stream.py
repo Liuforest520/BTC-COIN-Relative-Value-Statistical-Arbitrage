@@ -27,18 +27,40 @@ ENGLISH_ALIASES = {
 }
 
 
-def iter_csv_bars(file_path: str | Path) -> Iterator[list]:
-    """Stream normalized [ts, open, high, close, low, volume] bars from CSV."""
+def iter_csv_bars(
+    file_path: str | Path,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    batch_size: int = 1_000,
+    strict_memory: bool = False,
+) -> Iterator[list]:
+    """Stream normalized bars from CSV with optional timestamp bounds.
+
+    Bounds are left-closed/right-open.  The parser remains batch based, so
+    callers can consume a multi-year file without materializing it in memory.
+    """
     path = Path(file_path)
     encoding = _detect_encoding(path)
-    if encoding in {"utf-8-sig", "utf-8"}:
-        yield from _iter_polars_csv_bars(path, encoding)
-        return
+    source = (
+        _iter_polars_csv_bars(path, encoding, batch_size=batch_size)
+        if encoding in {"utf-8-sig", "utf-8"} and not strict_memory
+        else _iter_python_csv_bars(path, encoding)
+    )
+    start_ts = int(start_ts) if start_ts is not None else None
+    end_ts = int(end_ts) if end_ts is not None else None
+    for bar in source:
+        ts = int(bar[0])
+        if start_ts is not None and ts < start_ts:
+            continue
+        if end_ts is not None and ts >= end_ts:
+            break
+        yield bar
 
-    yield from _iter_python_csv_bars(path, encoding)
 
-
-def _iter_polars_csv_bars(path: Path, encoding: str) -> Iterator[list]:
+def _iter_polars_csv_bars(
+    path: Path, encoding: str, *, batch_size: int = 1_000,
+) -> Iterator[list]:
     """Use Polars' native parser while retaining bounded-memory batch iteration."""
     with path.open("r", encoding=encoding, newline="") as f:
         fieldnames = next(csv.reader(f), None)
@@ -68,7 +90,7 @@ def _iter_polars_csv_bars(path: Path, encoding: str) -> Iterator[list]:
         columns=sources,
         schema_overrides=schema_overrides,
         # Keep the in-memory read batch small for long multi-symbol backtests.
-        batch_size=1_000,
+        batch_size=max(1, int(batch_size)),
         n_threads=1,
         ignore_errors=True,
         encoding="utf8-lossy" if encoding == "utf-8-sig" else "utf8",

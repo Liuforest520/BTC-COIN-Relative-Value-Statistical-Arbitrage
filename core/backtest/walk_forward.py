@@ -62,16 +62,30 @@ def generate_month_windows(start_date, end_date, train_months=2, validation_mont
     windows = []
     while True:
         train_end = _add_months(cursor, train_months)
-        validation_end = _add_months(train_end, validation_months)
-        if validation_end > end:
+        nominal_validation_end = _add_months(train_end, validation_months)
+        if nominal_validation_end > end:
             break
+        # Keep natural-month boundaries for rolling windows, but allow the
+        # caller to request a final partial validation period (for example,
+        # an end date on the 11th of a month) without silently truncating it
+        # to the first day of that month.
+        next_cursor = _add_months(cursor, step_months)
+        next_train_end = _add_months(next_cursor, train_months)
+        next_nominal_validation_end = _add_months(next_train_end, validation_months)
+        is_partial_final = (
+            nominal_validation_end < end
+            and next_nominal_validation_end > end
+        )
+        validation_end = end if is_partial_final else nominal_validation_end
         windows.append(WalkForwardWindow(
             train_start=cursor.isoformat(),
             train_end=train_end.isoformat(),
             validation_start=train_end.isoformat(),
             validation_end=validation_end.isoformat(),
         ))
-        cursor = _add_months(cursor, step_months)
+        if is_partial_final:
+            break
+        cursor = next_cursor
     return windows
 
 
@@ -490,7 +504,10 @@ def _submit_parallel_portfolio_window_futures(
     return executor, futures
 
 
-def _parallel_pair_window_results(config_path, selected_pairs, windows, optimizer, workers):
+def _parallel_pair_window_results(
+    config_path, selected_pairs, windows, optimizer, workers,
+    candidate_output_path=None,
+):
     payloads = [
         (str(config_path), dict(pair), window.__dict__, optimizer, window_index, workers)
         for pair in selected_pairs
@@ -508,8 +525,11 @@ def _parallel_pair_window_results(config_path, selected_pairs, windows, optimize
             for payload in payloads
         }
         for future in as_completed(futures):
-            key = futures[future]
+            key = futures.pop(future)
             pair_id, window_index, result = future.result()
+            candidates = result.pop("candidates", [])
+            if candidate_output_path is not None and candidates:
+                _append_csv(candidate_output_path, _flatten_candidate_rows(candidates))
             results[(pair_id, window_index)] = result
             logger.info(
                 "pair window process completed pair={} window={} workers={}",
@@ -821,7 +841,6 @@ def run_walk_forward(
         raise ValueError("walk_forward produced no complete train/validation windows")
 
     schedule = {}
-    candidate_rows = []
     window_rows = []
     requested_pair_ids = set(getattr(wf, "pair_ids", []) or [])
     selected_pairs = [
@@ -835,6 +854,8 @@ def run_walk_forward(
     run_started = time.perf_counter()
     output_dir = Path(output_root or "results/walk_forward") / (run_name or config_path.stem)
     output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_output_path = output_dir / "parameter_candidates.csv"
+    candidate_output_path.unlink(missing_ok=True)
     _write_yaml(output_dir / "walk_forward_config.yaml", {
         "walk_forward": _dataclass_dict(wf), "optimizer": optimizer,
         "optimization_scope": "pair", "windows": [window.__dict__ for window in windows],
@@ -859,6 +880,7 @@ def run_walk_forward(
     if effective_workers > 1:
         parallel_pair_results = _parallel_pair_window_results(
             config_path, selected_pairs, windows, optimizer, effective_workers,
+            candidate_output_path=candidate_output_path,
         )
     for pair_index, pair in enumerate(selected_pairs, start=1):
         pair_id = pair.get("pair_id")
@@ -934,7 +956,9 @@ def run_walk_forward(
                 previous = selected["parameters"]
             pair_schedule.append(entry)
             schedule[pair_id] = pair_schedule
-            candidate_rows.extend(result["candidates"])
+            candidates = result.pop("candidates", [])
+            if candidates:
+                _append_csv(candidate_output_path, _flatten_candidate_rows(candidates))
             window_rows.append({"pair_id": pair_id, "train_start": window.train_start, "train_end": window.train_end, "validation_start": window.validation_start, "validation_end": window.validation_end, "selected": bool(selected), "selection_score": entry["selection_score"], "fallback": entry["fallback"], "skipped": entry["skipped"]})
             _write_json(output_dir / "parameter_schedule.json", schedule)
             _write_csv(output_dir / "parameter_schedule.csv", _schedule_rows(schedule))
@@ -1005,7 +1029,8 @@ def run_walk_forward(
     _write_json(output_dir / "parameter_schedule.json", schedule)
     _write_yaml(output_dir / "walk_forward_config.yaml", {"walk_forward": _dataclass_dict(wf), "optimizer": optimizer, "windows": [window.__dict__ for window in windows]})
     _write_csv(output_dir / "parameter_schedule.csv", _schedule_rows(schedule))
-    _write_csv(output_dir / "parameter_candidates.csv", _flatten_candidate_rows(candidate_rows))
+    if not candidate_output_path.exists():
+        candidate_output_path.write_text("", encoding="utf-8")
     _write_csv(output_dir / "window_summary.csv", window_rows)
     _write_csv(output_dir / "pair_window_metrics.csv", _pair_window_rows(final, schedule, config_path))
     _write_csv(output_dir / "portfolio_equity_curve.csv", _rows(final.equity_curve))
@@ -1538,6 +1563,25 @@ def _write_csv(path, rows):
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer=csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader(); writer.writerows(rows)
+
+
+def _append_csv(path, rows):
+    """Append stable-schema rows without retaining prior results in memory."""
+    rows = list(rows or [])
+    if not rows:
+        return
+    path = Path(path)
+    exists = path.exists() and path.stat().st_size > 0
+    if exists:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            fields = next(csv.reader(handle), [])
+    else:
+        fields = list(rows[0].keys())
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def _as_choices(value):
